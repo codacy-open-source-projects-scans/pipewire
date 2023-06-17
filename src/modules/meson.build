@@ -22,6 +22,7 @@ module_sources = [
   'module-loopback.c',
   'module-metadata.c',
   'module-netjack2-driver.c',
+  'module-netjack2-manager.c',
   'module-pipe-tunnel.c',
   'module-portal.c',
   'module-profiler.c',
@@ -201,13 +202,30 @@ endif
 
 summary({'ffado-driver': build_module_ffado_driver}, bool_yn: true, section: 'Optional Modules')
 
+opus_custom_h = cc.has_header('opus/opus_custom.h', dependencies: opus_dep)
+if opus_custom_h
+  opus_custom_dep = declare_dependency(compile_args: ['-DHAVE_OPUS_CUSTOM'], dependencies: opus_dep)
+else
+  opus_custom_dep = dependency('', required: false)
+endif
+summary({'Opus with custom modes for NetJack2': opus_custom_dep}, bool_yn: true, section: 'Streaming between daemons')
+
 pipewire_module_netjack2_driver = shared_library('pipewire-module-netjack2-driver',
   [ 'module-netjack2-driver.c' ],
   include_directories : [configinc],
   install : true,
   install_dir : modules_install_dir,
   install_rpath: modules_install_dir,
-  dependencies : [spa_dep, mathlib, dl_lib, pipewire_dep],
+  dependencies : [spa_dep, mathlib, dl_lib, pipewire_dep, opus_custom_dep],
+)
+
+pipewire_module_netjack2_manager = shared_library('pipewire-module-netjack2-manager',
+  [ 'module-netjack2-manager.c' ],
+  include_directories : [configinc],
+  install : true,
+  install_dir : modules_install_dir,
+  install_rpath: modules_install_dir,
+  dependencies : [spa_dep, mathlib, dl_lib, pipewire_dep, opus_custom_dep],
 )
 
 pipewire_module_profiler = shared_library('pipewire-module-profiler',
@@ -345,6 +363,8 @@ pipewire_module_protocol_pulse_sources = [
   'module-protocol-pulse/modules/module-switch-on-connect.c',
   'module-protocol-pulse/modules/module-tunnel-sink.c',
   'module-protocol-pulse/modules/module-tunnel-source.c',
+  'module-protocol-pulse/modules/module-virtual-sink.c',
+  'module-protocol-pulse/modules/module-virtual-source.c',
   'module-protocol-pulse/modules/module-x11-bell.c',
   'module-protocol-pulse/modules/module-zeroconf-discover.c',
 ]

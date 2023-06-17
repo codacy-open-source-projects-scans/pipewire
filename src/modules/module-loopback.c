@@ -180,6 +180,7 @@ struct impl {
 	unsigned int do_disconnect:1;
 	unsigned int recalc_delay:1;
 
+	struct spa_audio_info_raw delay_info;
 	float target_delay;
 	struct spa_ringbuffer buffer;
 	uint8_t *buffer_data;
@@ -195,7 +196,7 @@ static void capture_destroy(void *d)
 
 static void recalculate_delay(struct impl *impl)
 {
-	uint32_t target = impl->capture_info.rate * impl->target_delay, cdelay, pdelay;
+	uint32_t target = impl->delay_info.rate * impl->target_delay, cdelay, pdelay;
 	uint32_t delay, w;
 	struct pw_time pwt;
 
@@ -232,11 +233,20 @@ static void playback_process(void *d)
 		impl->recalc_delay = false;
 	}
 
-	if ((in = pw_stream_dequeue_buffer(impl->capture)) == NULL)
-		pw_log_debug("out of capture buffers: %m");
+	in = NULL;
+	while (true) {
+		struct pw_buffer *t;
+		if ((t = pw_stream_dequeue_buffer(impl->capture)) == NULL)
+			break;
+		if (in)
+			pw_stream_queue_buffer(impl->capture, in);
+		in = t;
+	}
+	if (in == NULL)
+		pw_log_debug("%p: out of capture buffers: %m", impl);
 
 	if ((out = pw_stream_dequeue_buffer(impl->playback)) == NULL)
-		pw_log_debug("out of playback buffers: %m");
+		pw_log_debug("%p: out of playback buffers: %m", impl);
 
 	if (in != NULL && out != NULL) {
 		uint32_t outsize = UINT32_MAX;
@@ -322,6 +332,18 @@ static void param_latency_changed(struct impl *impl, const struct spa_pod *param
 	impl->recalc_delay = true;
 }
 
+static void param_format_cleared(struct impl *impl, struct pw_stream *other,
+		struct spa_audio_info_raw *other_info)
+{
+	uint8_t buffer[1024];
+	struct spa_pod_builder b;
+	const struct spa_pod *params[1];
+
+	spa_pod_builder_init(&b, buffer, sizeof(buffer));
+	params[0] = spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat, other_info);
+	pw_stream_update_params(other, params, 1);
+}
+
 static void stream_state_changed(void *data, enum pw_stream_state old,
 		enum pw_stream_state state, const char *error)
 {
@@ -347,11 +369,11 @@ static void stream_state_changed(void *data, enum pw_stream_state old,
 static void recalculate_buffer(struct impl *impl)
 {
 	if (impl->target_delay > 0.0f) {
-		uint32_t delay = impl->capture_info.rate * impl->target_delay;
+		uint32_t delay = impl->delay_info.rate * impl->target_delay;
 		void *data;
 
 		impl->buffer_size = (delay + (1u<<15)) * 4;
-		data = realloc(impl->buffer_data, impl->buffer_size * impl->capture_info.channels);
+		data = realloc(impl->buffer_data, impl->buffer_size * impl->delay_info.channels);
 		if (data == NULL) {
 			pw_log_warn("can't allocate delay buffer, delay disabled: %m");
 			impl->buffer_size = 0;
@@ -376,8 +398,10 @@ static void capture_param_changed(void *data, uint32_t id, const struct spa_pod 
 	case SPA_PARAM_Format:
 	{
 		struct spa_audio_info_raw info;
-		if (param == NULL)
+		if (param == NULL) {
+			param_format_cleared(impl, impl->playback, &impl->playback_info);
 			return;
+		}
 		if (spa_format_audio_raw_parse(param, &info) < 0)
 			return;
 		if (info.rate == 0 ||
@@ -385,7 +409,7 @@ static void capture_param_changed(void *data, uint32_t id, const struct spa_pod 
 		    info.channels > SPA_AUDIO_MAX_CHANNELS)
 			return;
 
-		impl->capture_info = info;
+		impl->delay_info = info;
 		recalculate_buffer(impl);
 		break;
 	}
@@ -415,6 +439,12 @@ static void playback_param_changed(void *data, uint32_t id, const struct spa_pod
 	struct impl *impl = data;
 
 	switch (id) {
+	case SPA_PARAM_Format:
+		if (param == NULL) {
+			param_format_cleared(impl, impl->capture, &impl->capture_info);
+			return;
+		}
+		break;
 	case SPA_PARAM_Latency:
 		param_latency_changed(impl, param, &impl->playback_latency, impl->capture);
 		break;

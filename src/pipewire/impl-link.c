@@ -27,7 +27,6 @@ PW_LOG_TOPIC_EXTERN(log_link);
 struct impl {
 	struct pw_impl_link this;
 
-	unsigned int io_set:1;
 	unsigned int activated:1;
 
 	struct pw_work_queue *work;
@@ -71,6 +70,7 @@ static struct pw_node_peer *pw_node_peer_ref(struct pw_impl_node *onode, struct 
 	peer->output = onode;
 	peer->active_count = 0;
 	copy_target(&peer->target, &inode->rt.target);
+	peer->target.flags = PW_NODE_TARGET_PEER;
 
 	spa_list_append(&onode->peer_list, &peer->link);
 	pw_log_debug("new peer %p from %p to %p", peer, onode, inode);
@@ -482,7 +482,6 @@ static int port_set_io(struct pw_impl_link *this, struct pw_impl_port *port, uin
 {
 	int res = 0;
 
-	mix->io = data;
 	pw_log_debug("%p: %s port %p %d.%d set io: %d %p %zd", this,
 			pw_direction_as_string(port->direction),
 			port, port->port_id, mix->port.port_id, id, data, size);
@@ -638,15 +637,9 @@ do_activate_link(struct spa_loop *loop,
 		 bool async, uint32_t seq, const void *data, size_t size, void *user_data)
 {
 	struct pw_impl_link *this = user_data;
-
 	pw_log_trace("%p: activate", this);
-
-	spa_list_append(&this->output->rt.mix_list, &this->rt.out_mix.rt_link);
-	spa_list_append(&this->input->rt.mix_list, &this->rt.in_mix.rt_link);
-
 	if (this->peer)
 		pw_node_peer_activate(this->peer);
-
 	return 0;
 }
 
@@ -662,16 +655,14 @@ int pw_impl_link_activate(struct pw_impl_link *this)
 		!impl->inode->runnable || !impl->onode->runnable)
 		return 0;
 
-	if (!impl->io_set) {
-		if ((res = port_set_io(this, this->output, SPA_IO_Buffers, this->io,
-				sizeof(struct spa_io_buffers), &this->rt.out_mix)) < 0)
-			return res;
+	if ((res = port_set_io(this, this->input, SPA_IO_Buffers, this->io,
+			sizeof(struct spa_io_buffers), &this->rt.in_mix)) < 0)
+		return res;
 
-		if ((res = port_set_io(this, this->input, SPA_IO_Buffers, this->io,
-				sizeof(struct spa_io_buffers), &this->rt.in_mix)) < 0)
-			return res;
-		impl->io_set = true;
-	}
+	if ((res = port_set_io(this, this->output, SPA_IO_Buffers, this->io,
+			sizeof(struct spa_io_buffers), &this->rt.out_mix)) < 0)
+		return res;
+
 	pw_loop_invoke(this->output->node->data_loop,
 	       do_activate_link, SPA_ID_INVALID, NULL, 0, false, this);
 
@@ -841,15 +832,9 @@ do_deactivate_link(struct spa_loop *loop,
 		   bool async, uint32_t seq, const void *data, size_t size, void *user_data)
 {
         struct pw_impl_link *this = user_data;
-
-	pw_log_trace("%p: disable %p and %p", this, &this->rt.in_mix, &this->rt.out_mix);
-
-	spa_list_remove(&this->rt.out_mix.rt_link);
-	spa_list_remove(&this->rt.in_mix.rt_link);
-
+	pw_log_trace("%p: disable out %p", this, &this->rt.out_mix);
 	if (this->peer)
 		pw_node_peer_deactivate(this->peer);
-
 	return 0;
 }
 
@@ -870,7 +855,6 @@ int pw_impl_link_deactivate(struct pw_impl_link *this)
 	port_set_io(this, this->input, SPA_IO_Buffers, NULL, 0,
 			&this->rt.in_mix);
 
-	impl->io_set = false;
 	impl->activated = false;
 	pw_log_info("(%s) deactivated", this->name);
 	link_update_state(this, PW_LINK_STATE_PAUSED, 0, NULL);

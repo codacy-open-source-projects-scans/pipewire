@@ -1,5 +1,5 @@
 /* PipeWire */
-/* SPDX-FileCopyrightText: Copyright © 2021 Wim Taymans */
+/* SPDX-FileCopyrightText: Copyright © 2023 Wim Taymans */
 /* SPDX-License-Identifier: MIT */
 
 #include <string.h>
@@ -7,6 +7,7 @@
 #include <errno.h>
 #include <sys/types.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include <stdlib.h>
@@ -34,6 +35,7 @@
 #include <pipewire/private.h>
 
 #include "module-netjack2/packets.h"
+
 #include "module-netjack2/peer.c"
 
 #ifndef IPTOS_DSCP
@@ -41,24 +43,25 @@
 #define IPTOS_DSCP(x) ((x) & IPTOS_DSCP_MASK)
 #endif
 
-/** \page page_module_netjack2_driver PipeWire Module: Netjack2 driver
+/** \page page_module_netjack2_manager PipeWire Module: Netjack2 manager
  *
- * The netjack2-driver module provides a source or sink that is following a
- * netjack2 driver.
+ * The netjack2 manager module listens for new netjack2 driver messages and will
+ * start a communication channel with them.
  *
  * ## Module Options
  *
- * - `driver.mode`: the driver mode, sink|source|duplex, default duplex
  * - `local.ifname = <str>`: interface name to use
  * - `net.ip =<str>`: multicast IP address, default "225.3.19.154"
  * - `net.port =<int>`: control port, default "19000"
  * - `net.mtu = <int>`: MTU to use, default 1500
  * - `net.ttl = <int>`: TTL to use, default 1
  * - `net.loop = <bool>`: loopback multicast, default false
- * - `netjack2.client-name`: the name of the NETJACK2 client.
- * - `netjack2.save`: if jack port connections should be save automatically. Can also be
+ * - `netjack2.connect`: if jack ports should be connected automatically. Can also be
  *                   placed per stream.
- * - `netjack2.latency`: the latency in cycles, default 2
+ * - `netjack2.sample-rate`: the sample rate to use, default 48000
+ * - `netjack2.period-size`: the buffer size to use, default 1024
+ * - `netjack2.encoding`: the encoding, float|opus|int, default float
+ * - `netjack2.kbps`: the number of kilobits per second when encoding, default 64
  * - `audio.channels`: the number of audio ports. Can also be added to the stream props.
  * - `midi.ports`: the number of midi ports. Can also be added to the stream props.
  * - `source.props`: Extra properties for the source filter.
@@ -82,12 +85,13 @@
  *
  *\code{.unparsed}
  * context.modules = [
- * {   name = libpipewire-module-netjack2-driver
+ * {   name = libpipewire-module-netjack2-manager
  *     args = {
- *         #driver.mode          = duplex
- *         #netjack2.client-name = PipeWire
- *         #netjack2.save        = false
- *         #netjack2.latency     = 2
+ *         #netjack2.connect     = true
+ *         #netjack2.sample-rate = 48000
+ *         #netjack2.period-size = 1024
+ *         #netjack2.encoding    = float # float|opus
+ *         #netjack2.kbps        = 64
  *         #midi.ports           = 0
  *         #audio.channels       = 2
  *         #audio.position       = [ FL FR ]
@@ -103,7 +107,7 @@
  *\endcode
  */
 
-#define NAME "netjack2-driver"
+#define NAME "netjack2-manager"
 
 PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
 #define PW_LOG_TOPIC_DEFAULT mod_topic
@@ -118,28 +122,27 @@ PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
 #define DEFAULT_NET_DSCP	34 /* Default to AES-67 AF41 (34) */
 #define MAX_MTU			9000
 
-#define DEFAULT_NETWORK_LATENCY	2
+
 #define NETWORK_MAX_LATENCY	30
 
-#define DEFAULT_CLIENT_NAME	"PipeWire"
+#define DEFAULT_SAMPLE_RATE	48000
+#define DEFAULT_PERIOD_SIZE	1024
+#define DEFAULT_ENCODING	"float"
+#define DEFAULT_KBPS		64
 #define DEFAULT_CHANNELS	2
 #define DEFAULT_POSITION	"[ FL FR ]"
 #define DEFAULT_MIDI_PORTS	1
 
-#define FOLLOWER_INIT_TIMEOUT	1
-#define FOLLOWER_INIT_RETRY	-1
-
 #define MODULE_USAGE	"( remote.name=<remote> ) "				\
-			"( driver.mode=<sink|source|duplex> ) "			\
 			"( local.ifname=<interface name> ) "			\
 			"( net.ip=<ip address to use, default 225.3.19.154> ) "	\
 			"( net.port=<port to use, default 19000> ) "		\
 			"( net.mtu=<MTU to use, default 1500> ) "		\
 			"( net.ttl=<TTL to use, default 1> ) "			\
 			"( net.loop=<loopback, default false> ) "		\
-			"( netjack2.client-name=<name of the NETJACK2 client> ) "	\
-			"( netjack2.save=<bool, save ports> ) "			\
-			"( netjack2.latency=<latency in cycles, default 2> ) "	\
+			"( netjack2.connect=<bool, autoconnect ports> ) "	\
+			"( netjack2.sample-rate=<sampl erate, default 48000> ) "\
+			"( netjack2.period-size=<period size, default 1024> ) "	\
 			"( midi.ports=<number of midi ports> ) "		\
 			"( audio.channels=<number of channels> ) "		\
 			"( audio.position=<channel map> ) "			\
@@ -149,10 +152,12 @@ PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
 
 static const struct spa_dict_item module_props[] = {
 	{ PW_KEY_MODULE_AUTHOR, "Wim Taymans <wim.taymans@gmail.com>" },
-	{ PW_KEY_MODULE_DESCRIPTION, "Create a netjack2 driver" },
+	{ PW_KEY_MODULE_DESCRIPTION, "Create a netjack2 manager" },
 	{ PW_KEY_MODULE_USAGE, MODULE_USAGE },
 	{ PW_KEY_MODULE_VERSION, PACKAGE_VERSION },
 };
+
+static void parse_audio_info(const struct pw_properties *props, struct spa_audio_info_raw *info);
 
 struct port {
 	enum spa_direction direction;
@@ -163,6 +168,7 @@ struct port {
 
 struct stream {
 	struct impl *impl;
+	struct follower *follower;
 
 	enum spa_direction direction;
 	struct pw_properties *props;
@@ -181,6 +187,38 @@ struct stream {
 	uint32_t active_midi_ports;
 
 	unsigned int running:1;
+	unsigned int ready:1;
+};
+
+struct follower {
+	struct spa_list link;
+	struct impl *impl;
+
+	struct spa_io_position *position;
+
+	struct stream source;
+	struct stream sink;
+
+	uint32_t id;
+	struct sockaddr_storage dst_addr;
+	socklen_t dst_len;
+
+	uint32_t period_size;
+	uint32_t samplerate;
+	uint64_t frame_time;
+	uint32_t cycle;
+
+	uint32_t pw_xrun;
+	uint32_t nj2_xrun;
+
+	struct spa_source *setup_socket;
+	struct spa_source *socket;
+
+	struct netjack2_peer peer;
+
+	unsigned int done:1;
+	unsigned int new_xrun:1;
+	unsigned int started:1;
 };
 
 struct impl {
@@ -194,12 +232,17 @@ struct impl {
 #define MODE_DUPLEX	(MODE_SINK|MODE_SOURCE)
 	uint32_t mode;
 	struct pw_properties *props;
+	struct pw_properties *sink_props;
+	struct pw_properties *source_props;
 
+	uint32_t mtu;
+	uint32_t ttl;
 	bool loop;
-	int ttl;
-	int dscp;
-	int mtu;
-	uint32_t latency;
+	uint32_t dscp;
+	uint32_t period_size;
+	uint32_t samplerate;
+	uint32_t encoding;
+	uint32_t kbps;
 
 	struct pw_impl_module *module;
 	struct spa_hook module_listener;
@@ -208,38 +251,14 @@ struct impl {
 	struct spa_hook core_proxy_listener;
 	struct spa_hook core_listener;
 
-	struct spa_io_position *position;
-
-	struct stream source;
-	struct stream sink;
-
-	uint32_t period_size;
-	uint32_t samplerate;
-	uint64_t frame_time;
-
-	uint32_t pw_xrun;
-	uint32_t nj2_xrun;
-
-	struct sockaddr_storage dst_addr;
-	socklen_t dst_len;
 	struct sockaddr_storage src_addr;
 	socklen_t src_len;
 
 	struct spa_source *setup_socket;
-	struct spa_source *socket;
-	struct spa_source *timer;
-	int32_t init_retry;
+	struct spa_list follower_list;
+	uint32_t follower_id;
 
-	struct netjack2_peer peer;
-
-	uint32_t driving;
-	uint32_t received;
-
-	unsigned int triggered:1;
 	unsigned int do_disconnect:1;
-	unsigned int done:1;
-	unsigned int new_xrun:1;
-	unsigned int started:1;
 };
 
 static void reset_volume(struct volume *vol, uint32_t n_volumes)
@@ -309,55 +328,158 @@ static inline void set_info(struct stream *s, uint32_t nframes,
 static void sink_process(void *d, struct spa_io_position *position)
 {
 	struct stream *s = d;
-	struct impl *impl = s->impl;
+	struct follower *follower = s->follower;
 	uint32_t nframes = position->clock.duration;
 	struct data_info midi[s->n_ports];
 	struct data_info audio[s->n_ports];
 	uint32_t n_midi, n_audio;
 
-	if (impl->driving == MODE_SINK && impl->triggered) {
-		impl->triggered = false;
-		return;
-	}
-
 	set_info(s, nframes, midi, &n_midi, audio, &n_audio);
 
-	netjack2_send_data(&impl->peer, nframes, midi, n_midi, audio, n_audio);
+	follower->peer.cycle++;
+	netjack2_send_data(&follower->peer, nframes, midi, n_midi, audio, n_audio);
 
-	pw_log_trace_fp("done %"PRIu64, impl->frame_time);
-	if (impl->driving == MODE_SINK)
-		impl->done = true;
+	if (follower->socket)
+		pw_loop_update_io(s->impl->data_loop->loop, follower->socket, SPA_IO_IN);
 }
 
 static void source_process(void *d, struct spa_io_position *position)
 {
 	struct stream *s = d;
-	struct impl *impl = s->impl;
+	struct follower *follower = s->follower;
 	uint32_t nframes = position->clock.duration;
 	struct data_info midi[s->n_ports];
 	struct data_info audio[s->n_ports];
 	uint32_t n_midi, n_audio;
 
-	if (impl->driving == MODE_SOURCE && !impl->triggered) {
-		pw_log_trace_fp("done %"PRIu64, impl->frame_time);
-		impl->done = true;
-		return;
-	}
-	impl->triggered = false;
-
 	set_info(s, nframes, midi, &n_midi, audio, &n_audio);
 
-	netjack2_recv_data(&impl->peer, midi, n_midi, audio, n_audio);
+	netjack2_manager_sync_wait(&follower->peer);
+	netjack2_recv_data(&follower->peer, midi, n_midi, audio, n_audio);
+}
+
+static void follower_free(struct follower *follower)
+{
+	struct impl *impl = follower->impl;
+
+	spa_list_remove(&follower->link);
+
+	if (follower->source.filter)
+		pw_filter_destroy(follower->source.filter);
+	if (follower->sink.filter)
+		pw_filter_destroy(follower->sink.filter);
+
+	pw_properties_free(follower->source.props);
+	pw_properties_free(follower->sink.props);
+
+	if (follower->socket)
+		pw_loop_destroy_source(impl->data_loop->loop, follower->socket);
+	if (follower->setup_socket)
+		pw_loop_destroy_source(impl->main_loop, follower->setup_socket);
+
+	netjack2_cleanup(&follower->peer);
+	free(follower);
+}
+
+static int
+do_stop_follower(struct spa_loop *loop,
+	bool async, uint32_t seq, const void *data, size_t size, void *user_data)
+{
+	struct follower *follower = user_data;
+	follower->started = false;
+	if (follower->source.filter)
+		pw_filter_set_active(follower->source.filter, false);
+	if (follower->sink.filter)
+		pw_filter_set_active(follower->sink.filter, false);
+	follower_free(follower);
+	return 0;
+}
+
+static int start_follower(struct follower *follower)
+{
+	struct impl *impl = follower->impl;
+	pw_log_info("start follower %s", follower->peer.params.name);
+	follower->started = true;
+	if (follower->source.filter && follower->source.ready)
+		pw_filter_set_active(follower->source.filter, true);
+	if (follower->sink.filter && follower->sink.ready)
+		pw_filter_set_active(follower->sink.filter, true);
+	pw_loop_update_io(impl->main_loop, follower->setup_socket, 0);
+	return 0;
+}
+
+static void
+on_setup_io(void *data, int fd, uint32_t mask)
+{
+	struct follower *follower = data;
+	struct impl *impl = follower->impl;
+
+	if (mask & (SPA_IO_ERR | SPA_IO_HUP)) {
+		pw_log_warn("error:%08x", mask);
+		pw_loop_destroy_source(impl->main_loop, follower->setup_socket);
+		follower->setup_socket = NULL;
+		return;
+	}
+	if (mask & SPA_IO_IN) {
+		ssize_t len;
+		struct nj2_session_params params;
+
+		if ((len = recv(fd, &params, sizeof(params), 0)) < 0)
+			goto receive_error;
+
+		if (len < (int)sizeof(params))
+			goto short_packet;
+
+		if (strcmp(params.type, "params") != 0)
+			goto wrong_type;
+
+		switch(ntohl(params.packet_id)) {
+		case NJ2_ID_START_DRIVER:
+			start_follower(follower);
+			break;
+		}
+	}
+	return;
+
+receive_error:
+	pw_log_warn("recv error: %m");
+	return;
+short_packet:
+	pw_log_warn("short packet received");
+	return;
+wrong_type:
+	pw_log_warn("wrong packet type received");
+	return;
+}
+
+static void
+on_data_io(void *data, int fd, uint32_t mask)
+{
+	struct follower *follower = data;
+	struct impl *impl = follower->impl;
+
+	if (mask & (SPA_IO_ERR | SPA_IO_HUP)) {
+		pw_log_warn("error:%08x", mask);
+		pw_loop_destroy_source(impl->data_loop->loop, follower->socket);
+		follower->socket = NULL;
+		pw_loop_invoke(impl->main_loop, do_stop_follower, 1, NULL, 0, false, follower);
+		return;
+	}
+	if (mask & SPA_IO_IN) {
+		pw_loop_update_io(impl->data_loop->loop, follower->socket, 0);
+
+		pw_filter_trigger_process(follower->source.filter);
+	}
 }
 
 static void stream_io_changed(void *data, void *port_data, uint32_t id, void *area, uint32_t size)
 {
 	struct stream *s = data;
-	struct impl *impl = s->impl;
+	struct follower *follower = s->follower;
 	if (port_data == NULL) {
 		switch (id) {
 		case SPA_IO_Position:
-			impl->position = area;
+			follower->position = area;
 			break;
 		default:
 			break;
@@ -383,7 +505,7 @@ static void param_latency_changed(struct stream *s, const struct spa_pod *param,
 
 static void make_stream_ports(struct stream *s)
 {
-	struct impl *impl = s->impl;
+	struct follower *follower = s->follower;
 	uint32_t i;
 	struct pw_properties *props;
 	const char *str, *prefix;
@@ -404,7 +526,6 @@ static void make_stream_ports(struct stream *s)
 
 	for (i = 0; i < s->n_ports; i++) {
 		struct port *port = s->ports[i];
-
 		if (port != NULL) {
 			s->ports[i] = NULL;
 			pw_filter_remove_port(port);
@@ -436,9 +557,10 @@ static void make_stream_ports(struct stream *s)
 
 			is_midi = true;
 		}
+		spa_zero(latency);
 		latency = SPA_LATENCY_INFO(s->direction,
-				.min_quantum = impl->latency,
-				.max_quantum = impl->latency);
+				.min_quantum = follower->peer.params.network_latency,
+				.max_quantum = follower->peer.params.network_latency);
 		spa_pod_builder_init(&b, buffer, sizeof(buffer));
 		params[0] = spa_latency_build(&b, SPA_PARAM_Latency, &latency);
 
@@ -451,6 +573,7 @@ static void make_stream_ports(struct stream *s)
 			pw_log_error("Can't create port: %m");
 			return;
 		}
+
 		port->latency[s->direction] = latency;
 		port->is_midi = is_midi;
 
@@ -521,7 +644,9 @@ static void stream_param_changed(void *data, void *port_data, uint32_t id,
 		case SPA_PARAM_PortConfig:
 			pw_log_debug("PortConfig");
 			make_stream_ports(s);
-			pw_filter_set_active(s->filter, true);
+			s->ready = true;
+			if (s->follower->started)
+				pw_filter_set_active(s->filter, true);
 			break;
 		case SPA_PARAM_Props:
 			pw_log_debug("Props");
@@ -556,13 +681,19 @@ static int make_stream(struct stream *s, const char *name)
 	const struct spa_pod *params[4];
 	uint8_t buffer[1024];
 	struct spa_pod_builder b;
+	uint32_t flags;
 
 	n_params = 0;
 	spa_pod_builder_init(&b, buffer, sizeof(buffer));
 
-	s->filter = pw_filter_new(impl->core, name, pw_properties_copy(s->props));
+	s->filter = pw_filter_new(impl->core, name, s->props);
+	s->props = NULL;
 	if (s->filter == NULL)
 		return -errno;
+
+	flags = PW_FILTER_FLAG_INACTIVE |
+			PW_FILTER_FLAG_RT_PROCESS |
+			PW_FILTER_FLAG_CUSTOM_LATENCY;
 
 	if (s->direction == PW_DIRECTION_INPUT) {
 		pw_filter_add_listener(s->filter, &s->listener,
@@ -570,6 +701,7 @@ static int make_stream(struct stream *s, const char *name)
 	} else {
 		pw_filter_add_listener(s->filter, &s->listener,
 				&source_events, s);
+		flags |= PW_FILTER_FLAG_TRIGGER;
 	}
 
 	reset_volume(&s->volume, s->info.channels);
@@ -581,109 +713,23 @@ static int make_stream(struct stream *s, const char *name)
 			SPA_PARAM_Format, &s->info);
 	params[n_params++] = make_props_param(&b, &s->volume);
 
-	return pw_filter_connect(s->filter,
-			PW_FILTER_FLAG_INACTIVE |
-			PW_FILTER_FLAG_DRIVER |
-			PW_FILTER_FLAG_RT_PROCESS |
-			PW_FILTER_FLAG_CUSTOM_LATENCY,
-			params, n_params);
+	return pw_filter_connect(s->filter, flags, params, n_params);
 }
 
-static int create_filters(struct impl *impl)
+static int create_filters(struct follower *follower)
 {
+	struct impl *impl = follower->impl;
 	int res = 0;
 
 	if (impl->mode & MODE_SINK)
-		res = make_stream(&impl->sink, "NETJACK2 Sink");
+		res = make_stream(&follower->sink, "NETJACK2 Send");
 
 	if (impl->mode & MODE_SOURCE)
-		res = make_stream(&impl->source, "NETJACK2 Source");
+		res = make_stream(&follower->source, "NETJACK2 Receive");
 
 	return res;
 }
 
-
-static inline uint64_t get_time_ns(void)
-{
-	struct timespec ts;
-	clock_gettime(CLOCK_MONOTONIC, &ts);
-	return SPA_TIMESPEC_TO_NSEC(&ts);
-}
-
-static void
-on_data_io(void *data, int fd, uint32_t mask)
-{
-	struct impl *impl = data;
-
-	if (mask & (SPA_IO_ERR | SPA_IO_HUP)) {
-		pw_log_warn("error:%08x", mask);
-		pw_loop_update_io(impl->data_loop->loop, impl->socket, 0);
-		return;
-	}
-	if (mask & SPA_IO_IN) {
-		bool source_running, sink_running;
-		uint32_t nframes;
-		uint64_t nsec;
-
-		nframes = netjack2_driver_sync_wait(&impl->peer);
-		if (nframes == 0)
-			return;
-
-		nsec = get_time_ns();
-
-		if (!impl->done) {
-			impl->pw_xrun++;
-			impl->new_xrun = true;
-		}
-		impl->received++;
-
-		source_running = impl->source.running;
-		sink_running = impl->sink.running;
-
-		impl->frame_time += nframes;
-
-		pw_log_trace_fp("process %d %u %u %p %"PRIu64, nframes, source_running,
-				sink_running, impl->position, impl->frame_time);
-
-		if (impl->new_xrun) {
-			pw_log_warn("Xrun netjack2:%u PipeWire:%u", impl->nj2_xrun, impl->pw_xrun);
-			impl->new_xrun = false;
-		}
-		if (impl->position) {
-			struct spa_io_clock *c = &impl->position->clock;
-
-			c->nsec = nsec;
-			c->rate = SPA_FRACTION(1, impl->samplerate);
-			c->position = impl->frame_time;
-			c->duration = nframes;
-			c->delay = 0;
-			c->rate_diff = 1.0;
-			c->next_nsec = nsec;
-
-			c->target_rate = c->rate;
-			c->target_duration = c->duration;
-		}
-		if (!source_running)
-			netjack2_recv_data(&impl->peer, NULL, 0, NULL, 0);
-
-		if (impl->mode & MODE_SOURCE && source_running) {
-			impl->done = false;
-			impl->triggered = true;
-			impl->driving = MODE_SOURCE;
-			pw_filter_trigger_process(impl->source.filter);
-		} else if (impl->mode == MODE_SINK && sink_running) {
-			impl->done = false;
-			impl->triggered = true;
-			impl->driving = MODE_SINK;
-			pw_filter_trigger_process(impl->sink.filter);
-		} else {
-			sink_running = false;
-			impl->done = true;
-		}
-		if (!sink_running)
-			netjack2_send_data(&impl->peer, nframes, NULL, 0, NULL, 0);
-	}
-}
 
 static int
 do_schedule_destroy(struct spa_loop *loop,
@@ -732,30 +778,23 @@ static bool is_multicast(struct sockaddr *sa, socklen_t salen)
 	return false;
 }
 
-static int make_socket(struct sockaddr_storage *src, socklen_t src_len,
-		struct sockaddr_storage *dst, socklen_t dst_len,
-		bool loop, int ttl, int dscp)
+static int make_data_socket(struct sockaddr_storage *sa, socklen_t salen,
+		bool loop, int ttl, int dscp, char *ifname)
 {
 	int af, fd, val, res;
 	struct timeval timeout;
 
-	af = src->ss_family;
+	af = sa->ss_family;
 	if ((fd = socket(af, SOCK_DGRAM | SOCK_CLOEXEC, 0)) < 0) {
 		pw_log_error("socket failed: %m");
 		return -errno;
 	}
-	val = 1;
-	if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val)) < 0) {
+	if (connect(fd, (struct sockaddr*)sa, salen) < 0) {
 		res = -errno;
-		pw_log_error("setsockopt failed: %m");
+		pw_log_error("connect() failed: %m");
 		goto error;
 	}
 
-#ifdef SO_PRIORITY
-	val = 6;
-	if (setsockopt(fd, SOL_SOCKET, SO_PRIORITY, &val, sizeof(val)) < 0)
-		pw_log_warn("setsockopt(SO_PRIORITY) failed: %m");
-#endif
 	timeout.tv_sec = 2;
 	timeout.tv_usec = 0;
 	if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &timeout, sizeof(timeout)) < 0)
@@ -766,12 +805,7 @@ static int make_socket(struct sockaddr_storage *src, socklen_t src_len,
 		if (setsockopt(fd, IPPROTO_IP, IP_TOS, &val, sizeof(val)) < 0)
 			pw_log_warn("setsockopt(IP_TOS) failed: %m");
 	}
-	if (bind(fd, (struct sockaddr*)src, src_len) < 0) {
-		res = -errno;
-		pw_log_error("bind() failed: %m");
-		goto error;
-	}
-	if (is_multicast((struct sockaddr*)dst, dst_len)) {
+	if (is_multicast((struct sockaddr*)sa, salen)) {
 		val = loop;
 		if (setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &val, sizeof(val)) < 0)
 			pw_log_warn("setsockopt(IP_MULTICAST_LOOP) failed: %m");
@@ -780,7 +814,75 @@ static int make_socket(struct sockaddr_storage *src, socklen_t src_len,
 		if (setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &val, sizeof(val)) < 0)
 			pw_log_warn("setsockopt(IP_MULTICAST_TTL) failed: %m");
 	}
+	return fd;
+error:
+	close(fd);
+	return res;
+}
 
+static int make_announce_socket(struct sockaddr_storage *sa, socklen_t salen,
+		char *ifname)
+{
+	int af, fd, val, res;
+	struct ifreq req;
+
+	af = sa->ss_family;
+	if ((fd = socket(af, SOCK_DGRAM | SOCK_CLOEXEC, 0)) < 0) {
+		pw_log_error("socket failed: %m");
+		return -errno;
+	}
+	val = 1;
+	if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, sizeof(val)) < 0) {
+		res = -errno;
+		pw_log_error("setsockopt failed: %m");
+		goto error;
+	}
+	spa_zero(req);
+	if (ifname) {
+		snprintf(req.ifr_name, sizeof(req.ifr_name), "%s", ifname);
+		res = ioctl(fd, SIOCGIFINDEX, &req);
+	        if (res < 0)
+	                pw_log_warn("SIOCGIFINDEX %s failed: %m", ifname);
+	}
+	res = 0;
+	if (af == AF_INET) {
+		static const uint32_t ipv4_mcast_mask = 0xe0000000;
+		struct sockaddr_in *sa4 = (struct sockaddr_in*)sa;
+		if ((ntohl(sa4->sin_addr.s_addr) & ipv4_mcast_mask) == ipv4_mcast_mask) {
+			struct ip_mreqn mr4;
+			memset(&mr4, 0, sizeof(mr4));
+			mr4.imr_multiaddr = sa4->sin_addr;
+			mr4.imr_ifindex = req.ifr_ifindex;
+			res = setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mr4, sizeof(mr4));
+		} else {
+			sa4->sin_addr.s_addr = INADDR_ANY;
+		}
+	} else if (af == AF_INET6) {
+		struct sockaddr_in6 *sa6 = (struct sockaddr_in6*)sa;
+		if (sa6->sin6_addr.s6_addr[0] == 0xff) {
+			struct ipv6_mreq mr6;
+			memset(&mr6, 0, sizeof(mr6));
+			mr6.ipv6mr_multiaddr = sa6->sin6_addr;
+			mr6.ipv6mr_interface = req.ifr_ifindex;
+			res = setsockopt(fd, IPPROTO_IPV6, IPV6_JOIN_GROUP, &mr6, sizeof(mr6));
+		} else {
+		        sa6->sin6_addr = in6addr_any;
+		}
+	} else {
+		res = -EINVAL;
+		goto error;
+	}
+
+	if (res < 0) {
+		res = -errno;
+		pw_log_error("join mcast failed: %m");
+		goto error;
+	}
+	if (bind(fd, (struct sockaddr*)sa, salen) < 0) {
+		res = -errno;
+		pw_log_error("bind() failed: %m");
+		goto error;
+	}
 	return fd;
 error:
 	close(fd);
@@ -795,120 +897,171 @@ static const char *get_ip(const struct sockaddr_storage *sa, char *ip, size_t le
 	} else if (sa->ss_family == AF_INET6) {
 		struct sockaddr_in6 *in = (struct sockaddr_in6*)sa;
 		inet_ntop(sa->ss_family, &in->sin6_addr, ip, len);
-	} else
-		snprintf(ip, len, "invalid ip");
+	} else {
+		snprintf(ip, len, "invalid address");
+	}
 	return ip;
 }
 
-static void update_timer(struct impl *impl, uint64_t timeout)
-{
-	struct timespec value, interval;
-	value.tv_sec = 0;
-	value.tv_nsec = timeout ? 1 : 0;
-	interval.tv_sec = timeout;
-	interval.tv_nsec = 0;
-	pw_loop_update_timer(impl->main_loop, impl->timer, &value, &interval, false);
-}
-
-static bool encoding_supported(uint32_t encoder)
-{
-	switch (encoder) {
-	case NJ2_ENCODER_FLOAT:
-	case NJ2_ENCODER_INT:
-		return true;
-#ifdef HAVE_OPUS
-	case NJ2_ENCODER_OPUS:
-		return true;
-#endif
-	}
-	return false;
-}
-
-static int handle_follower_setup(struct impl *impl, struct nj2_session_params *params,
+static int handle_follower_available(struct impl *impl, struct nj2_session_params *params,
 	struct sockaddr_storage *addr, socklen_t addr_len)
 {
-	int res;
-	struct netjack2_peer *peer = &impl->peer;
+	int res, fd;
+	struct follower *follower;
+	char buffer[256];
+	struct netjack2_peer *peer;
 
-	pw_log_info("got follower setup");
+	pw_log_info("got follower available");
 	nj2_dump_session_params(params);
 
-	nj2_session_params_ntoh(&peer->params, params);
-	SPA_SWAP(peer->params.send_audio_channels, peer->params.recv_audio_channels);
-	SPA_SWAP(peer->params.send_midi_channels, peer->params.recv_midi_channels);
-
-	if (peer->params.send_audio_channels < 0 ||
-	    peer->params.recv_audio_channels < 0 ||
-	    peer->params.send_midi_channels < 0 ||
-	    peer->params.recv_midi_channels < 0 ||
-	    peer->params.sample_rate == 0 ||
-	    peer->params.period_size == 0 ||
-	    !encoding_supported(peer->params.sample_encoder)) {
-		pw_log_warn("invalid follower setup");
+	if (ntohl(params->version) != NJ2_NETWORK_PROTOCOL) {
+		pw_log_warn("invalid version");
 		return -EINVAL;
 	}
 
-	pw_loop_update_io(impl->main_loop, impl->setup_socket, 0);
+	follower = calloc(1, sizeof(*follower));
+	if (follower == NULL)
+		return -errno;
 
-	impl->source.n_ports = peer->params.send_audio_channels + peer->params.send_midi_channels;
-	impl->source.info.rate =  peer->params.sample_rate;
-	impl->source.info.channels =  peer->params.send_audio_channels;
-	impl->sink.n_ports = peer->params.recv_audio_channels + peer->params.recv_midi_channels;
-	impl->sink.info.rate =  peer->params.sample_rate;
-	impl->sink.info.channels =  peer->params.recv_audio_channels;
-	impl->samplerate = peer->params.sample_rate;
-	impl->period_size = peer->params.period_size;
+	follower->impl = impl;
+	follower->id = impl->follower_id;
+	spa_list_append(&impl->follower_list, &follower->link);
 
-	pw_properties_setf(impl->sink.props, PW_KEY_NODE_DESCRIPTION, "NETJACK2 to %s",
-			peer->params.driver_name);
-	pw_properties_setf(impl->source.props, PW_KEY_NODE_DESCRIPTION, "NETJACK2 from %s",
-			peer->params.driver_name);
+	peer = &follower->peer;
 
-	pw_properties_setf(impl->sink.props, PW_KEY_NODE_RATE,
-			"1/%u", impl->samplerate);
-	pw_properties_set(impl->sink.props, PW_KEY_NODE_FORCE_RATE, "0");
-	pw_properties_setf(impl->sink.props, PW_KEY_NODE_FORCE_QUANTUM,
-			"%u", impl->period_size);
-	pw_properties_setf(impl->source.props, PW_KEY_NODE_RATE,
-			"1/%u", impl->samplerate);
-	pw_properties_set(impl->source.props, PW_KEY_NODE_FORCE_RATE, "0");
-	pw_properties_setf(impl->source.props, PW_KEY_NODE_FORCE_QUANTUM,
-			"%u", impl->period_size);
+	follower->source.impl = impl;
+	follower->source.follower = follower;
+	follower->source.direction = PW_DIRECTION_OUTPUT;
+	follower->source.props = pw_properties_copy(impl->source_props);
+	follower->sink.impl = impl;
+	follower->sink.follower = follower;
+	follower->sink.direction = PW_DIRECTION_INPUT;
+	follower->sink.props = pw_properties_copy(impl->sink_props);
 
-	if ((res = create_filters(impl)) < 0)
-		return res;
+	parse_audio_info(follower->source.props, &follower->source.info);
+	parse_audio_info(follower->sink.props, &follower->sink.info);
 
-	peer->fd = impl->socket->fd;
-	peer->our_stream = 'r';
-	peer->other_stream = 's';
-	peer->send_volume = &impl->sink.volume;
-	peer->recv_volume = &impl->source.volume;
+	follower->source.n_midi = pw_properties_get_uint32(follower->source.props,
+			"midi.ports", DEFAULT_MIDI_PORTS);
+	follower->sink.n_midi = pw_properties_get_uint32(follower->sink.props,
+			"midi.ports", DEFAULT_MIDI_PORTS);
+
+	follower->samplerate = impl->samplerate;
+	follower->period_size = impl->period_size;
+
+	pw_properties_setf(follower->sink.props, PW_KEY_NODE_RATE,
+			"1/%u", follower->samplerate);
+	pw_properties_set(follower->sink.props, PW_KEY_NODE_FORCE_RATE, "0");
+	pw_properties_setf(follower->sink.props, PW_KEY_NODE_FORCE_QUANTUM,
+			"%u", follower->period_size);
+	pw_properties_setf(follower->source.props, PW_KEY_NODE_RATE,
+			"1/%u", follower->samplerate);
+	pw_properties_set(follower->source.props, PW_KEY_NODE_FORCE_RATE, "0");
+	pw_properties_setf(follower->source.props, PW_KEY_NODE_FORCE_QUANTUM,
+			"%u", follower->period_size);
+
+	nj2_session_params_ntoh(&peer->params, params);
+
+	pw_properties_setf(follower->source.props, PW_KEY_NODE_DESCRIPTION, "%s NETJACK2 from %s",
+			params->name, params->follower_name);
+	pw_properties_setf(follower->sink.props, PW_KEY_NODE_DESCRIPTION, "%s NETJACK2 to %s",
+			params->name, params->follower_name);
+
+	peer->params.mtu = impl->mtu;
+	peer->params.id = follower->id;
+	snprintf(peer->params.driver_name, sizeof(peer->params.driver_name), "%s", pw_get_host_name());
+	peer->params.sample_rate = follower->samplerate;
+	peer->params.period_size = follower->period_size;
+	peer->params.sample_encoder = impl->encoding;
+	peer->params.kbps = impl->kbps;
+
+	if (peer->params.send_audio_channels < 0)
+		peer->params.send_audio_channels = follower->sink.info.channels;
+	if (peer->params.recv_audio_channels < 0)
+		peer->params.recv_audio_channels = follower->source.info.channels;
+	if (peer->params.send_midi_channels < 0)
+		peer->params.send_midi_channels = follower->sink.n_midi;
+	if (peer->params.recv_midi_channels < 0)
+		peer->params.recv_midi_channels = follower->source.n_midi;
+
+	follower->source.n_ports = peer->params.send_audio_channels + peer->params.send_midi_channels;
+	follower->source.info.rate =  peer->params.sample_rate;
+	follower->source.info.channels =  peer->params.send_audio_channels;
+	follower->sink.n_ports = peer->params.recv_audio_channels + peer->params.recv_midi_channels;
+	follower->sink.info.rate =  peer->params.sample_rate;
+	follower->sink.info.channels =  peer->params.recv_audio_channels;
+
+	follower->source.n_ports = follower->source.n_midi + follower->source.info.channels;
+	follower->sink.n_ports = follower->sink.n_midi + follower->sink.info.channels;
+	if (follower->source.n_ports > MAX_PORTS || follower->sink.n_ports > MAX_PORTS) {
+		pw_log_error("too many ports");
+		res = -EINVAL;
+		goto cleanup;
+	}
+
+	if ((res = create_filters(follower)) < 0)
+		goto create_failed;
+
+	fd = make_data_socket(addr, addr_len, impl->loop,
+			impl->ttl, impl->dscp, NULL);
+	if (fd < 0)
+		goto socket_failed;
+
+	follower->setup_socket = pw_loop_add_io(impl->main_loop, fd,
+			0, true, on_setup_io, follower);
+	if (follower->setup_socket == NULL) {
+		res = -errno;
+		pw_log_error("can't create setup source: %m");
+		goto socket_failed;
+	}
+
+	follower->socket = pw_loop_add_io(impl->data_loop->loop, fd,
+			0, false, on_data_io, follower);
+	if (follower->socket == NULL) {
+		res = -errno;
+		pw_log_error("can't create data source: %m");
+		goto socket_failed;
+	}
+	peer->fd = fd;
+	peer->our_stream = 's';
+	peer->other_stream = 'r';
+	peer->send_volume = &follower->sink.volume;
+	peer->recv_volume = &follower->source.volume;
 	netjack2_init(peer);
 
 	int bufsize = NETWORK_MAX_LATENCY * (peer->params.mtu +
-		peer->params.period_size * sizeof(float) *
-		SPA_MAX(impl->source.n_ports, impl->sink.n_ports));
+		follower->period_size * sizeof(float) *
+		SPA_MAX(follower->source.n_ports, follower->sink.n_ports));
 
 	pw_log_info("send/recv buffer %d", bufsize);
-	if (setsockopt(impl->socket->fd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize)) < 0)
+	if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &bufsize, sizeof(bufsize)) < 0)
 		pw_log_warn("setsockopt(SO_SNDBUF) failed: %m");
-	if (setsockopt(impl->socket->fd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize)) < 0)
+	if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &bufsize, sizeof(bufsize)) < 0)
 		pw_log_warn("setsockopt(SO_SNDBUF) failed: %m");
 
-	if (connect(impl->socket->fd, (struct sockaddr*)addr, addr_len) < 0)
-		goto connect_error;
+	impl->follower_id++;
 
-	impl->started = true;
-	params->packet_id = htonl(NJ2_ID_START_DRIVER);
-	send(impl->socket->fd, params, sizeof(*params), 0);
+	pw_loop_update_io(impl->main_loop, follower->setup_socket, SPA_IO_IN);
 
-	impl->done = true;
-	pw_loop_update_io(impl->data_loop->loop, impl->socket, SPA_IO_IN);
+	nj2_session_params_hton(params, &peer->params);
+	params->packet_id = htonl(NJ2_ID_FOLLOWER_SETUP);
+
+	pw_log_info("sending follower setup to %s", get_ip(addr, buffer, sizeof(buffer)));
+	nj2_dump_session_params(params);
+	send(follower->socket->fd, params, sizeof(*params), 0);
 
 	return 0;
-connect_error:
-	pw_log_error("connect() failed: %m");
-	return -errno;
+
+create_failed:
+	pw_log_error("can't create streams: %s", spa_strerror(res));
+	goto cleanup;
+socket_failed:
+	res = fd;
+	pw_log_error("can't create socket: %s", spa_strerror(res));
+	goto cleanup;
+cleanup:
+	follower_free(follower);
+	return res;
 }
 
 static void
@@ -917,24 +1070,26 @@ on_socket_io(void *data, int fd, uint32_t mask)
 	struct impl *impl = data;
 
 	if (mask & SPA_IO_IN) {
-		struct sockaddr_storage addr;
-		socklen_t addr_len = sizeof(addr);
 		ssize_t len;
+		struct sockaddr_storage addr;
+		socklen_t addr_len  = sizeof(addr);
 		struct nj2_session_params params;
 
 		if ((len = recvfrom(fd, &params, sizeof(params), 0,
 				(struct sockaddr *)&addr, &addr_len)) < 0)
 			goto receive_error;
 
-		if (len < (int)sizeof(struct nj2_session_params))
+		if (len < (int)sizeof(params))
 			goto short_packet;
 
 		if (strcmp(params.type, "params") != 0)
 			goto wrong_type;
 
 		switch(ntohl(params.packet_id)) {
-		case NJ2_ID_FOLLOWER_SETUP:
-			handle_follower_setup(impl, &params, &addr, addr_len);
+		case NJ2_ID_FOLLOWER_AVAILABLE:
+			handle_follower_available(impl, &params, &addr, addr_len);
+			break;
+		case NJ2_ID_STOP_DRIVER:
 			break;
 		}
 	}
@@ -951,57 +1106,21 @@ wrong_type:
 	return;
 }
 
-static int send_follower_available(struct impl *impl)
-{
-	char buffer[256];
-	struct nj2_session_params params;
-	const char *client_name;
-
-	pw_loop_update_io(impl->main_loop, impl->setup_socket, SPA_IO_IN);
-
-	pw_log_info("sending AVAILABLE to %s", get_ip(&impl->dst_addr, buffer, sizeof(buffer)));
-
-	client_name = pw_properties_get(impl->props, "netjack2.client-name");
-	if (client_name == NULL)
-		client_name = DEFAULT_CLIENT_NAME;
-
-	spa_zero(params);
-	strcpy(params.type, "params");
-	params.version = htonl(NJ2_NETWORK_PROTOCOL);
-	params.packet_id = htonl(NJ2_ID_FOLLOWER_AVAILABLE);
-	snprintf(params.name, sizeof(params.name), "%s", client_name);
-	snprintf(params.follower_name, sizeof(params.follower_name), "%s", pw_get_host_name());
-	params.mtu = htonl(impl->mtu);
-	params.transport_sync = htonl(0);
-	params.send_audio_channels = htonl(-1);
-	params.recv_audio_channels = htonl(-1);
-	params.send_midi_channels = htonl(-1);
-	params.recv_midi_channels = htonl(-1);
-	params.sample_encoder = htonl(NJ2_ENCODER_FLOAT);
-	params.follower_sync_mode = htonl(1);
-        params.network_latency = htonl(impl->latency);
-	sendto(impl->setup_socket->fd, &params, sizeof(params), 0,
-			(struct sockaddr*)&impl->dst_addr, impl->dst_len);
-	return 0;
-}
-
 static int create_netjack2_socket(struct impl *impl)
 {
 	const char *str;
 	uint32_t port;
 	int fd, res;
+	char buffer[256];
 
 	port = pw_properties_get_uint32(impl->props, "net.port", 0);
 	if (port == 0)
 		port = DEFAULT_NET_PORT;
 	if ((str = pw_properties_get(impl->props, "net.ip")) == NULL)
 		str = DEFAULT_NET_IP;
-	if ((res = parse_address(str, port, &impl->dst_addr, &impl->dst_len)) < 0) {
+
+	if ((res = parse_address(str, port, &impl->src_addr, &impl->src_len)) < 0) {
 		pw_log_error("invalid net.ip %s: %s", str, spa_strerror(res));
-		goto out;
-	}
-	if ((res = parse_address("0.0.0.0", 0, &impl->src_addr, &impl->src_len)) < 0) {
-		pw_log_error("invalid source.ip: %s", spa_strerror(res));
 		goto out;
 	}
 
@@ -1010,104 +1129,26 @@ static int create_netjack2_socket(struct impl *impl)
 	impl->loop = pw_properties_get_bool(impl->props, "net.loop", DEFAULT_NET_LOOP);
 	impl->dscp = pw_properties_get_uint32(impl->props, "net.dscp", DEFAULT_NET_DSCP);
 
-	fd = make_socket(&impl->src_addr, impl->src_len,
-			&impl->dst_addr, impl->dst_len, impl->loop, impl->ttl, impl->dscp);
+	fd = make_announce_socket(&impl->src_addr, impl->src_len, NULL);
 	if (fd < 0) {
-		res = -errno;
+		res = fd;
 		pw_log_error("can't create socket: %s", spa_strerror(res));
 		goto out;
 	}
 
 	impl->setup_socket = pw_loop_add_io(impl->main_loop, fd,
-				0, true, on_socket_io, impl);
+				SPA_IO_IN, true, on_socket_io, impl);
 	if (impl->setup_socket == NULL) {
 		res = -errno;
 		pw_log_error("can't create setup source: %m");
 		close(fd);
 		goto out;
 	}
-
-	impl->socket = pw_loop_add_io(impl->data_loop->loop, fd,
-			0, false, on_data_io, impl);
-	if (impl->socket == NULL) {
-		res = -errno;
-		pw_log_error("can't create data source: %m");
-		goto out;
-	}
-
-	impl->init_retry = -1;
-	update_timer(impl, FOLLOWER_INIT_TIMEOUT);
-
+	pw_log_info("listening for AVAILABLE on %s",
+			get_ip(&impl->src_addr, buffer, sizeof(buffer)));
 	return 0;
 out:
 	return res;
-}
-
-static int send_stop_driver(struct impl *impl)
-{
-	struct nj2_session_params params;
-
-	impl->started = false;
-	if (impl->socket)
-		pw_loop_update_io(impl->data_loop->loop, impl->socket, 0);
-
-	pw_log_info("sending STOP_DRIVER");
-	nj2_session_params_hton(&params, &impl->peer.params);
-	params.packet_id = htonl(NJ2_ID_STOP_DRIVER);
-	sendto(impl->setup_socket->fd, &params, sizeof(params), 0,
-			(struct sockaddr*)&impl->dst_addr, impl->dst_len);
-
-	if (impl->source.filter)
-		pw_filter_destroy(impl->source.filter);
-	if (impl->sink.filter)
-		pw_filter_destroy(impl->sink.filter);
-
-	netjack2_cleanup(&impl->peer);
-	return 0;
-}
-
-static int destroy_netjack2_socket(struct impl *impl)
-{
-	update_timer(impl, 0);
-
-	if (impl->socket) {
-		pw_loop_destroy_source(impl->data_loop->loop, impl->socket);
-		impl->socket = NULL;
-	}
-	if (impl->setup_socket) {
-		send_stop_driver(impl);
-		pw_loop_destroy_source(impl->main_loop, impl->setup_socket);
-		impl->setup_socket = NULL;
-	}
-	return 0;
-}
-
-static void restart_netjack2_socket(struct impl *impl)
-{
-	destroy_netjack2_socket(impl);
-	create_netjack2_socket(impl);
-}
-
-static void on_timer_event(void *data, uint64_t expirations)
-{
-	struct impl *impl = data;
-
-	if (impl->started) {
-		if (impl->received == 0) {
-			pw_log_warn("receive timeout, restarting");
-			restart_netjack2_socket(impl);
-		}
-		impl->received = 0;
-	}
-	if (!impl->started) {
-		if (impl->init_retry > 0 && --impl->init_retry == 0) {
-			pw_log_error("timeout in connect");
-			update_timer(impl, 0);
-			pw_impl_module_schedule_destroy(impl->module);
-			return;
-		}
-		send_follower_available(impl);
-	}
 }
 
 static void core_error(void *data, uint32_t id, int seq, int res, const char *message)
@@ -1140,20 +1181,20 @@ static const struct pw_proxy_events core_proxy_events = {
 
 static void impl_destroy(struct impl *impl)
 {
-	destroy_netjack2_socket(impl);
+	struct follower *f;
 
-	if (impl->source.filter)
-		pw_filter_destroy(impl->source.filter);
-	if (impl->sink.filter)
-		pw_filter_destroy(impl->sink.filter);
+	if (impl->setup_socket) {
+		pw_loop_destroy_source(impl->main_loop, impl->setup_socket);
+		impl->setup_socket = NULL;
+	}
+	spa_list_consume(f, &impl->follower_list, link)
+		follower_free(f);
+
 	if (impl->core && impl->do_disconnect)
 		pw_core_disconnect(impl->core);
 
-	if (impl->timer)
-		pw_loop_destroy_source(impl->main_loop, impl->timer);
-
-	pw_properties_free(impl->sink.props);
-	pw_properties_free(impl->source.props);
+	pw_properties_free(impl->sink_props);
+	pw_properties_free(impl->source_props);
 	pw_properties_free(impl->props);
 
 	free(impl);
@@ -1216,10 +1257,10 @@ static void copy_props(struct impl *impl, struct pw_properties *props, const cha
 {
 	const char *str;
 	if ((str = pw_properties_get(props, key)) != NULL) {
-		if (pw_properties_get(impl->sink.props, key) == NULL)
-			pw_properties_set(impl->sink.props, key, str);
-		if (pw_properties_get(impl->source.props, key) == NULL)
-			pw_properties_set(impl->source.props, key, str);
+		if (pw_properties_get(impl->sink_props, key) == NULL)
+			pw_properties_set(impl->sink_props, key, str);
+		if (pw_properties_get(impl->source_props, key) == NULL)
+			pw_properties_set(impl->source_props, key, str);
 	}
 }
 
@@ -1239,6 +1280,7 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 		return -errno;
 
 	pw_log_debug("module %p: new %s", impl, args);
+	spa_list_init(&impl->follower_list);
 
 	if (args == NULL)
 		args = "";
@@ -1252,9 +1294,9 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	impl->props = props;
 	impl->data_loop = pw_context_get_data_loop(context);
 
-	impl->sink.props = pw_properties_new(NULL, NULL);
-	impl->source.props = pw_properties_new(NULL, NULL);
-	if (impl->source.props == NULL || impl->sink.props == NULL) {
+	impl->sink_props = pw_properties_new(NULL, NULL);
+	impl->source_props = pw_properties_new(NULL, NULL);
+	if (impl->source_props == NULL || impl->sink_props == NULL) {
 		res = -errno;
 		pw_log_error( "can't create properties: %m");
 		goto error;
@@ -1265,13 +1307,8 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	impl->main_loop = pw_context_get_main_loop(context);
 	impl->system = impl->main_loop->system;
 
-	impl->source.impl = impl;
-	impl->source.direction = PW_DIRECTION_OUTPUT;
-	impl->sink.impl = impl;
-	impl->sink.direction = PW_DIRECTION_INPUT;
-
 	impl->mode = MODE_DUPLEX;
-	if ((str = pw_properties_get(props, "driver.mode")) != NULL) {
+	if ((str = pw_properties_get(props, "tunnel.mode")) != NULL) {
 		if (spa_streq(str, "source")) {
 			impl->mode = MODE_SOURCE;
 		} else if (spa_streq(str, "sink")) {
@@ -1279,55 +1316,69 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 		} else if (spa_streq(str, "duplex")) {
 			impl->mode = MODE_DUPLEX;
 		} else {
-			pw_log_error("invalid driver.mode '%s'", str);
+			pw_log_error("invalid tunnel.mode '%s'", str);
 			res = -EINVAL;
 			goto error;
 		}
 	}
-	impl->latency = pw_properties_get_uint32(impl->props, "netjack2.latency",
-			DEFAULT_NETWORK_LATENCY);
+	impl->samplerate = pw_properties_get_uint32(impl->props, "netjack2.sample-rate",
+			DEFAULT_SAMPLE_RATE);
+	impl->period_size = pw_properties_get_uint32(impl->props, "netjack2.period-size",
+			DEFAULT_PERIOD_SIZE);
+	if ((str = pw_properties_get(impl->props, "netjack2.encoding")) == NULL)
+		str = DEFAULT_ENCODING;
+	if (spa_streq(str, "float")) {
+		impl->encoding = NJ2_ENCODER_FLOAT;
+	} else if (spa_streq(str, "opus")) {
+#ifdef HAVE_OPUS
+		impl->encoding = NJ2_ENCODER_OPUS;
+#else
+		pw_log_error("OPUS support is disabled");
+		res = -EINVAL;
+		goto error;
+#endif
+	} else if (spa_streq(str, "int")) {
+		impl->encoding = NJ2_ENCODER_INT;
+	} else {
+			pw_log_error("invalid netjack2.encoding '%s'", str);
+			res = -EINVAL;
+			goto error;
+	}
+	impl->kbps = pw_properties_get_uint32(impl->props, "netjack2.kbps",
+			DEFAULT_KBPS);
 
 	if (pw_properties_get(props, PW_KEY_NODE_VIRTUAL) == NULL)
 		pw_properties_set(props, PW_KEY_NODE_VIRTUAL, "true");
-	if (pw_properties_get(props, PW_KEY_NODE_GROUP) == NULL)
-		pw_properties_set(props, PW_KEY_NODE_GROUP, "jack-group");
+	if (pw_properties_get(props, PW_KEY_NODE_NETWORK) == NULL)
+		pw_properties_set(props, PW_KEY_NODE_NETWORK, "true");
+	if (pw_properties_get(props, PW_KEY_NODE_LINK_GROUP) == NULL)
+		pw_properties_set(props, PW_KEY_NODE_LINK_GROUP, "jack-group");
 	if (pw_properties_get(props, PW_KEY_NODE_ALWAYS_PROCESS) == NULL)
 		pw_properties_set(props, PW_KEY_NODE_ALWAYS_PROCESS, "true");
+	if (pw_properties_get(props, PW_KEY_NODE_LOCK_QUANTUM) == NULL)
+		pw_properties_set(props, PW_KEY_NODE_LOCK_QUANTUM, "true");
+	if (pw_properties_get(props, PW_KEY_NODE_LOCK_RATE) == NULL)
+		pw_properties_set(props, PW_KEY_NODE_LOCK_RATE, "true");
 
-	pw_properties_set(impl->sink.props, PW_KEY_MEDIA_CLASS, "Audio/Sink");
-	pw_properties_set(impl->sink.props, PW_KEY_PRIORITY_DRIVER, "40000");
-	pw_properties_set(impl->sink.props, PW_KEY_NODE_NAME, "netjack2_driver_send");
+	pw_properties_set(impl->sink_props, PW_KEY_MEDIA_CLASS, "Audio/Sink");
+	pw_properties_set(impl->sink_props, PW_KEY_NODE_NAME, "netjack2_manager_send");
 
-	pw_properties_set(impl->source.props, PW_KEY_MEDIA_CLASS, "Audio/Source");
-	pw_properties_set(impl->source.props, PW_KEY_PRIORITY_DRIVER, "40001");
-	pw_properties_set(impl->source.props, PW_KEY_NODE_NAME, "netjack2_driver_receive");
+	pw_properties_set(impl->source_props, PW_KEY_MEDIA_CLASS, "Audio/Source");
+	pw_properties_set(impl->source_props, PW_KEY_NODE_NAME, "netjack2_manager_recv");
 
 	if ((str = pw_properties_get(props, "sink.props")) != NULL)
-		pw_properties_update_string(impl->sink.props, str, strlen(str));
+		pw_properties_update_string(impl->sink_props, str, strlen(str));
 	if ((str = pw_properties_get(props, "source.props")) != NULL)
-		pw_properties_update_string(impl->source.props, str, strlen(str));
+		pw_properties_update_string(impl->source_props, str, strlen(str));
 
+	copy_props(impl, props, PW_KEY_NODE_VIRTUAL);
+	copy_props(impl, props, PW_KEY_NODE_NETWORK);
+	copy_props(impl, props, PW_KEY_NODE_LINK_GROUP);
+	copy_props(impl, props, PW_KEY_NODE_ALWAYS_PROCESS);
+	copy_props(impl, props, PW_KEY_NODE_LOCK_QUANTUM);
+	copy_props(impl, props, PW_KEY_NODE_LOCK_RATE);
 	copy_props(impl, props, PW_KEY_AUDIO_CHANNELS);
 	copy_props(impl, props, SPA_KEY_AUDIO_POSITION);
-	copy_props(impl, props, PW_KEY_NODE_ALWAYS_PROCESS);
-	copy_props(impl, props, PW_KEY_NODE_GROUP);
-	copy_props(impl, props, PW_KEY_NODE_VIRTUAL);
-
-	parse_audio_info(impl->source.props, &impl->source.info);
-	parse_audio_info(impl->sink.props, &impl->sink.info);
-
-	impl->source.n_midi = pw_properties_get_uint32(impl->source.props,
-			"midi.ports", DEFAULT_MIDI_PORTS);
-	impl->sink.n_midi = pw_properties_get_uint32(impl->sink.props,
-			"midi.ports", DEFAULT_MIDI_PORTS);
-
-	impl->source.n_ports = impl->source.n_midi + impl->source.info.channels;
-	impl->sink.n_ports = impl->sink.n_midi + impl->sink.info.channels;
-	if (impl->source.n_ports > MAX_PORTS || impl->sink.n_ports > MAX_PORTS) {
-		pw_log_error("too many ports");
-		res = -EINVAL;
-		goto error;
-	}
 
 	impl->core = pw_context_get_object(impl->context, PW_TYPE_INTERFACE_Core);
 	if (impl->core == NULL) {
@@ -1351,13 +1402,6 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	pw_core_add_listener(impl->core,
 			&impl->core_listener,
 			&core_events, impl);
-
-	impl->timer = pw_loop_add_timer(impl->main_loop, on_timer_event, impl);
-	if (impl->timer == NULL) {
-		res = -errno;
-		pw_log_error("can't create timer source: %m");
-		goto error;
-	}
 
 	if ((res = create_netjack2_socket(impl)) < 0)
 		goto error;

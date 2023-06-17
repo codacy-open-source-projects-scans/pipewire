@@ -591,6 +591,9 @@ static inline void pw_node_activation_state_reset(struct pw_node_activation_stat
 
 struct pw_node_target {
 	struct spa_list link;
+#define PW_NODE_TARGET_NONE	0
+#define PW_NODE_TARGET_PEER	1
+	uint32_t flags;
 	uint32_t id;
 	char name[128];
 	struct pw_impl_node *node;
@@ -908,8 +911,6 @@ struct pw_impl_port {
 
 	struct {
 		struct spa_io_buffers io;	/**< io area of the port */
-		struct spa_io_clock clock;	/**< io area of the clock */
-		struct spa_list mix_list;
 		struct spa_list node_link;
 	} rt;					/**< data only accessed from the data thread */
 	unsigned int added:1;
