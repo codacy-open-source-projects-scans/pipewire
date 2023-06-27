@@ -477,6 +477,11 @@ static cookie_io_functions_t io_funcs = {
 	.write = log_write,
 };
 
+static void silence_error_handler(const char *file, int line,
+		const char *function, int err, const char *fmt, ...)
+{
+}
+
 int spa_alsa_init(struct state *state, const struct spa_dict *info)
 {
 	uint32_t i;
@@ -556,12 +561,14 @@ static int probe_pitch_ctl(struct state *state, const char* device_name)
 		"Playback Pitch 1000000";
 	int err;
 
-	err = snd_ctl_open(&state->ctl, device_name, SND_CTL_NONBLOCK);
+	snd_lib_error_set_handler(silence_error_handler);
 
+	err = snd_ctl_open(&state->ctl, device_name, SND_CTL_NONBLOCK);
 	if (err < 0) {
-		spa_log_info(state->log, "%s could not find ctl device", state->props.device);
+		spa_log_info(state->log, "%s could not find ctl device: %s",
+				state->props.device, snd_strerror(err));
 		state->ctl = NULL;
-		return err;
+		goto error;
 	}
 
 	snd_ctl_elem_id_alloca(&id);
@@ -572,25 +579,27 @@ static int probe_pitch_ctl(struct state *state, const char* device_name)
 	snd_ctl_elem_value_set_id(state->pitch_elem, id);
 
 	err = snd_ctl_elem_read(state->ctl, state->pitch_elem);
-
 	if (err < 0) {
-		spa_log_debug(state->log, "%s: did not find ctl %s", state->props.device, elem_name);
+		spa_log_debug(state->log, "%s: did not find ctl %s: %s",
+				state->props.device, elem_name, snd_strerror(err));
 
 		snd_ctl_elem_value_free(state->pitch_elem);
 		state->pitch_elem = NULL;
 
 		snd_ctl_close(state->ctl);
 		state->ctl = NULL;
-
-		return err;
+		goto error;
 	}
 
 	snd_ctl_elem_value_set_integer(state->pitch_elem, 0, 1000000);
+	CHECK(snd_ctl_elem_write(state->ctl, state->pitch_elem), "snd_ctl_elem_write");
 	state->last_rate = 1.0;
 
 	spa_log_info(state->log, "%s: found ctl %s", state->props.device, elem_name);
-
-	return 0;
+	err = 0;
+error:
+	snd_lib_error_set_handler(NULL);
+	return err;
 }
 
 int spa_alsa_open(struct state *state, const char *params)
@@ -2566,6 +2575,7 @@ int spa_alsa_skip(struct state *state)
 static int handle_play(struct state *state, uint64_t current_time, snd_pcm_uframes_t avail,
 		snd_pcm_uframes_t delay, snd_pcm_uframes_t target)
 {
+	struct spa_io_buffers *io = state->io;
 	int res;
 
 	if (state->alsa_started && SPA_UNLIKELY(delay > target + state->max_error)) {
@@ -2580,20 +2590,12 @@ static int handle_play(struct state *state, uint64_t current_time, snd_pcm_ufram
 	if (SPA_UNLIKELY((res = update_time(state, current_time, delay, target, false)) < 0))
 		return res;
 
-	if (spa_list_is_empty(&state->ready)) {
-		struct spa_io_buffers *io = state->io;
+	spa_log_trace_fp(state->log, "%p: %d", state, io->status);
 
-		spa_log_trace_fp(state->log, "%p: %d", state, io->status);
+	update_sources(state, false);
 
-		update_sources(state, false);
-
-		io->status = SPA_STATUS_NEED_DATA;
-		res = spa_node_call_ready(&state->callbacks, SPA_STATUS_NEED_DATA);
-	}
-	else {
-		res = spa_alsa_write(state);
-	}
-	return res;
+	io->status = SPA_STATUS_NEED_DATA;
+	return spa_node_call_ready(&state->callbacks, SPA_STATUS_NEED_DATA);
 }
 
 static int handle_capture(struct state *state, uint64_t current_time, snd_pcm_uframes_t avail,
@@ -2652,7 +2654,7 @@ static void alsa_wakeup_event(struct spa_source *source)
 	struct state *state = source->data;
 	snd_pcm_uframes_t avail, delay, target;
 	uint64_t expire, current_time;
-	int res;
+	int res, missed;
 
 	if (SPA_UNLIKELY(state->disable_tsched)) {
 		/* ALSA poll fds need to be "demangled" to know whether it's a real wakeup */
@@ -2724,10 +2726,13 @@ done:
 	if (!state->disable_tsched &&
 			(state->next_time > current_time + SPA_NSEC_PER_SEC ||
 			 current_time > state->next_time + SPA_NSEC_PER_SEC)) {
-		spa_log_error(state->log, "%s: impossible timeout %lu %lu %lu %"PRIu64" %"PRIu64" %"PRIi64
-				" %d %"PRIi64, state->props.device, avail, delay, target,
-				current_time, state->next_time, state->next_time - current_time,
-				state->threshold, state->sample_count);
+		if ((missed = ratelimit_test(&state->rate_limit, current_time)) >= 0) {
+			spa_log_error(state->log, "%s: impossible timeout %lu %lu %lu %"
+					PRIu64" %"PRIu64" %"PRIi64" %d %"PRIi64" (%d missed)",
+					state->props.device, avail, delay, target,
+					current_time, state->next_time, state->next_time - current_time,
+					state->threshold, state->sample_count, missed);
+		}
 		state->next_time = current_time + state->threshold * 1e9 / state->rate;
 	}
 	set_timeout(state, state->next_time);

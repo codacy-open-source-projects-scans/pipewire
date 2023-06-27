@@ -355,8 +355,10 @@ static bool is_multicast(struct sockaddr *sa, socklen_t salen)
 	return false;
 }
 
-static int make_send_socket(struct sockaddr_storage *sa, socklen_t salen,
-		bool loop, int ttl, char *ifname)
+static int make_send_socket(
+		struct sockaddr_storage *src, socklen_t src_len,
+		struct sockaddr_storage *sa, socklen_t salen,
+		bool loop, int ttl)
 {
 	int af, fd, val, res;
 
@@ -364,6 +366,11 @@ static int make_send_socket(struct sockaddr_storage *sa, socklen_t salen,
 	if ((fd = socket(af, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0)) < 0) {
 		pw_log_error("socket failed: %m");
 		return -errno;
+	}
+	if (bind(fd, (struct sockaddr*)src, src_len) < 0) {
+		res = -errno;
+		pw_log_error("bind() failed: %m");
+		goto error;
 	}
 	if (connect(fd, (struct sockaddr*)sa, salen) < 0) {
 		res = -errno;
@@ -892,6 +899,7 @@ static struct session *session_new(struct impl *impl, struct sdp_info *info)
 	pw_properties_setf(props, "rtp.destination.ip", "%s", dst_addr);
 	pw_properties_setf(props, "rtp.destination.port", "%u", info->dst_port);
 	pw_properties_setf(props, "rtp.payload", "%u", info->payload);
+	pw_properties_setf(props, "rtp.ptime", "%f", info->ptime);
 	pw_properties_setf(props, "rtp.media", "%s", info->media_type);
 	pw_properties_setf(props, "rtp.mime", "%s", info->mime_type);
 	pw_properties_setf(props, "rtp.rate", "%u", info->rate);
@@ -1217,9 +1225,9 @@ static int start_sap(struct impl *impl)
 	int fd, res;
 	struct timespec value, interval;
 
-	if ((fd = make_send_socket(&impl->sap_addr, impl->sap_len,
-					impl->mcast_loop, impl->ttl,
-					impl->ifname)) < 0)
+	if ((fd = make_send_socket(&impl->src_addr, impl->src_len,
+					&impl->sap_addr, impl->sap_len,
+					impl->mcast_loop, impl->ttl)) < 0)
 		return fd;
 
 	impl->sap_fd = fd;
@@ -1464,8 +1472,23 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	impl->cleanup_interval = pw_properties_get_uint32(impl->props,
 			"sap.cleanup.sec", DEFAULT_CLEANUP_SEC);
 
-	if ((str = pw_properties_get(props, "source.ip")) == NULL)
+	if ((str = pw_properties_get(props, "source.ip")) == NULL) {
 		str = DEFAULT_SOURCE_IP;
+		if (impl->ifname) {
+			int fd = socket(AF_INET, SOCK_DGRAM, 0);
+			if (fd >= 0) {
+				struct ifreq req;
+				spa_zero(req);
+				req.ifr_addr.sa_family = AF_INET;
+				snprintf(req.ifr_name, sizeof(req.ifr_name), "%s", impl->ifname);
+				res = ioctl(fd, SIOCGIFADDR, &req);
+				if (res < 0)
+					pw_log_warn("SIOCGIFADDR %s failed: %m", impl->ifname);
+				str = inet_ntoa(((struct sockaddr_in *)&req.ifr_addr)->sin_addr);
+				close(fd);
+			}
+		}
+	}
 	if ((res = parse_address(str, port, &impl->src_addr, &impl->src_len)) < 0) {
 		pw_log_error("invalid source.ip %s: %s", str, spa_strerror(res));
 		goto out;

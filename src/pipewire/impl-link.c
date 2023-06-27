@@ -157,12 +157,16 @@ static void link_update_state(struct pw_impl_link *link, enum pw_link_state stat
 		     pw_link_state_as_string(state), error);
 
 	if (state == PW_LINK_STATE_ERROR) {
-		pw_log_error("(%s) %s -> error (%s)", link->name,
-				pw_link_state_as_string(old), error);
+		pw_log_error("(%s) %s -> error (%s) (%s-%s)", link->name,
+				pw_link_state_as_string(old), error,
+				pw_impl_port_state_as_string(link->output->state),
+				pw_impl_port_state_as_string(link->input->state));
 	} else {
-		pw_log_info("(%s) %s -> %s", link->name,
+		pw_log_info("(%s) %s -> %s (%s-%s)", link->name,
 				pw_link_state_as_string(old),
-				pw_link_state_as_string(state));
+				pw_link_state_as_string(state),
+				pw_impl_port_state_as_string(link->output->state),
+				pw_impl_port_state_as_string(link->input->state));
 	}
 
 	pw_impl_link_emit_state_changed(link, old, state, error);
@@ -651,7 +655,7 @@ int pw_impl_link_activate(struct pw_impl_link *this)
 	pw_log_debug("%p: activate activated:%d state:%s", this, impl->activated,
 			pw_link_state_as_string(this->info.state));
 
-	if (impl->activated || !this->prepared ||
+	if (this->destroyed || impl->activated || !this->prepared ||
 		!impl->inode->runnable || !impl->onode->runnable)
 		return 0;
 
@@ -660,8 +664,11 @@ int pw_impl_link_activate(struct pw_impl_link *this)
 		return res;
 
 	if ((res = port_set_io(this, this->output, SPA_IO_Buffers, this->io,
-			sizeof(struct spa_io_buffers), &this->rt.out_mix)) < 0)
+			sizeof(struct spa_io_buffers), &this->rt.out_mix)) < 0) {
+		port_set_io(this, this->input, SPA_IO_Buffers, NULL, 0,
+				&this->rt.in_mix);
 		return res;
+	}
 
 	pw_loop_invoke(this->output->node->data_loop,
 	       do_activate_link, SPA_ID_INVALID, NULL, 0, false, this);
@@ -816,7 +823,7 @@ int pw_impl_link_prepare(struct pw_impl_link *this)
 	if (!impl->inode->active || !impl->onode->active)
 		return 0;
 
-	if (this->preparing || this->prepared)
+	if (this->destroyed || this->preparing || this->prepared)
 		return 0;
 
 	this->preparing = true;
@@ -857,8 +864,9 @@ int pw_impl_link_deactivate(struct pw_impl_link *this)
 
 	impl->activated = false;
 	pw_log_info("(%s) deactivated", this->name);
-	link_update_state(this, PW_LINK_STATE_PAUSED, 0, NULL);
-
+	link_update_state(this, this->destroyed ?
+			PW_LINK_STATE_INIT : PW_LINK_STATE_PAUSED,
+			0, NULL);
 	return 0;
 }
 
@@ -1287,9 +1295,9 @@ struct pw_impl_link *pw_context_create_link(struct pw_context *context,
 		     output_node, output->port_id, this->rt.out_mix.port.port_id,
 		     input_node, input->port_id, this->rt.in_mix.port.port_id);
 
-	this->name = spa_aprintf("%d.%d -> %d.%d",
-			output_node->info.id, output->port_id,
-			input_node->info.id, input->port_id);
+	this->name = spa_aprintf("%d.%d.%d -> %d.%d.%d",
+			output_node->info.id, output->port_id, this->rt.out_mix.port.port_id,
+			input_node->info.id, input->port_id, this->rt.in_mix.port.port_id);
 	pw_log_info("(%s) (%s) -> (%s)", this->name, output_node->name, input_node->name);
 
 	pw_impl_port_emit_link_added(output, this);
@@ -1429,6 +1437,8 @@ void pw_impl_link_destroy(struct pw_impl_link *link)
 
 	pw_log_debug("%p: destroy", impl);
 	pw_log_info("(%s) destroy", link->name);
+
+	link->destroyed = true;
 	pw_impl_link_emit_destroy(link);
 
 	pw_impl_link_deactivate(link);

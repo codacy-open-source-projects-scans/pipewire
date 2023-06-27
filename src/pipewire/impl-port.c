@@ -70,7 +70,7 @@ static void emit_info_changed(struct pw_impl_port *port)
 	port->info.change_mask = 0;
 }
 
-static const char *port_state_as_string(enum pw_impl_port_state state)
+const char *pw_impl_port_state_as_string(enum pw_impl_port_state state)
 {
 	switch (state) {
 	case PW_IMPL_PORT_STATE_ERROR:
@@ -101,7 +101,8 @@ void pw_impl_port_update_state(struct pw_impl_port *port, enum pw_impl_port_stat
 	pw_log(state == PW_IMPL_PORT_STATE_ERROR ?
 			SPA_LOG_LEVEL_ERROR : SPA_LOG_LEVEL_DEBUG,
 		"%p: state %s -> %s (%s)", port,
-		port_state_as_string(old), port_state_as_string(state), error);
+		pw_impl_port_state_as_string(old),
+		pw_impl_port_state_as_string(state), error);
 
 	pw_impl_port_emit_state_changed(port, old, state, error);
 
@@ -131,7 +132,10 @@ do_add_mix(struct spa_loop *loop,
 	struct pw_impl_port *this = mix->p;
 	struct impl *impl = SPA_CONTAINER_OF(this, struct impl, this);
 	pw_log_trace("%p: add mix %p", this, mix);
-	spa_list_append(&impl->mix_list, &mix->rt_link);
+	if (!mix->active) {
+		spa_list_append(&impl->mix_list, &mix->rt_link);
+		mix->active = true;
+	}
 	return 0;
 }
 
@@ -142,7 +146,10 @@ do_remove_mix(struct spa_loop *loop,
 	struct pw_impl_port_mix *mix = user_data;
 	struct pw_impl_port *this = mix->p;
 	pw_log_trace("%p: remove mix %p", this, mix);
-	spa_list_remove(&mix->rt_link);
+	if (mix->active) {
+		spa_list_remove(&mix->rt_link);
+		mix->active = false;
+	}
 	return 0;
 }
 
@@ -156,7 +163,7 @@ static int port_set_io(void *object,
 
 	mix = find_mix(this, direction, port_id);
 	if (mix == NULL)
-		return 0;
+		return -ENOENT;
 
 	if (id == SPA_IO_Buffers) {
 		if (data == NULL || size == 0) {
@@ -324,6 +331,9 @@ int pw_impl_port_release_mix(struct pw_impl_port *port, struct pw_impl_port_mix 
 
 	res = pw_impl_port_call_release_mix(port, mix);
 
+	if (port->destroying)
+		return res;
+
 	if ((res = spa_node_remove_port(port->mix, port->direction, port_id)) < 0 &&
 	    res != -ENOTSUP)
 		pw_log_warn("can't remove mix port %d: %s", port_id, spa_strerror(res));
@@ -337,6 +347,8 @@ int pw_impl_port_release_mix(struct pw_impl_port *port, struct pw_impl_port_mix 
 				     port->direction, port->port_id,
 				     SPA_IO_Buffers,
 				     NULL, sizeof(port->rt.io));
+
+		pw_impl_port_set_param(port, SPA_PARAM_Format, 0, NULL);
 	}
 	return res;
 }
@@ -1705,7 +1717,7 @@ int pw_impl_port_use_buffers(struct pw_impl_port *port, struct pw_impl_port_mix 
 	int res = 0, res2;
 
 	pw_log_debug("%p: %d:%d.%d: %d buffers flags:%d state:%d n_mix:%d", port,
-			port->direction, port->port_id, mix->id,
+			port->direction, port->port_id, mix->port.port_id,
 			n_buffers, flags, port->state, port->n_mix);
 
 	if (n_buffers == 0 && port->state <= PW_IMPL_PORT_STATE_READY)

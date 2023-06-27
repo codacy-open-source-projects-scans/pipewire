@@ -166,6 +166,9 @@ PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
  * are read-only except for the bq_raw biquad, which can configure default values
  * depending on the graph rate and change those at runtime.
  *
+ * We refer to https://arachnoid.com/BiQuadDesigner/index.html for an explanation of
+ * the controls.
+ *
  * The following labels can be used:
  *
  * - `bq_lowpass` a lowpass filter.
@@ -1121,18 +1124,6 @@ static void state_changed(void *data, enum pw_stream_state old,
 	}
 }
 
-static void param_format_cleared(struct impl *impl, struct pw_stream *other,
-		struct spa_audio_info_raw *other_info)
-{
-	uint8_t buffer[1024];
-	struct spa_pod_builder b;
-	const struct spa_pod *params[1];
-
-	spa_pod_builder_init(&b, buffer, sizeof(buffer));
-	params[0] = spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat, other_info);
-	pw_stream_update_params(other, params, 1);
-}
-
 static void param_changed(void *data, uint32_t id, const struct spa_pod *param)
 {
 	struct impl *impl = data;
@@ -1143,8 +1134,6 @@ static void param_changed(void *data, uint32_t id, const struct spa_pod *param)
 	case SPA_PARAM_Format:
 		if (param == NULL) {
 			graph_cleanup(graph);
-			param_format_cleared(impl, impl->capture, &impl->capture_info);
-			param_format_cleared(impl, impl->playback, &impl->playback_info);
 		} else {
 			struct spa_audio_info_raw info;
 			spa_zero(info);
@@ -1266,7 +1255,8 @@ static int setup_streams(struct impl *impl)
 			PW_ID_ANY,
 			PW_STREAM_FLAG_AUTOCONNECT |
 			PW_STREAM_FLAG_MAP_BUFFERS |
-			PW_STREAM_FLAG_RT_PROCESS,
+			PW_STREAM_FLAG_RT_PROCESS |
+			PW_STREAM_FLAG_ASYNC,
 			params, n_params);
 
 	spa_pod_dynamic_builder_clean(&b);
@@ -2477,7 +2467,12 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	parse_audio_info(impl->capture_props, &impl->capture_info);
 	parse_audio_info(impl->playback_props, &impl->playback_info);
 
-	if (impl->capture_info.rate && !impl->playback_info.rate)
+	if (!impl->capture_info.rate && !impl->playback_info.rate) {
+		if (pw_properties_get(impl->playback_props, "resample.disable") == NULL)
+			pw_properties_set(impl->playback_props, "resample.disable", "true");
+		if (pw_properties_get(impl->capture_props, "resample.disable") == NULL)
+			pw_properties_set(impl->capture_props, "resample.disable", "true");
+	} else if (impl->capture_info.rate && !impl->playback_info.rate)
 		impl->playback_info.rate = impl->capture_info.rate;
 	else if (impl->playback_info.rate && !impl->capture_info.rate)
 		impl->capture_info.rate = !impl->playback_info.rate;

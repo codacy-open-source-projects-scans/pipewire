@@ -453,7 +453,8 @@ do_call_process(struct spa_loop *loop,
 static inline void call_process(struct stream *impl)
 {
 	pw_log_trace_fp("%p: call process rt:%u", impl, impl->process_rt);
-	if (impl->direction == SPA_DIRECTION_OUTPUT && update_requested(impl) <= 0)
+	if (impl->n_buffers == 0 ||
+	    (impl->direction == SPA_DIRECTION_OUTPUT && update_requested(impl) <= 0))
 		return;
 	if (impl->process_rt) {
 		if (impl->rt_callbacks.funcs)
@@ -1035,12 +1036,15 @@ static int impl_node_process_input(void *object)
 		/* push new buffer */
 		pw_log_trace_fp("%p: push %d %p", stream, b->id, io);
 		if (queue_push(impl, &impl->dequeued, b) == 0) {
-			copy_position(impl, impl->dequeued.incount);
 			if (b->busy)
 				ATOMIC_INC(b->busy->count);
-			call_process(impl);
 		}
 	}
+	if (!queue_is_empty(impl, &impl->dequeued)) {
+		copy_position(impl, impl->dequeued.incount);
+		call_process(impl);
+	}
+
 	if (io->status != SPA_STATUS_NEED_DATA || io->buffer_id == SPA_ID_INVALID) {
 		/* pop buffer to recycle */
 		if ((b = queue_pop(impl, &impl->queued))) {
@@ -1953,7 +1957,7 @@ pw_stream_connect(struct pw_stream *stream,
 	impl->info.flags = SPA_NODE_FLAG_RT;
 	/* if the callback was not marked RT_PROCESS, we will offload
 	 * the process callback in the main thread and we are ASYNC */
-	if (!impl->process_rt)
+	if (!impl->process_rt || SPA_FLAG_IS_SET(flags, PW_STREAM_FLAG_ASYNC))
 		impl->info.flags |= SPA_NODE_FLAG_ASYNC;
 	impl->info.props = &stream->properties->dict;
 	impl->params[NODE_PropInfo] = SPA_PARAM_INFO(SPA_PARAM_PropInfo, 0);
@@ -2007,10 +2011,12 @@ pw_stream_connect(struct pw_stream *stream,
 		/* XXX this is deprecated but still used by the portal and its apps */
 		pw_properties_setf(stream->properties, PW_KEY_NODE_TARGET, "%d", target_id);
 
-	if ((flags & PW_STREAM_FLAG_AUTOCONNECT) &&
+	if ((str = getenv("PIPEWIRE_AUTOCONNECT")) != NULL)
+		pw_properties_set(stream->properties,
+				PW_KEY_NODE_AUTOCONNECT, spa_atob(str) ? "true" : "false");
+	else if ((flags & PW_STREAM_FLAG_AUTOCONNECT) &&
 	    pw_properties_get(stream->properties, PW_KEY_NODE_AUTOCONNECT) == NULL) {
-		str = getenv("PIPEWIRE_AUTOCONNECT");
-		pw_properties_set(stream->properties, PW_KEY_NODE_AUTOCONNECT, str ? str : "true");
+		pw_properties_set(stream->properties, PW_KEY_NODE_AUTOCONNECT, "true");
 	}
 	if (flags & PW_STREAM_FLAG_DRIVER)
 		pw_properties_set(stream->properties, PW_KEY_NODE_DRIVER, "true");

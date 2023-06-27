@@ -823,6 +823,7 @@ struct pw_impl_port_mix {
 	uint32_t id;
 	uint32_t peer_id;
 	unsigned int have_buffers:1;
+	unsigned int active:1;
 };
 
 struct pw_impl_port_implementation {
@@ -989,6 +990,7 @@ struct pw_impl_link {
 	unsigned int preparing:1;
 	unsigned int prepared:1;
 	unsigned int passive:1;
+	unsigned int destroyed:1;
 };
 
 #define pw_resource_emit(o,m,v,...) spa_hook_list_call(&o->listener_list, struct pw_resource_events, m, v, ##__VA_ARGS__)
