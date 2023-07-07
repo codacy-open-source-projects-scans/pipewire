@@ -40,13 +40,19 @@
  * The `rtp-source` module creates a PipeWire source that receives audio
  * and midi RTP packets.
  *
+ * This module is usually loaded from the \page page_module_rtp_sap so that the
+ * source.ip and source.port and format parameters matches that of the sender.
+ *
  * ## Module Options
  *
  * Options specific to the behavior of this module
  *
  * - `local.ifname = <str>`: interface name to use
+ * - `source.ip = <str>`: the source ip address, default 224.0.0.56
+ * - `source.port = <int>`: the source port
  * - `node.always-process = <bool>`: true to receive even when not running
  * - `sess.latency.msec = <str>`: target network latency in milliseconds, default 100
+ * - `sess.ignore-ssrc = <bool>`: ignore SSRC, default false
  * - `sess.media = <string>`: the media type audio|midi|opus, default audio
  * - `stream.props = {}`: properties to be passed to the stream
  *
@@ -73,7 +79,10 @@
  * {   name = libpipewire-module-rtp-source
  *     args = {
  *         #local.ifname = eth0
+ *         #source.ip = 224.0.0.56
+ *         #source.port = 0
  *         sess.latency.msec = 100
+ *         #sess.ignore-ssrc = false
  *         #node.always-process = false
  *         #sess.media = "audio"
  *         #audio.format = "S16BE"
@@ -106,6 +115,7 @@ PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
 		"( source.ip=<source IP address, default:"DEFAULT_SOURCE_IP"> ) "				\
  		"source.port=<int, source port> "								\
 		"( sess.latency.msec=<target network latency, default "SPA_STRINGIFY(DEFAULT_SESS_LATENCY)"> ) "\
+		"( sess.ignore-ssrc=<to ignore SSRC, default false> ) "\
  		"( sess.media=<string, the media type audio|midi|opus, default audio> ) "			\
 		"( audio.format=<format, default:"DEFAULT_FORMAT"> ) "						\
 		"( audio.rate=<sample rate, default:"SPA_STRINGIFY(DEFAULT_RATE)"> ) "				\
@@ -490,6 +500,7 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	copy_props(impl, props, "sess.max-ptime");
 	copy_props(impl, props, "sess.latency.msec");
 	copy_props(impl, props, "sess.ts-direct");
+	copy_props(impl, props, "sess.ignore-ssrc");
 
 	str = pw_properties_get(props, "local.ifname");
 	impl->ifname = str ? strdup(str) : NULL;
