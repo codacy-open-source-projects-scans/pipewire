@@ -572,6 +572,12 @@ struct pw_global *pw_impl_client_get_global(struct pw_impl_client *client)
 }
 
 SPA_EXPORT
+struct pw_mempool *pw_impl_client_get_mempool(struct pw_impl_client *client)
+{
+	return client->pool;
+}
+
+SPA_EXPORT
 const struct pw_properties *pw_impl_client_get_properties(struct pw_impl_client *client)
 {
 	return client->properties;
@@ -707,7 +713,7 @@ int pw_impl_client_update_permissions(struct pw_impl_client *client,
 			if (context->current_client == client)
 				new_perm &= old_perm;
 
-			pw_log_debug("%p: set default permissions %08x -> %08x",
+			pw_log_info("%p: set default permissions %08x -> %08x",
 					client, old_perm, new_perm);
 
 			def->permissions = new_perm;
@@ -742,7 +748,7 @@ int pw_impl_client_update_permissions(struct pw_impl_client *client,
 			if (context->current_client == client)
 				new_perm &= old_perm;
 
-			pw_log_debug("%p: set global %d permissions %08x -> %08x",
+			pw_log_info("%p: set global %d permissions %08x -> %08x",
 					client, global->id, old_perm, new_perm);
 
 			p->permissions = new_perm;

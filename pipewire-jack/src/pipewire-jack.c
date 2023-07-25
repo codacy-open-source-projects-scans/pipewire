@@ -21,9 +21,11 @@
 #include <spa/support/cpu.h>
 #include <spa/param/audio/format-utils.h>
 #include <spa/param/video/format-utils.h>
+#include <spa/param/latency-utils.h>
 #include <spa/debug/types.h>
 #include <spa/debug/pod.h>
 #include <spa/utils/json.h>
+#include <spa/utils/result.h>
 #include <spa/utils/string.h>
 #include <spa/utils/ringbuffer.h>
 
@@ -298,6 +300,7 @@ struct client {
 	char *load_init;		/* initialization string */
 	jack_uuid_t session_id;		/* requested session_id */
 
+	struct pw_loop *l;
 	struct pw_data_loop *loop;
 	struct pw_properties *props;
 
@@ -1232,7 +1235,7 @@ static struct link *find_activation(struct spa_list *links, uint32_t node_id)
 static void client_remove_source(struct client *c)
 {
 	if (c->socket_source) {
-		pw_loop_destroy_source(c->loop->loop, c->socket_source);
+		pw_loop_destroy_source(c->l, c->socket_source);
 		c->socket_source = NULL;
 	}
 }
@@ -1734,7 +1737,7 @@ static inline void signal_sync(struct client *c)
 		pw_log_trace_fp("%p: link %p %p %d/%d", c, l, state,
 				state->pending, state->required);
 
-		if (pw_node_activation_state_dec(state, 1)) {
+		if (pw_node_activation_state_dec(state)) {
 			l->activation->status = PW_NODE_ACTIVATION_TRIGGERED;
 			l->activation->signal_time = nsec;
 
@@ -1860,7 +1863,7 @@ static int client_node_transport(void *data,
 			c, readfd, writefd, c->node_id);
 
 	close(writefd);
-	c->socket_source = pw_loop_add_io(c->loop->loop,
+	c->socket_source = pw_loop_add_io(c->l,
 					  readfd,
 					  SPA_IO_ERR | SPA_IO_HUP,
 					  true, on_rtsocket_condition, c);
@@ -1895,18 +1898,18 @@ static int install_timeowner(struct client *c)
 	pw_log_debug("%p: activation %p", c, a);
 
 	/* was ok */
-	owner = ATOMIC_LOAD(a->segment_owner[0]);
+	owner = SPA_ATOMIC_LOAD(a->segment_owner[0]);
 	if (owner == c->node_id)
 		return 0;
 
 	/* try to become owner */
 	if (c->timeowner_conditional) {
-		if (!ATOMIC_CAS(a->segment_owner[0], 0, c->node_id)) {
+		if (!SPA_ATOMIC_CAS(a->segment_owner[0], 0, c->node_id)) {
 			pw_log_debug("%p: owner:%u id:%u", c, owner, c->node_id);
 			return -EBUSY;
 		}
 	} else {
-		ATOMIC_STORE(a->segment_owner[0], c->node_id);
+		SPA_ATOMIC_STORE(a->segment_owner[0], c->node_id);
 	}
 
 	pw_log_debug("%p: timebase installed for id:%u", c, c->node_id);
@@ -2020,7 +2023,7 @@ static int client_node_command(void *data, const struct spa_command *command)
 	case SPA_NODE_COMMAND_Suspend:
 	case SPA_NODE_COMMAND_Pause:
 		if (c->started) {
-			pw_loop_update_io(c->loop->loop,
+			pw_loop_update_io(c->l,
 					  c->socket_source, SPA_IO_ERR | SPA_IO_HUP);
 
 			c->started = false;
@@ -2029,7 +2032,7 @@ static int client_node_command(void *data, const struct spa_command *command)
 
 	case SPA_NODE_COMMAND_Start:
 		if (!c->started) {
-			pw_loop_update_io(c->loop->loop,
+			pw_loop_update_io(c->l,
 					  c->socket_source,
 					  SPA_IO_IN | SPA_IO_ERR | SPA_IO_HUP);
 			c->started = true;
@@ -3533,6 +3536,7 @@ jack_client_t * jack_client_open (const char *client_name,
 	uint32_t n_support;
 	const char *str;
 	struct spa_cpu *cpu_iface;
+	const struct pw_properties *props;
 	va_list ap;
 
         if (getenv("PIPEWIRE_NOJACK") != NULL ||
@@ -3604,14 +3608,16 @@ jack_client_t * jack_client_open (const char *client_name,
 	client->notify_buffer = calloc(1, NOTIFY_BUFFER_SIZE + sizeof(struct notify));
 	spa_ringbuffer_init(&client->notify_ring);
 
-	client->allow_mlock = client->context.context->settings.mem_allow_mlock;
-	client->warn_mlock = client->context.context->settings.mem_warn_mlock;
-
 	pw_context_conf_update_props(client->context.context,
 			"jack.properties", client->props);
 
+	props = pw_context_get_properties(client->context.context);
+
+	client->allow_mlock = pw_properties_get_bool(props, "mem.allow-mlock", true);
+	client->warn_mlock = pw_properties_get_bool(props, "mem.warn-mlock", false);
+
 	pw_context_conf_section_match_rules(client->context.context, "jack.rules",
-			&client->context.context->properties->dict, execute_match, client);
+			&props->dict, execute_match, client);
 
 	support = pw_context_get_support(client->context.context, &n_support);
 
@@ -3638,6 +3644,7 @@ jack_client_t * jack_client_open (const char *client_name,
 			&thread_utils_impl, client);
 
 	client->loop = pw_context_get_data_loop(client->context.context);
+	client->l = pw_data_loop_get_loop(client->loop);
 	pw_data_loop_stop(client->loop);
 
 	pw_context_set_object(client->context.context,
@@ -6188,7 +6195,7 @@ int jack_release_timebase (jack_client_t *client)
 	if ((a = c->driver_activation) == NULL)
 		return -EIO;
 
-	if (!ATOMIC_CAS(a->segment_owner[0], c->node_id, 0))
+	if (!SPA_ATOMIC_CAS(a->segment_owner[0], c->node_id, 0))
 		return -EINVAL;
 
 	c->timebase_callback = NULL;
@@ -6360,7 +6367,7 @@ int  jack_transport_reposition (jack_client_t *client,
 	na->reposition.duration = 0;
 	na->reposition.position = pos->frame;
 	na->reposition.rate = 1.0;
-	ATOMIC_STORE(a->reposition_owner, c->node_id);
+	SPA_ATOMIC_STORE(a->reposition_owner, c->node_id);
 
 	return 0;
 }
@@ -6370,7 +6377,7 @@ static void update_command(struct client *c, uint32_t command)
 	struct pw_node_activation *a = c->rt.driver_activation;
 	if (!a)
 		return;
-	ATOMIC_STORE(a->command, command);
+	SPA_ATOMIC_STORE(a->command, command);
 }
 
 SPA_EXPORT
