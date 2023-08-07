@@ -503,7 +503,7 @@ int spa_alsa_init(struct state *state, const struct spa_dict *info)
 	snd_config_update_free_global();
 
 	state->multi_rate = true;
-	state->htimestamp = true;
+	state->htimestamp = false;
 	for (i = 0; info && i < info->n_items; i++) {
 		const char *k = info->items[i].key;
 		const char *s = info->items[i].value;
@@ -2498,9 +2498,10 @@ int spa_alsa_read(struct state *state)
 
 			if (avail < target)
 				max_read = target - avail;
-			else if (avail > target)
+			else if (avail > target) {
 				snd_pcm_forward(state->hndl, avail - target);
-			avail = target;
+				avail = target;
+			}
 			state->alsa_sync = false;
 		} else
 			state->alsa_sync_warning = true;

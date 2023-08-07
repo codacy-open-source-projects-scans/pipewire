@@ -9,12 +9,14 @@
 
 #include <spa/support/plugin.h>
 #include <spa/support/cpu.h>
+#include <spa/support/loop.h>
 #include <spa/support/log.h>
 #include <spa/utils/result.h>
 #include <spa/utils/list.h>
 #include <spa/utils/json.h>
 #include <spa/utils/names.h>
 #include <spa/utils/string.h>
+#include <spa/utils/ratelimit.h>
 #include <spa/node/node.h>
 #include <spa/node/io.h>
 #include <spa/node/utils.h>
@@ -89,6 +91,7 @@ struct props {
 	unsigned int resample_quality;
 	double rate;
 	char wav_path[512];
+	unsigned int lock_volumes:1;
 };
 
 static void props_reset(struct props *props)
@@ -109,6 +112,7 @@ static void props_reset(struct props *props)
 	props->resample_quality = RESAMPLE_DEFAULT_QUALITY;
 	props->rate = 1.0;
 	spa_zero(props->wav_path);
+	props->lock_volumes = false;
 }
 
 struct buffer {
@@ -187,6 +191,8 @@ struct impl {
 	uint32_t max_align;
 	uint32_t quantum_limit;
 	enum spa_direction direction;
+
+	struct spa_ratelimit rate_limit;
 
 	struct props props;
 
@@ -695,6 +701,14 @@ static int impl_node_enum_params(void *object, int seq,
 				SPA_PROP_INFO_type, SPA_POD_String(p->wav_path),
 				SPA_PROP_INFO_params, SPA_POD_Bool(true));
 			break;
+		case 27:
+			param = spa_pod_builder_add_object(&b,
+				SPA_TYPE_OBJECT_PropInfo, id,
+				SPA_PROP_INFO_name, SPA_POD_String("channelmix.lock-volumes"),
+				SPA_PROP_INFO_description, SPA_POD_String("Disable volume updates"),
+				SPA_PROP_INFO_type, SPA_POD_CHOICE_Bool(p->lock_volumes),
+				SPA_PROP_INFO_params, SPA_POD_Bool(true));
+			break;
 		default:
 			return 0;
 		}
@@ -773,6 +787,8 @@ static int impl_node_enum_params(void *object, int seq,
 			spa_pod_builder_string(&b, dither_method_info[this->dir[1].conv.method].label);
 			spa_pod_builder_string(&b, "debug.wav-path");
 			spa_pod_builder_string(&b, p->wav_path);
+			spa_pod_builder_string(&b, "channelmix.lock-volumes");
+			spa_pod_builder_bool(&b, p->lock_volumes);
 			spa_pod_builder_pop(&b, &f[1]);
 			param = spa_pod_builder_pop(&b, &f[0]);
 			break;
@@ -854,6 +870,8 @@ static int audioconvert_set_param(struct impl *this, const char *k, const char *
 		spa_scnprintf(this->props.wav_path,
 				sizeof(this->props.wav_path), "%s", s ? s : "");
 	}
+	else if (spa_streq(k, "channelmix.lock-volumes"))
+		this->props.lock_volumes = spa_atob(s);
 	else
 		return 0;
 	return 1;
@@ -1049,13 +1067,15 @@ static int apply_props(struct impl *this, const struct spa_pod *param)
 		case SPA_PROP_volume:
 			p->prev_volume = p->volume;
 
-			if (spa_pod_get_float(&prop->value, &p->volume) == 0) {
+			if (!p->lock_volumes &&
+			    spa_pod_get_float(&prop->value, &p->volume) == 0) {
 				spa_log_debug(this->log, "%p new volume %f", this, p->volume);
 				changed++;
 			}
 			break;
 		case SPA_PROP_mute:
-			if (spa_pod_get_bool(&prop->value, &p->channel.mute) == 0) {
+			if (!p->lock_volumes &&
+			    spa_pod_get_bool(&prop->value, &p->channel.mute) == 0) {
 				have_channel_volume = true;
 				changed++;
 			}
@@ -1124,7 +1144,8 @@ static int apply_props(struct impl *this, const struct spa_pod *param)
 			}
 			break;
 		case SPA_PROP_channelVolumes:
-			if ((n = spa_pod_copy_array(&prop->value, SPA_TYPE_Float,
+			if (!p->lock_volumes &&
+			    (n = spa_pod_copy_array(&prop->value, SPA_TYPE_Float,
 					p->channel.volumes, SPA_AUDIO_MAX_CHANNELS)) > 0) {
 				have_channel_volume = true;
 				p->channel.n_volumes = n;
@@ -1139,13 +1160,15 @@ static int apply_props(struct impl *this, const struct spa_pod *param)
 			}
 			break;
 		case SPA_PROP_softMute:
-			if (spa_pod_get_bool(&prop->value, &p->soft.mute) == 0) {
+			if (!p->lock_volumes &&
+			    spa_pod_get_bool(&prop->value, &p->soft.mute) == 0) {
 				have_soft_volume = true;
 				changed++;
 			}
 			break;
 		case SPA_PROP_softVolumes:
-			if ((n = spa_pod_copy_array(&prop->value, SPA_TYPE_Float,
+			if (!p->lock_volumes &&
+			    (n = spa_pod_copy_array(&prop->value, SPA_TYPE_Float,
 					p->soft.volumes, SPA_AUDIO_MAX_CHANNELS)) > 0) {
 				have_soft_volume = true;
 				p->soft.n_volumes = n;
@@ -1187,7 +1210,7 @@ static int apply_props(struct impl *this, const struct spa_pod *param)
 		set_volume(this);
 	}
 
-	if (vol_ramp_params_changed) {
+	if (!p->lock_volumes && vol_ramp_params_changed) {
 		void *sequence = NULL;
 		if (p->volume == p->prev_volume)
 			spa_log_error(this->log, "no change in volume, cannot ramp volume");
@@ -2297,12 +2320,8 @@ static inline struct buffer *peek_buffer(struct impl *this, struct port *port)
 {
 	struct buffer *b;
 
-	if (spa_list_is_empty(&port->queue)) {
-		if (port->n_buffers > 0)
-			spa_log_warn(this->log, "%p: out of buffers on port %d %d",
-				this, port->id, port->n_buffers);
+	if (spa_list_is_empty(&port->queue))
 		return NULL;
-	}
 
 	b = spa_list_first(&port->queue, struct buffer, link);
 	spa_log_trace_fp(this->log, "%p: peek buffer %d/%d on port %d %u",
@@ -2312,10 +2331,12 @@ static inline struct buffer *peek_buffer(struct impl *this, struct port *port)
 
 static inline void dequeue_buffer(struct impl *this, struct port *port, struct buffer *b)
 {
-	spa_list_remove(&b->link);
-	SPA_FLAG_CLEAR(b->flags, BUFFER_FLAG_QUEUED);
 	spa_log_trace_fp(this->log, "%p: dequeue buffer %d on port %d %u",
 			this, b->id, port->id, b->flags);
+	if (!SPA_FLAG_IS_SET(b->flags, BUFFER_FLAG_QUEUED))
+		return;
+	spa_list_remove(&b->link);
+	SPA_FLAG_CLEAR(b->flags, BUFFER_FLAG_QUEUED);
 }
 
 static int
@@ -2595,6 +2616,14 @@ static inline bool resample_is_passthrough(struct impl *this)
 	return true;
 }
 
+static uint64_t get_time_ns(struct impl *impl)
+{
+	struct timespec now;
+	if (clock_gettime(CLOCK_MONOTONIC, &now) < 0)
+		return 0;
+	return SPA_TIMESPEC_TO_NSEC(&now);
+}
+
 static int impl_node_process(void *object)
 {
 	struct impl *this = object;
@@ -2607,12 +2636,13 @@ static int impl_node_process(void *object)
 	struct buffer *buf, *out_bufs[MAX_PORTS];
 	struct spa_data *bd;
 	struct dir *dir;
-	int tmp = 0, res = 0;
+	int tmp = 0, res = 0, missed;
 	bool in_passthrough, mix_passthrough, resample_passthrough, out_passthrough;
 	bool in_avail = false, flush_in = false, flush_out = false;
 	bool draining = false, in_empty = this->out_offset == 0;
 	struct spa_io_buffers *io, *ctrlio = NULL;
 	const struct spa_pod_sequence *ctrl = NULL;
+	uint64_t current_time;
 
 	/* calculate quantum scale, this is how many samples we need to produce or
 	 * consume. Also update the rate scale, this is sent to the resampler to adjust
@@ -2621,6 +2651,7 @@ static int impl_node_process(void *object)
 	if (SPA_LIKELY(this->io_position)) {
 		double r =  this->rate_scale;
 
+		current_time = this->io_position->clock.nsec;
 		quant_samples = this->io_position->clock.duration;
 		if (this->direction == SPA_DIRECTION_INPUT) {
 			if (this->io_position->clock.rate.denom != this->resample.o_rate)
@@ -2641,8 +2672,10 @@ static int impl_node_process(void *object)
 			this->rate_scale = r;
 		}
 	}
-	else
+	else {
+		current_time = get_time_ns(this);
 		quant_samples = this->quantum_limit;
+	}
 
 	dir = &this->dir[SPA_DIRECTION_INPUT];
 	in_passthrough = dir->conv.is_passthrough;
@@ -2770,6 +2803,11 @@ static int impl_node_process(void *object)
 				queue_buffer(this, port, io->buffer_id);
 
 			buf = peek_buffer(this, port);
+			if (buf == NULL && port->n_buffers > 0 &&
+			    (missed = spa_ratelimit_test(&this->rate_limit, current_time)) >= 0) {
+				spa_log_warn(this->log, "%p: (%d missed) out of buffers on port %d %d",
+					this, missed, port->id, port->n_buffers);
+			}
 		}
 		out_bufs[i] = buf;
 
@@ -3176,8 +3214,10 @@ impl_init(const struct spa_handle_factory *factory,
 		this->cpu_flags = spa_cpu_get_flags(this->cpu);
 		this->max_align = SPA_MIN(MAX_ALIGN, spa_cpu_get_max_align(this->cpu));
 	}
-
 	props_reset(&this->props);
+
+	this->rate_limit.interval = 2 * SPA_NSEC_PER_SEC;
+	this->rate_limit.burst = 1;
 
 	this->mix.options = CHANNELMIX_OPTION_UPMIX | CHANNELMIX_OPTION_MIX_LFE;
 	this->mix.upmix = CHANNELMIX_UPMIX_NONE;
