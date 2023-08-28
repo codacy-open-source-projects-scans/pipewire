@@ -1051,6 +1051,26 @@ static int emit_nodes(struct impl *this)
 				emit_device_set_node(this, DEVICE_ID_SINK_SET);
 		}
 
+		if (this->bt_dev->connected_profiles & (SPA_BT_PROFILE_BAP_BROADCAST_SINK)) {
+			t = find_transport(this, SPA_BT_PROFILE_BAP_BROADCAST_SINK, this->props.codec);
+			if (t) {
+				this->props.codec = t->media_codec->id;
+				emit_node(this, t, DEVICE_ID_SINK, SPA_NAME_API_BLUEZ5_MEDIA_SINK, false);
+			}
+
+			if (this->device_set.leader && this->device_set.sinks > 0)
+				emit_device_set_node(this, DEVICE_ID_SINK_SET);
+		}
+
+		if (this->bt_dev->connected_profiles & (SPA_BT_PROFILE_BAP_BROADCAST_SOURCE)) {
+			t = find_transport(this, SPA_BT_PROFILE_BAP_BROADCAST_SOURCE, this->props.codec);
+			if (t) {
+				this->props.codec = t->media_codec->id;
+				emit_dynamic_node(&this->dyn_media_source, this, t,
+					DEVICE_ID_SOURCE, SPA_NAME_API_BLUEZ5_MEDIA_SOURCE, false);
+			}
+		}
+
 		if (get_supported_media_codec(this, this->props.codec, NULL) == NULL)
 			this->props.codec = 0;
 		break;
@@ -1467,19 +1487,8 @@ static uint32_t get_index_from_profile(struct impl *this, uint32_t profile, enum
 	if (profile == DEVICE_PROFILE_OFF || profile == DEVICE_PROFILE_AG)
 		return profile;
 
-	if (profile == DEVICE_PROFILE_A2DP) {
-		if (codec == 0 || (this->bt_dev->connected_profiles & SPA_BT_PROFILE_MEDIA_SOURCE))
-			return profile;
-
+	if ((profile == DEVICE_PROFILE_A2DP) || (profile == DEVICE_PROFILE_BAP))
 		return codec + DEVICE_PROFILE_LAST;
-	}
-
-	if (profile == DEVICE_PROFILE_BAP) {
-		if (codec == 0)
-			return profile;
-
-		return codec + DEVICE_PROFILE_LAST;
-	}
 
 	if (profile == DEVICE_PROFILE_HSP_HFP) {
 		if (codec == 0 || (this->bt_dev->connected_profiles & SPA_BT_PROFILE_HFP_AG))
@@ -1607,6 +1616,11 @@ static struct spa_pod *build_profile(struct impl *this, struct spa_pod_builder *
 		if (!(profile & SPA_BT_PROFILE_A2DP_SINK)) {
 			return NULL;
 		}
+
+		/* A2DP will only enlist codec profiles */
+		if (!codec)
+			return NULL;
+
 		name = spa_bt_profile_name(profile);
 		n_sink++;
 		if (codec) {
@@ -1617,7 +1631,15 @@ static struct spa_pod *build_profile(struct impl *this, struct spa_pod_builder *
 				return NULL;
 			}
 			name_and_codec = spa_aprintf("%s-%s", name, media_codec->name);
-			name = name_and_codec;
+
+			/*
+			 * Give base name to highest priority profile, so that best codec can be
+			 * selected at command line with out knowing which codecs are actually
+			 * supported
+			 */
+			if (idx != 0)
+				name = name_and_codec;
+
 			if (profile == SPA_BT_PROFILE_A2DP_SINK && !media_codec->duplex_codec) {
 				desc_and_codec = spa_aprintf(_("High Fidelity Playback (A2DP Sink, codec %s)"),
 							     media_codec->description);
@@ -1641,28 +1663,27 @@ static struct spa_pod *build_profile(struct impl *this, struct spa_pod_builder *
 	case DEVICE_PROFILE_BAP:
 	{
 		uint32_t profile = device->connected_profiles &
-		      (SPA_BT_PROFILE_BAP_SINK | SPA_BT_PROFILE_BAP_SOURCE);
+		      (SPA_BT_PROFILE_BAP_SINK | SPA_BT_PROFILE_BAP_SOURCE 
+			  	| SPA_BT_PROFILE_BAP_BROADCAST_SOURCE 
+				| SPA_BT_PROFILE_BAP_BROADCAST_SINK);
 		size_t idx;
 		const struct media_codec *media_codec;
+
+		/* BAP will only enlist codec profiles */
+		if (codec == 0)
+			return NULL;
 
 		if (profile == 0)
 			return NULL;
 
-		if (profile & (SPA_BT_PROFILE_BAP_SINK))
+		if ((profile & (SPA_BT_PROFILE_BAP_SINK)) || 
+			(profile & (SPA_BT_PROFILE_BAP_BROADCAST_SINK)))
 			n_sink++;
-		if (profile & (SPA_BT_PROFILE_BAP_SOURCE))
+		if ((profile & (SPA_BT_PROFILE_BAP_SOURCE)) || 
+			(profile & (SPA_BT_PROFILE_BAP_BROADCAST_SOURCE)))
 			n_source++;
 
 		name = spa_bt_profile_name(profile);
-
-		/* If we can't codec switch, emit codecless profile */
-		if (current && !can_bap_codec_switch(this)) {
-			codec = 0;
-			index = get_index_from_profile(this, profile_index, codec);
-		} else if ((codec != 0) != can_bap_codec_switch(this)) {
-			errno = -EINVAL;
-			return NULL;
-		}
 
 		if (codec) {
 			media_codec = get_supported_media_codec(this, codec, &idx);
@@ -1671,13 +1692,23 @@ static struct spa_pod *build_profile(struct impl *this, struct spa_pod_builder *
 				return NULL;
 			}
 			name_and_codec = spa_aprintf("%s-%s", name, media_codec->name);
-			name = name_and_codec;
+
+			/*
+			 * Give base name to highest priority profile, so that best codec can be
+			 * selected at command line with out knowing which codecs are actually
+			 * supported
+			 */
+			if (idx != 0)
+				name = name_and_codec;
+
 			switch (profile) {
 			case SPA_BT_PROFILE_BAP_SINK:
+			case SPA_BT_PROFILE_BAP_BROADCAST_SINK:
 				desc_and_codec = spa_aprintf(_("High Fidelity Playback (BAP Sink, codec %s)"),
 						media_codec->description);
 				break;
 			case SPA_BT_PROFILE_BAP_SOURCE:
+			case SPA_BT_PROFILE_BAP_BROADCAST_SOURCE:
 				desc_and_codec = spa_aprintf(_("High Fidelity Input (BAP Source, codec %s)"),
 						media_codec->description);
 				break;
@@ -1690,9 +1721,11 @@ static struct spa_pod *build_profile(struct impl *this, struct spa_pod_builder *
 		} else {
 			switch (profile) {
 			case SPA_BT_PROFILE_BAP_SINK:
+			case SPA_BT_PROFILE_BAP_BROADCAST_SINK:
 				desc = _("High Fidelity Playback (BAP Sink)");
 				break;
 			case SPA_BT_PROFILE_BAP_SOURCE:
+			case SPA_BT_PROFILE_BAP_BROADCAST_SOURCE:
 				desc = _("High Fidelity Input (BAP Source)");
 				break;
 			default:
