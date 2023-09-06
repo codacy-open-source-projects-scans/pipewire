@@ -445,6 +445,17 @@ static int suspend_node(struct pw_impl_node *this)
 
 	node_deactivate(this);
 
+	pw_log_debug("%p: suspend node driving:%d driver:%d added:%d", this,
+			this->driving, this->driver, this->added);
+
+	res = spa_node_send_command(this->node,
+				    &SPA_NODE_COMMAND_INIT(SPA_NODE_COMMAND_Suspend));
+	if (res == -ENOTSUP)
+		res = spa_node_send_command(this->node,
+				    &SPA_NODE_COMMAND_INIT(SPA_NODE_COMMAND_Pause));
+	if (res < 0 && res != -EIO)
+		pw_log_warn("%p: suspend node error %s", this, spa_strerror(res));
+
 	spa_list_for_each(p, &this->input_ports, link) {
 		if ((res = pw_impl_port_set_param(p, SPA_PARAM_Format, 0, NULL)) < 0)
 			pw_log_warn("%p: error unset format input: %s",
@@ -460,17 +471,6 @@ static int suspend_node(struct pw_impl_node *this)
 		/* force CONFIGURE in case of async */
 		p->state = PW_IMPL_PORT_STATE_CONFIGURE;
 	}
-
-	pw_log_debug("%p: suspend node driving:%d driver:%d added:%d", this,
-			this->driving, this->driver, this->added);
-
-	res = spa_node_send_command(this->node,
-				    &SPA_NODE_COMMAND_INIT(SPA_NODE_COMMAND_Suspend));
-	if (res == -ENOTSUP)
-		res = spa_node_send_command(this->node,
-				    &SPA_NODE_COMMAND_INIT(SPA_NODE_COMMAND_Pause));
-	if (res < 0 && res != -EIO)
-		pw_log_warn("%p: suspend node error %s", this, spa_strerror(res));
 
 	node_update_state(this, PW_NODE_STATE_SUSPENDED, 0, NULL);
 
@@ -591,7 +591,6 @@ static int node_send_command(void *object, const struct spa_command *command)
 {
 	struct resource_data *data = object;
 	struct pw_impl_node *node = data->node;
-	struct impl *impl = SPA_CONTAINER_OF(node, struct impl, this);
 	uint32_t id = SPA_NODE_COMMAND_ID(command);
 
 	pw_log_debug("%p: got command %d (%s)", node, id,
@@ -599,9 +598,7 @@ static int node_send_command(void *object, const struct spa_command *command)
 
 	switch (id) {
 	case SPA_NODE_COMMAND_Suspend:
-		if (node->info.state == PW_NODE_STATE_ERROR ||
-		    impl->pending_state == PW_NODE_STATE_IDLE)
-			suspend_node(node);
+		suspend_node(node);
 		break;
 	default:
 		spa_node_send_command(node->node, command);
@@ -1799,7 +1796,12 @@ static int node_ready(void *data, int status)
 		 * help drivers that don't support this yet */
 		if (SPA_UNLIKELY(node->rt.position->clock.duration != node->rt.position->clock.target_duration ||
 		    node->rt.position->clock.rate.denom != node->rt.position->clock.target_rate.denom)) {
-			pw_log_warn("driver %s did not update duration/rate", node->name);
+			pw_log_warn("driver %s did not update duration/rate (%"PRIu64"/%"PRIu64" %u/%u)",
+					node->name,
+					node->rt.position->clock.duration,
+					node->rt.position->clock.target_duration,
+					node->rt.position->clock.rate.denom,
+					node->rt.position->clock.target_rate.denom);
 			node->rt.position->clock.duration = node->rt.position->clock.target_duration;
 			node->rt.position->clock.rate = node->rt.position->clock.target_rate;
 		}

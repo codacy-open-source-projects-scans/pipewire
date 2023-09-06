@@ -499,8 +499,12 @@ int spa_alsa_init(struct state *state, const struct spa_dict *info)
 {
 	uint32_t i;
 	int err;
+	const char *str;
 
 	snd_config_update_free_global();
+
+	if ((str = spa_dict_lookup(info, "device.profile.pro")) != NULL)
+		state->is_pro = spa_atob(str);
 
 	state->multi_rate = true;
 	state->htimestamp = false;
@@ -916,7 +920,7 @@ static int add_rate(struct state *state, uint32_t scale, uint32_t interleave, bo
 		min = max = rate;
 
 	if (rate == 0)
-		rate = state->position ? state->position->clock.rate.denom : DEFAULT_RATE;
+		rate = state->position ? state->position->clock.target_rate.denom : DEFAULT_RATE;
 
 	rate = SPA_CLAMP(rate, min, max);
 
@@ -1345,6 +1349,17 @@ static int enum_dsd_formats(struct state *state, uint32_t index, uint32_t *next,
 	return 1;
 }
 
+/* find smaller power of 2 */
+static uint32_t flp2(uint32_t x)
+{
+	x = x | (x >> 1);
+	x = x | (x >> 2);
+	x = x | (x >> 4);
+	x = x | (x >> 8);
+	x = x | (x >> 16);
+	return x - (x >> 1);
+}
+
 int
 spa_alsa_enum_format(struct state *state, int seq, uint32_t start, uint32_t num,
 		     const struct spa_pod *filter)
@@ -1422,6 +1437,7 @@ int spa_alsa_set_format(struct state *state, struct spa_audio_info *fmt, uint32_
 	unsigned int periods;
 	bool match = true, planar = false, is_batch;
 	char spdif_params[128] = "";
+	uint32_t default_period, latency;
 
 	spa_log_debug(state->log, "opened:%d format:%d started:%d", state->opened,
 			state->have_format, state->started);
@@ -1647,12 +1663,15 @@ int spa_alsa_set_format(struct state *state, struct spa_audio_info *fmt, uint32_
 	period_size = state->default_period_size;
 	is_batch = snd_pcm_hw_params_is_batch(params) && !state->disable_batch;
 
+	default_period = SPA_SCALE32_UP(DEFAULT_PERIOD, state->rate, DEFAULT_RATE);
+	default_period = flp2(2 * default_period - 1);
+
 	/* no period size specified. If we are batch or not using timers,
 	 * use the graph duration as the period */
 	if (period_size == 0 && (is_batch || state->disable_tsched))
-		period_size = state->position ? state->position->clock.target_duration : DEFAULT_PERIOD;
+		period_size = state->position ? state->position->clock.target_duration : default_period;
 	if (period_size == 0)
-		period_size = DEFAULT_PERIOD;
+		period_size = default_period;
 
 	if (!state->disable_tsched) {
 		if (is_batch) {
@@ -1660,7 +1679,7 @@ int spa_alsa_set_format(struct state *state, struct spa_audio_info *fmt, uint32_
 			 * the period smaller and add one period of headroom. Limit the
 			 * period size to our default so that we don't create too much
 			 * headroom. */
-			period_size = SPA_MIN(period_size, DEFAULT_PERIOD) / 2;
+			period_size = SPA_MIN(period_size, default_period) / 2;
 		} else {
 			/* disable ALSA wakeups */
 			if (snd_pcm_hw_params_can_disable_period_wakeup(params))
@@ -1719,9 +1738,12 @@ int spa_alsa_set_format(struct state *state, struct spa_audio_info *fmt, uint32_
 	state->headroom = SPA_MIN(state->headroom, state->buffer_frames);
 	state->start_delay = state->default_start_delay;
 
+	latency = SPA_MAX(state->min_delay, SPA_MIN(state->max_delay, state->headroom));
+	if (state->position != NULL)
+		latency = SPA_SCALE32_UP(latency, state->position->clock.target_rate.denom, state->rate);
+
 	state->latency[state->port_direction].min_rate =
-		state->latency[state->port_direction].max_rate =
-			SPA_MAX(state->min_delay, SPA_MIN(state->max_delay, state->headroom));
+		state->latency[state->port_direction].max_rate = latency;
 
 	spa_log_info(state->log, "%s (%s): format:%s access:%s-%s rate:%d channels:%d "
 			"buffer frames %lu, period frames %lu, periods %u, frame_size %zd "
@@ -1927,14 +1949,17 @@ static int alsa_recover(struct state *state, int err)
 
 		delay = SPA_TIMEVAL_TO_USEC(&diff);
 		missing = delay * state->rate / SPA_USEC_PER_SEC;
+		missing += state->start_delay + state->threshold + state->headroom;
 
 		spa_log_trace(state->log, "%p: xrun of %"PRIu64" usec %"PRIu64,
 				state, delay, missing);
 
+		if (state->clock) {
+			state->clock->xrun += SPA_SCALE32_UP(missing,
+					state->clock->rate.denom, state->rate);
+		}
 		spa_node_call_xrun(&state->callbacks,
 				SPA_TIMEVAL_TO_USEC(&trigger), delay, NULL);
-
-		state->sample_count += missing ? missing : state->threshold;
 		break;
 	}
 	case SND_PCM_STATE_SUSPENDED:
@@ -2197,8 +2222,15 @@ static inline int check_position_config(struct state *state)
 	if (SPA_UNLIKELY(state->position  == NULL))
 		return 0;
 
-	target_duration = state->position->clock.target_duration;
-	target_rate = state->position->clock.target_rate;
+	if (state->disable_tsched && state->started && !state->following) {
+		target_duration = state->period_frames;
+		target_rate = SPA_FRACTION(1, state->rate);
+		state->position->clock.target_duration = target_duration;
+		state->position->clock.target_rate = target_rate;
+	} else {
+		target_duration = state->position->clock.target_duration;
+		target_rate = state->position->clock.target_rate;
+	}
 
 	if (SPA_UNLIKELY((state->duration != target_duration) ||
 	    (state->rate_denom != target_rate.denom))) {
