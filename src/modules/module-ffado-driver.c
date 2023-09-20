@@ -39,7 +39,7 @@
  * ## Module Options
  *
  * - `driver.mode`: the driver mode, sink|source|duplex, default duplex
- * - `ffado.devices`: array of devices to open, default hw:0
+ * - `ffado.devices`: array of devices to open, default "hw:0"
  * - `ffado.period-size`: period size,default 1024
  * - `ffado.period-num`: period number,default 3
  * - `ffado.sample-rate`: sample-rate, default 48000
@@ -71,7 +71,7 @@
  * {   name = libpipewire-module-ffado-driver
  *     args = {
  *         #driver.mode       = duplex
- *         #ffado.devices     = [ hw:0 ]
+ *         #ffado.devices     = [ "hw:0" ]
  *         #ffado.period-size = 1024
  *         #ffado.period-num  = 3
  *         #ffado.sample-rate = 48000
@@ -100,7 +100,7 @@ PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
 
 #define MAX_PORTS	128
 
-#define DEFAULT_DEVICES		"[ hw:0 ]"
+#define DEFAULT_DEVICES		"[ \"hw:0\" ]"
 #define DEFAULT_PERIOD_SIZE	1024
 #define DEFAULT_PERIOD_NUM	3
 #define DEFAULT_SAMPLE_RATE	48000
@@ -113,7 +113,7 @@ PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
 
 #define MODULE_USAGE	"( remote.name=<remote> ) "				\
 			"( driver.mode=<sink|source|duplex> ) "			\
-			"( ffado.devices=<devices array size, default hw:0> ) "	\
+			"( ffado.devices=<devices array size, default \"hw:0\"> ) "	\
 			"( ffado.period-size=<period size, default 1024> ) "	\
 			"( ffado.period-num=<period num, default 3> ) "		\
 			"( ffado.sample-rate=<sampe rate, default 48000> ) "	\
@@ -417,7 +417,7 @@ static void param_latency_changed(struct stream *s, const struct spa_pod *param,
 	bool update = false;
 	enum spa_direction direction = port->direction;
 
-	if (spa_latency_parse(param, &latency) < 0)
+	if (param == NULL || spa_latency_parse(param, &latency) < 0)
 		return;
 
 	if (spa_latency_info_compare(&port->latency[direction], &latency)) {

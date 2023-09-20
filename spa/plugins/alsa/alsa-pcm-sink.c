@@ -252,9 +252,13 @@ static int impl_node_set_io(void *object, uint32_t id, void *data, size_t size)
 
 	switch (id) {
 	case SPA_IO_Clock:
+		if (size > 0 && size < sizeof(struct spa_io_clock))
+			return -EINVAL;
 		this->clock = data;
 		break;
 	case SPA_IO_Position:
+		if (size > 0 && size < sizeof(struct spa_io_position))
+			return -EINVAL;
 		this->position = data;
 		break;
 	default:
@@ -820,14 +824,9 @@ static int impl_node_process(void *object)
 		spa_list_append(&this->ready, &b->link);
 		SPA_FLAG_CLEAR(b->flags, BUFFER_FLAG_OUT);
 		io->buffer_id = SPA_ID_INVALID;
-
-		spa_alsa_write(this);
-
-		io->status = SPA_STATUS_OK;
 	}
-	else if (!spa_list_is_empty(&this->ready)) {
+	if (!spa_list_is_empty(&this->ready)) {
 		spa_alsa_write(this);
-
 		io->status = SPA_STATUS_OK;
 	}
 	return SPA_STATUS_HAVE_DATA;
