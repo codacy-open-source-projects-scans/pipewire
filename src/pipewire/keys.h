@@ -38,6 +38,8 @@ extern "C" {
 #define PW_KEY_SEC_GID			"pipewire.sec.gid"	/**< client gid, set by protocol*/
 #define PW_KEY_SEC_LABEL		"pipewire.sec.label"	/**< client security label, set by protocol*/
 
+#define PW_KEY_SEC_SOCKET		"pipewire.sec.socket"	/**< client socket name, set by protocol */
+
 #define PW_KEY_LIBRARY_NAME_SYSTEM	"library.name.system"	/**< name of the system library to use */
 #define PW_KEY_LIBRARY_NAME_LOOP	"library.name.loop"	/**< name of the loop library to use */
 #define PW_KEY_LIBRARY_NAME_DBUS	"library.name.dbus"	/**< name of the dbus library to use */
@@ -88,7 +90,9 @@ extern "C" {
 /* remote keys */
 #define PW_KEY_REMOTE_NAME		"remote.name"		/**< The name of the remote to connect to,
 								  *  default pipewire-0, overwritten by
-								  *  env(PIPEWIRE_REMOTE) */
+								  *  env(PIPEWIRE_REMOTE). May also be
+								  *  a SPA-JSON array of sockets, to be tried
+								  *  in order. */
 #define PW_KEY_REMOTE_INTENTION		"remote.intention"	/**< The intention of the remote connection,
 								  *  "generic", "screencast" */
 

@@ -131,6 +131,8 @@ static int alsa_set_param(struct state *state, const char *k, const char *s)
 		state->multi_rate = spa_atob(s);
 	} else if (spa_streq(k, "api.alsa.htimestamp")) {
 		state->htimestamp = spa_atob(s);
+	} else if (spa_streq(k, "api.alsa.auto-link")) {
+		state->auto_link = spa_atob(s);
 	} else if (spa_streq(k, "latency.internal.rate")) {
 		state->process_latency.rate = atoi(s);
 	} else if (spa_streq(k, "latency.internal.ns")) {
@@ -512,7 +514,6 @@ int spa_alsa_init(struct state *state, const struct spa_dict *info)
 
 	state->multi_rate = true;
 	state->htimestamp = false;
-	state->disable_tsched = state->is_pro;
 	for (i = 0; info && i < info->n_items; i++) {
 		const char *k = info->items[i].key;
 		const char *s = info->items[i].value;
@@ -573,6 +574,9 @@ int spa_alsa_clear(struct state *state)
 	if ((err = snd_output_close(state->output)) < 0)
 		spa_log_warn(state->log, "output close failed: %s", snd_strerror(err));
 	fclose(state->log_file);
+
+	free(state->tag[0]);
+	free(state->tag[1]);
 
 	return err;
 }
@@ -1476,6 +1480,37 @@ spa_alsa_enum_format(struct state *state, int seq, uint32_t start, uint32_t num,
 	return res;
 }
 
+static void recalc_headroom(struct state *state)
+{
+	uint32_t latency;
+	uint32_t rate = 0;
+
+	if (state->position != NULL)
+		rate = state->position->clock.target_rate.denom;
+
+	state->headroom = state->default_headroom;
+	if (!state->disable_tsched || state->resample) {
+		/* When using timers, we might miss the pointer update for batch
+		 * devices so add some extra headroom. With IRQ, we know the pointers
+		 * are updated when we wake up and we don't need the headroom. */
+		if (state->is_batch)
+			state->headroom += state->period_frames;
+		/* Add 32 extra samples of headroom to handle jitter in capture.
+		 * For IRQ, we don't need this because when we wake up, we have
+		 * exactly enough samples to read or write. */
+		if (state->stream == SND_PCM_STREAM_CAPTURE)
+			state->headroom = SPA_MAX(state->headroom, 32u);
+	}
+	state->headroom = SPA_MIN(state->headroom, state->buffer_frames);
+
+	latency = SPA_MAX(state->min_delay, SPA_MIN(state->max_delay, state->headroom));
+	if (rate != 0 && state->rate != 0)
+		latency = SPA_SCALE32_UP(latency, rate, state->rate);
+
+	state->latency[state->port_direction].min_rate =
+		state->latency[state->port_direction].max_rate = latency;
+}
+
 int spa_alsa_set_format(struct state *state, struct spa_audio_info *fmt, uint32_t flags)
 {
 	unsigned int rrate, rchannels, val, rscale = 1;
@@ -1486,14 +1521,15 @@ int spa_alsa_set_format(struct state *state, struct spa_audio_info *fmt, uint32_
 	snd_pcm_access_mask_t *amask;
 	snd_pcm_t *hndl;
 	unsigned int periods;
-	bool match = true, planar = false, is_batch;
+	bool match = true, planar = false;
 	char spdif_params[128] = "";
-	uint32_t default_period, latency;
+	uint32_t default_period;
 
 	spa_log_debug(state->log, "opened:%d format:%d started:%d", state->opened,
 			state->have_format, state->started);
 
 	state->use_mmap = !state->disable_mmap;
+	state->force_position = false;
 
 	switch (fmt->media_subtype) {
 	case SPA_MEDIA_SUBTYPE_raw:
@@ -1556,6 +1592,7 @@ int spa_alsa_set_format(struct state *state, struct spa_audio_info *fmt, uint32_
 				IEC958_AES0_CON_EMPHASIS_NONE | IEC958_AES0_NONAUDIO,
 				IEC958_AES1_CON_ORIGINAL | IEC958_AES1_CON_PCM_CODER,
 				0, aes3);
+		state->force_position = true;
 		break;
 	}
 	case SPA_MEDIA_SUBTYPE_dsd:
@@ -1706,10 +1743,10 @@ int spa_alsa_set_format(struct state *state, struct spa_audio_info *fmt, uint32_
 	else
 		state->frame_size *= rchannels;
 
-	/* make sure we updates threshold in check_position_config() because they depend
+	/* make sure we update threshold in check_position_config() because they depend
 	 * on the samplerate. */
-	state->duration = 0;
-	state->rate_denom = 0;
+	state->driver_duration = 0;
+	state->driver_rate.denom = 0;
 
 	state->have_format = true;
 	if (state->card->format_ref++ == 0)
@@ -1717,20 +1754,20 @@ int spa_alsa_set_format(struct state *state, struct spa_audio_info *fmt, uint32_
 
 	dir = 0;
 	period_size = state->default_period_size;
-	is_batch = snd_pcm_hw_params_is_batch(params) && !state->disable_batch;
+	state->is_batch = snd_pcm_hw_params_is_batch(params) && !state->disable_batch;
 
 	default_period = SPA_SCALE32_UP(DEFAULT_PERIOD, state->rate, DEFAULT_RATE);
 	default_period = flp2(2 * default_period - 1);
 
 	/* no period size specified. If we are batch or not using timers,
 	 * use the graph duration as the period */
-	if (period_size == 0 && (is_batch || state->disable_tsched))
+	if (period_size == 0 && (state->is_batch || state->disable_tsched))
 		period_size = state->position ? state->position->clock.target_duration : default_period;
 	if (period_size == 0)
 		period_size = default_period;
 
-	if (!state->disable_tsched) {
-		if (is_batch) {
+	if (!state->disable_tsched || state->resample) {
+		if (state->is_batch) {
 			/* batch devices get their hw pointers updated every period. Make
 			 * the period smaller and add one period of headroom. Limit the
 			 * period size to our default so that we don't create too much
@@ -1770,20 +1807,6 @@ int spa_alsa_set_format(struct state *state, struct spa_audio_info *fmt, uint32_
 		return -EIO;
 	}
 
-	state->headroom = state->default_headroom;
-	if (!state->disable_tsched) {
-		/* When using timers, we might miss the pointer update for batch
-		 * devices so add some extra headroom. With IRQ, we know the pointers
-		 * are updated when we wake up and we don't need the headroom. */
-		if (is_batch)
-			state->headroom += period_size;
-		/* Add 32 extra samples of headroom to handle jitter in capture.
-		 * For IRQ, we don't need this because when we wake up, we have
-		 * exactly enough samples to read or write. */
-		if (state->stream == SND_PCM_STREAM_CAPTURE)
-			state->headroom = SPA_MAX(state->headroom, 32u);
-	}
-
 	state->max_delay = state->buffer_frames / 2;
 	if (spa_strstartswith(state->props.device, "a52") ||
 	    spa_strstartswith(state->props.device, "dca"))
@@ -1791,15 +1814,9 @@ int spa_alsa_set_format(struct state *state, struct spa_audio_info *fmt, uint32_
 	else
 		state->min_delay = 0;
 
-	state->headroom = SPA_MIN(state->headroom, state->buffer_frames);
 	state->start_delay = state->default_start_delay;
 
-	latency = SPA_MAX(state->min_delay, SPA_MIN(state->max_delay, state->headroom));
-	if (state->position != NULL)
-		latency = SPA_SCALE32_UP(latency, state->position->clock.target_rate.denom, state->rate);
-
-	state->latency[state->port_direction].min_rate =
-		state->latency[state->port_direction].max_rate = latency;
+	recalc_headroom(state);
 
 	spa_log_info(state->log, "%s: format:%s access:%s-%s rate:%d channels:%d "
 			"buffer frames %lu, period frames %lu, periods %u, frame_size %zd "
@@ -1809,7 +1826,7 @@ int spa_alsa_set_format(struct state *state, struct spa_audio_info *fmt, uint32_
 			planar ? "planar" : "interleaved",
 			state->rate, state->channels, state->buffer_frames, state->period_frames,
 			periods, state->frame_size, state->headroom, state->start_delay,
-			is_batch, !state->disable_tsched);
+			state->is_batch, !state->disable_tsched);
 
 	/* write the parameters to device */
 	CHECK(snd_pcm_hw_params(hndl, params), "set_hw_params");
@@ -1959,11 +1976,76 @@ static int spa_alsa_silence(struct state *state, snd_pcm_uframes_t silence)
 	return 0;
 }
 
+static void reset_buffers(struct state *this)
+{
+	uint32_t i;
+
+	spa_list_init(&this->free);
+	spa_list_init(&this->ready);
+
+	for (i = 0; i < this->n_buffers; i++) {
+		struct buffer *b = &this->buffers[i];
+		if (this->stream == SND_PCM_STREAM_PLAYBACK) {
+			SPA_FLAG_SET(b->flags, BUFFER_FLAG_OUT);
+			spa_node_call_reuse_buffer(&this->callbacks, 0, b->id);
+		} else {
+			spa_list_append(&this->free, &b->link);
+			SPA_FLAG_CLEAR(b->flags, BUFFER_FLAG_OUT);
+		}
+	}
+}
+
+
+static int do_prepare(struct state *state)
+{
+	int err;
+
+	state->last_threshold = state->threshold;
+
+	spa_log_debug(state->log, "%p: start threshold:%d duration:%d rate:%d follower:%d match:%d resample:%d",
+			state, state->threshold, state->driver_duration, state->driver_rate.denom,
+			state->following, state->matching, state->resample);
+
+	CHECK(set_swparams(state), "swparams");
+
+	if ((!state->linked) && (err = snd_pcm_prepare(state->hndl)) < 0 && err != -EBUSY) {
+		spa_log_error(state->log, "%s: snd_pcm_prepare error: %s",
+				state->name, snd_strerror(err));
+		return err;
+	}
+	if (state->stream == SND_PCM_STREAM_PLAYBACK) {
+		snd_pcm_uframes_t silence = state->start_delay + state->threshold + state->headroom;
+		if (state->disable_tsched)
+			silence += state->threshold;
+		spa_alsa_silence(state, silence);
+	}
+
+	reset_buffers(state);
+	state->alsa_sync = true;
+	state->alsa_sync_warning = false;
+	state->alsa_recovering = false;
+	state->alsa_started = false;
+
+	return 0;
+}
+
+static inline int do_drop(struct state *state)
+{
+	int res;
+	spa_log_debug(state->log, "%p: snd_pcm_drop %u", state, state->linked);
+	if (!state->linked && (res = snd_pcm_drop(state->hndl)) < 0) {
+		spa_log_error(state->log, "%s: snd_pcm_drop: %s",
+				state->name, snd_strerror(res));
+		return res;
+	}
+	return 0;
+}
+
 static inline int do_start(struct state *state)
 {
 	int res;
 	if (SPA_UNLIKELY(!state->alsa_started)) {
-		spa_log_trace(state->log, "%p: snd_pcm_start %u", state, state->linked);
+		spa_log_debug(state->log, "%p: snd_pcm_start %u", state, state->linked);
 		if (!state->linked && (res = snd_pcm_start(state->hndl)) < 0) {
 			spa_log_error(state->log, "%s: snd_pcm_start: %s",
 					state->name, snd_strerror(res));
@@ -1974,10 +2056,13 @@ static inline int do_start(struct state *state)
 	return 0;
 }
 
+static inline int check_position_config(struct state *state);
+
 static int alsa_recover(struct state *state, int err)
 {
 	int res, st;
 	snd_pcm_status_t *status;
+	struct state *driver, *follower;
 
 	snd_pcm_status_alloca(&status);
 	if (SPA_UNLIKELY((res = snd_pcm_status(state->hndl, status)) < 0)) {
@@ -2032,22 +2117,40 @@ recover:
 				state->name, snd_strerror(res));
 		return res;
 	}
-	if (state->driver && state->linked) {
-		spa_alsa_prepare(state->driver);
-		res = spa_alsa_start(state->driver);
-	} else {
-		spa_alsa_prepare(state);
-		res = spa_alsa_start(state);
+	if (state->driver && state->linked)
+		driver = state->driver;
+	else
+		driver = state;
+
+	do_drop(driver);
+	spa_list_for_each(follower, &driver->rt.followers, rt.driver_link) {
+		if (follower != driver && follower->linked) {
+			do_drop(follower);
+			check_position_config(follower);
+		}
 	}
+	do_prepare(driver);
+	spa_list_for_each(follower, &driver->rt.followers, rt.driver_link) {
+		if (follower != driver && follower->linked)
+			do_prepare(follower);
+	}
+	do_start(driver);
+	spa_list_for_each(follower, &driver->rt.followers, rt.driver_link) {
+		if (follower != driver && follower->linked)
+			do_start(follower);
+	}
+
 	return res;
 }
 
 static inline snd_pcm_sframes_t alsa_avail(struct state *state)
 {
-	if (state->disable_tsched)
-		return snd_pcm_avail_update(state->hndl);
+	snd_pcm_sframes_t avail;
+	if (state->disable_tsched && !state->resample)
+		avail = snd_pcm_avail_update(state->hndl);
 	else
-		return snd_pcm_avail(state->hndl);
+		avail = snd_pcm_avail(state->hndl);
+	return avail;
 }
 
 static int get_avail(struct state *state, uint64_t current_time, snd_pcm_uframes_t *delay)
@@ -2220,9 +2323,9 @@ static int update_time(struct state *state, uint64_t current_time, snd_pcm_sfram
 
 	if (SPA_LIKELY(!follower && state->clock)) {
 		state->clock->nsec = current_time;
-		state->clock->rate = state->clock->target_rate;
+		state->clock->rate = state->driver_rate;
 		state->clock->position += state->clock->duration;
-		state->clock->duration = state->duration;
+		state->clock->duration = state->driver_duration;
 		state->clock->delay = delay + state->delay;
 		state->clock->rate_diff = corr;
 		state->clock->next_nsec = state->next_time;
@@ -2248,10 +2351,11 @@ static int setup_matching(struct state *state)
 	if (spa_streq(state->position->clock.name, state->clock_name))
 		state->matching = false;
 
-	state->resample = !state->pitch_elem && (((uint32_t)state->rate != state->rate_denom) || state->matching);
+	state->resample = !state->pitch_elem && (((uint32_t)state->rate != state->driver_rate.denom) || state->matching);
+	recalc_headroom(state);
 
 	spa_log_info(state->log, "driver clock:'%s'@%d our clock:'%s'@%d matching:%d resample:%d",
-			state->position->clock.name, state->rate_denom,
+			state->position->clock.name, state->driver_rate.denom,
 			state->clock_name, state->rate,
 			state->matching, state->resample);
 	return 0;
@@ -2271,33 +2375,36 @@ static inline int check_position_config(struct state *state)
 {
 	uint64_t target_duration;
 	struct spa_fraction target_rate;
+	struct spa_io_position *pos;
 
-	if (SPA_UNLIKELY(state->position == NULL))
+	if (SPA_UNLIKELY((pos = state->position) == NULL))
 		return 0;
 
-	if (state->disable_tsched && state->started && !state->following) {
+	if (state->force_position ||
+	    (state->disable_tsched && state->started && !state->following)) {
 		target_duration = state->period_frames;
 		target_rate = SPA_FRACTION(1, state->rate);
-		state->position->clock.target_duration = target_duration;
-		state->position->clock.target_rate = target_rate;
+		pos->clock.target_duration = target_duration;
+		pos->clock.target_rate = target_rate;
 	} else {
-		target_duration = state->position->clock.target_duration;
-		target_rate = state->position->clock.target_rate;
+		target_duration = pos->clock.target_duration;
+		target_rate = pos->clock.target_rate;
 	}
 	if (target_duration == 0 || target_rate.denom == 0)
 		return -EIO;
 
-	if (SPA_UNLIKELY((state->duration != target_duration) ||
-	    (state->rate_denom != target_rate.denom))) {
-		spa_log_debug(state->log, "%p: follower:%d duration:%u->%"PRIu64" rate;%d->%d",
-				state, state->following, state->duration, target_duration,
-				state->rate_denom, target_rate.denom);
-		state->duration = target_duration;
-		state->rate_denom = target_rate.denom;
-		state->threshold = SPA_SCALE32_UP(state->duration, state->rate, state->rate_denom);
+	if (SPA_UNLIKELY((state->driver_duration != target_duration) ||
+	    (state->driver_rate.denom != target_rate.denom))) {
+		spa_log_info(state->log, "%p: follower:%d duration:%u->%"PRIu64" rate:%d->%d",
+				state, state->following, state->driver_duration, target_duration,
+				state->driver_rate.denom, target_rate.denom);
+
+		state->driver_duration = target_duration;
+		state->driver_rate = target_rate;
+		state->threshold = SPA_SCALE32_UP(state->driver_duration, state->rate, state->driver_rate.denom);
 		state->max_error = SPA_MAX(256.0f, state->threshold / 2.0f);
 		state->max_resync = SPA_MIN(state->threshold, state->max_error);
-		state->resample = ((uint32_t)state->rate != state->rate_denom) || state->matching;
+		state->resample = ((uint32_t)state->rate != state->driver_rate.denom) || state->matching;
 		state->alsa_sync = true;
 	}
 	return 0;
@@ -2309,16 +2416,16 @@ static int alsa_write_sync(struct state *state, uint64_t current_time)
 	snd_pcm_uframes_t avail, delay, target;
 	bool following = state->following;
 
-	if (SPA_UNLIKELY(!state->alsa_started))
-		return 0;
-
 	if (SPA_UNLIKELY((res = check_position_config(state)) < 0))
 		return res;
 
-	if (SPA_UNLIKELY((res = get_status(state, current_time, &avail, &delay, &target)) < 0))
+	if (SPA_UNLIKELY((res = get_status(state, current_time, &avail, &delay, &target)) < 0)) {
+		spa_log_error(state->log, "get_status error");
+		state->next_time += state->threshold * 1e9 / state->rate;
 		return res;
+	}
 
-	if (SPA_UNLIKELY(!following && delay > target + state->max_error)) {
+	if (SPA_UNLIKELY(!following && state->alsa_started && delay > target + state->max_error)) {
 		spa_log_trace(state->log, "%p: early wakeup %ld %lu %lu", state,
 				avail, delay, target);
 		if (delay > target * 3)
@@ -2329,7 +2436,7 @@ static int alsa_write_sync(struct state *state, uint64_t current_time)
 	if (SPA_UNLIKELY((res = update_time(state, current_time, delay, target, following)) < 0))
 		return res;
 
-	if (following && !state->linked) {
+	if (following && state->alsa_started && !state->linked) {
 		if (SPA_UNLIKELY(state->alsa_sync)) {
 			enum spa_log_level lev;
 
@@ -2338,18 +2445,20 @@ static int alsa_write_sync(struct state *state, uint64_t current_time)
 			else
 				lev = SPA_LOG_LEVEL_INFO;
 
-			if ((suppressed = spa_ratelimit_test(&state->rate_limit, current_time)) >= 0) {
-				spa_log_lev(state->log, lev, "%s: follower avail:%lu delay:%ld "
-						"target:%ld thr:%u, resync (%d suppressed)",
-						state->name, avail, delay,
-						target, state->threshold, suppressed);
-			}
+			if ((suppressed = spa_ratelimit_test(&state->rate_limit, current_time)) < 0)
+				lev = SPA_LOG_LEVEL_DEBUG;
+
+			spa_log_lev(state->log, lev, "%s: follower avail:%lu delay:%ld "
+					"target:%ld thr:%u, resync (%d suppressed)",
+					state->name, avail, delay,
+					target, state->threshold, suppressed);
 
 			if (avail > target)
 				snd_pcm_rewind(state->hndl, avail - target);
 			else if (avail < target)
 				spa_alsa_silence(state, target - avail);
 			avail = target;
+			spa_dll_init(&state->dll);
 			state->alsa_sync = false;
 		} else
 			state->alsa_sync_warning = true;
@@ -2470,11 +2579,9 @@ again:
 
 int spa_alsa_write(struct state *state)
 {
-	int res = 0;
 	if (state->following && state->rt.driver == NULL) {
 		uint64_t current_time = state->position->clock.nsec;
-		if ((res = alsa_write_sync(state, current_time)) < 0)
-			return res;
+		alsa_write_sync(state, current_time);
 	}
 	return alsa_write_frames(state);
 }
@@ -2573,8 +2680,11 @@ static int alsa_read_sync(struct state *state, uint64_t current_time)
 	if (SPA_UNLIKELY((res = check_position_config(state)) < 0))
 		return res;
 
-	if (SPA_UNLIKELY((res = get_status(state, current_time, &avail, &delay, &target)) < 0))
+	if (SPA_UNLIKELY((res = get_status(state, current_time, &avail, &delay, &target)) < 0)) {
+		spa_log_error(state->log, "get_status error");
+		state->next_time += state->threshold * 1e9 / state->rate;
 		return res;
+	}
 
 	if (SPA_UNLIKELY(!following && avail < state->read_size)) {
 		spa_log_trace(state->log, "%p: early wakeup %ld %ld %ld %d", state,
@@ -2588,7 +2698,7 @@ static int alsa_read_sync(struct state *state, uint64_t current_time)
 		return res;
 
 	max_read = state->buffer_frames;
-	if (following) {
+	if (following && !state->linked) {
 		if (state->alsa_sync) {
 			enum spa_log_level lev;
 
@@ -2597,11 +2707,12 @@ static int alsa_read_sync(struct state *state, uint64_t current_time)
 			else
 				lev = SPA_LOG_LEVEL_INFO;
 
-			if ((suppressed = spa_ratelimit_test(&state->rate_limit, current_time)) >= 0) {
-				spa_log_lev(state->log, lev, "%s: follower delay:%ld target:%ld thr:%u, "
-						"resync (%d suppressed)", state->name, delay,
-						target, state->threshold, suppressed);
-			}
+			if ((suppressed = spa_ratelimit_test(&state->rate_limit, current_time)) < 0)
+				lev = SPA_LOG_LEVEL_DEBUG;
+
+			spa_log_lev(state->log, lev, "%s: follower delay:%ld target:%ld thr:%u "
+					"resample:%d, resync (%d suppressed)", state->name, delay,
+					target, state->threshold, state->resample, suppressed);
 
 			if (avail < target)
 				max_read = target - avail;
@@ -2610,6 +2721,7 @@ static int alsa_read_sync(struct state *state, uint64_t current_time)
 				avail = target;
 			}
 			state->alsa_sync = false;
+			spa_dll_init(&state->dll);
 		} else
 			state->alsa_sync_warning = true;
 
@@ -2623,7 +2735,7 @@ static int alsa_read_sync(struct state *state, uint64_t current_time)
 static int alsa_read_frames(struct state *state)
 {
 	snd_pcm_t *hndl = state->hndl;
-	snd_pcm_uframes_t total_read = 0, to_read;
+	snd_pcm_uframes_t total_read = 0, avail;
 	const snd_pcm_channel_area_t *my_areas;
 	snd_pcm_uframes_t read, frames, offset;
 	snd_pcm_sframes_t commitres;
@@ -2632,15 +2744,15 @@ static int alsa_read_frames(struct state *state)
 	frames = state->max_read;
 
 	if (state->use_mmap) {
-		to_read = state->buffer_frames;
-		if ((res = snd_pcm_mmap_begin(hndl, &my_areas, &offset, &to_read)) < 0) {
+		avail = state->buffer_frames;
+		if ((res = snd_pcm_mmap_begin(hndl, &my_areas, &offset, &avail)) < 0) {
 			spa_log_error(state->log, "%s: snd_pcm_mmap_begin error: %s",
 					state->name, snd_strerror(res));
 			alsa_recover(state, res);
 			return res;
 		}
-		spa_log_trace_fp(state->log, "%p: begin offs:%ld frames:%ld to_read:%ld thres:%d", state,
-				offset, frames, to_read, state->threshold);
+		spa_log_trace_fp(state->log, "%p: begin offs:%ld frames:%ld avail:%ld thres:%d", state,
+				offset, frames, avail, state->threshold);
 	} else {
 		my_areas = NULL;
 		offset = 0;
@@ -2659,8 +2771,15 @@ static int alsa_read_frames(struct state *state)
 		spa_log_trace_fp(state->log, "%p: commit offs:%ld read:%ld count:%"PRIi64, state,
 				offset, read, state->sample_count);
 		if ((commitres = snd_pcm_mmap_commit(hndl, offset, read)) < 0) {
-			spa_log_error(state->log, "%s: snd_pcm_mmap_commit error %lu %lu: %s",
-					state->name, frames, read, snd_strerror(commitres));
+			enum spa_log_level lev;
+
+			if (SPA_UNLIKELY(state->alsa_sync_warning))
+				lev = SPA_LOG_LEVEL_ERROR;
+			else
+				lev = SPA_LOG_LEVEL_INFO;
+
+			spa_log_lev(state->log, lev, "%s: snd_pcm_mmap_commit error %lu %lu %lu: %s",
+					state->name, frames, avail, read, snd_strerror(commitres));
 			if (commitres != -EPIPE && commitres != -ESTRPIPE)
 				return res;
 		}
@@ -2677,11 +2796,9 @@ static int alsa_read_frames(struct state *state)
 
 int spa_alsa_read(struct state *state)
 {
-	int res;
 	if (state->following && state->rt.driver == NULL) {
 		uint64_t current_time = state->position->clock.nsec;
-		if ((res = alsa_read_sync(state, current_time)) < 0)
-			return res;
+		alsa_read_sync(state, current_time);
 	}
 	return alsa_read_frames(state);
 }
@@ -2865,25 +2982,6 @@ done:
 	}
 }
 
-static void reset_buffers(struct state *this)
-{
-	uint32_t i;
-
-	spa_list_init(&this->free);
-	spa_list_init(&this->ready);
-
-	for (i = 0; i < this->n_buffers; i++) {
-		struct buffer *b = &this->buffers[i];
-		if (this->stream == SND_PCM_STREAM_PLAYBACK) {
-			SPA_FLAG_SET(b->flags, BUFFER_FLAG_OUT);
-			spa_node_call_reuse_buffer(&this->callbacks, 0, b->id);
-		} else {
-			spa_list_append(&this->free, &b->link);
-			SPA_FLAG_CLEAR(b->flags, BUFFER_FLAG_OUT);
-		}
-	}
-}
-
 static void remove_sources(struct state *state)
 {
 	int i;
@@ -2948,6 +3046,9 @@ int spa_alsa_prepare(struct state *state)
 	struct state *follower;
 	int err;
 
+	if (!state->opened)
+		return -EIO;
+
 	spa_alsa_pause(state);
 
 	if (state->prepared)
@@ -2957,37 +3058,14 @@ int spa_alsa_prepare(struct state *state)
 		spa_log_error(state->log, "%s: invalid position config", state->name);
 		return -EIO;
 	}
-
-	state->last_threshold = state->threshold;
-
-	spa_log_debug(state->log, "%p: start threshold:%d duration:%d rate:%d follower:%d match:%d resample:%d",
-			state, state->threshold, state->duration, state->rate_denom,
-			state->following, state->matching, state->resample);
-
-	CHECK(set_swparams(state), "swparams");
-
-	if ((err = snd_pcm_prepare(state->hndl)) < 0 && err != -EBUSY) {
-		spa_log_error(state->log, "%s: snd_pcm_prepare error: %s",
-				state->name, snd_strerror(err));
+	if ((err = do_prepare(state)) < 0)
 		return err;
-	}
-	if (state->stream == SND_PCM_STREAM_PLAYBACK) {
-		snd_pcm_uframes_t silence = state->start_delay + state->threshold + state->headroom;
-		if (state->disable_tsched)
-			silence += state->threshold;
-		spa_alsa_silence(state, silence);
-	}
-
-	reset_buffers(state);
-	state->alsa_sync = true;
-	state->alsa_sync_warning = false;
-	state->alsa_recovering = false;
-	state->alsa_started = false;
 
 	spa_list_for_each(follower, &state->followers, driver_link) {
 		if (follower != state && !follower->matching) {
-			spa_alsa_prepare(follower);
-			if (!follower->linked)
+			if (spa_alsa_prepare(follower) < 0)
+				continue;
+			if (!follower->linked && state->auto_link)
 				do_link(state, follower);
 		}
 	}
@@ -3004,6 +3082,8 @@ int spa_alsa_start(struct state *state)
 
 	if (state->started)
 		return 0;
+	else if (!state->opened)
+		return -EIO;
 
 	spa_alsa_prepare(state);
 
@@ -3128,7 +3208,6 @@ int spa_alsa_reassign_follower(struct state *state)
 
 int spa_alsa_pause(struct state *state)
 {
-	int err;
 	struct state *follower;
 
 	if (!state->started)
@@ -3142,9 +3221,7 @@ int spa_alsa_pause(struct state *state)
 	spa_list_for_each(follower, &state->followers, driver_link)
 		spa_alsa_pause(follower);
 
-	if (!state->linked && (err = snd_pcm_drop(state->hndl)) < 0)
-		spa_log_error(state->log, "%s: snd_pcm_drop %s", state->name,
-				snd_strerror(err));
+	do_drop(state);
 
 	state->prepared = false;
 

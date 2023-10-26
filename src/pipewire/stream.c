@@ -157,6 +157,7 @@ struct stream {
 	unsigned int driving:1;
 	unsigned int using_trigger:1;
 	unsigned int trigger:1;
+	unsigned int early_process:1;
 	int in_set_param;
 	int in_emit_param_changed;
 };
@@ -1103,7 +1104,7 @@ again:
 			 * rate matching node (audioconvert) has been scheduled to
 			 * update the values. */
 			ask_more = !impl->process_rt && impl->rate_match == NULL &&
-				queue_is_empty(impl, &impl->queued) &&
+				(impl->early_process || queue_is_empty(impl, &impl->queued)) &&
 				!queue_is_empty(impl, &impl->dequeued);
 			pw_log_trace_fp("%p: pop %d %p ask_more:%u %p", stream, b->id, io,
 					ask_more, impl->rate_match);
@@ -1121,7 +1122,7 @@ again:
 		}
 	} else {
 		ask_more = !impl->process_rt &&
-			queue_is_empty(impl, &impl->queued) &&
+			(impl->early_process || queue_is_empty(impl, &impl->queued)) &&
 			!queue_is_empty(impl, &impl->dequeued);
 	}
 
@@ -1912,6 +1913,7 @@ pw_stream_connect(struct pw_stream *stream,
 		impl->node_methods.process = impl_node_process_output;
 
 	impl->process_rt = SPA_FLAG_IS_SET(flags, PW_STREAM_FLAG_RT_PROCESS);
+	impl->early_process = SPA_FLAG_IS_SET(flags, PW_STREAM_FLAG_EARLY_PROCESS);
 
 	impl->impl_node.iface = SPA_INTERFACE_INIT(
 			SPA_TYPE_INTERFACE_Node,
@@ -2032,10 +2034,10 @@ pw_stream_connect(struct pw_stream *stream,
 	if ((str = getenv("PIPEWIRE_QUANTUM")) != NULL) {
 		struct spa_fraction q;
 		if (sscanf(str, "%u/%u", &q.num, &q.denom) == 2 && q.denom != 0) {
-			pw_properties_setf(stream->properties, PW_KEY_NODE_RATE,
+			pw_properties_setf(stream->properties, PW_KEY_NODE_FORCE_RATE,
 					"1/%u", q.denom);
-			pw_properties_setf(stream->properties, PW_KEY_NODE_LATENCY,
-					"%u/%u", q.num, q.denom);
+			pw_properties_setf(stream->properties, PW_KEY_NODE_FORCE_QUANTUM,
+					"%u", q.num);
 		}
 	}
 	if ((str = getenv("PIPEWIRE_LATENCY")) != NULL)
@@ -2338,6 +2340,7 @@ int pw_stream_get_time_n(struct pw_stream *stream, struct pw_time *time, size_t 
 	struct stream *impl = SPA_CONTAINER_OF(stream, struct stream, this);
 	uintptr_t seq1, seq2;
 	uint32_t buffered, quantum, index;
+	int32_t avail_buffers;
 
 	do {
 		seq1 = SPA_SEQ_READ(impl->seq);
@@ -2356,19 +2359,23 @@ int pw_stream_get_time_n(struct pw_stream *stream, struct pw_time *time, size_t 
 	time->delay += (impl->latency.min_rate + impl->latency.max_rate) / 2;
 	time->delay += ((impl->latency.min_ns + impl->latency.max_ns) / 2) * time->rate.denom / SPA_NSEC_PER_SEC;
 
+	avail_buffers = spa_ringbuffer_get_read_index(&impl->dequeued.ring, &index);
+	avail_buffers = SPA_CLAMP(avail_buffers, 0, (int32_t)impl->n_buffers);
+
 	if (size >= offsetof(struct pw_time, queued_buffers))
 		time->buffered = buffered;
 	if (size >= offsetof(struct pw_time, avail_buffers))
-		time->queued_buffers = spa_ringbuffer_get_read_index(&impl->queued.ring, &index);
+		time->queued_buffers = impl->n_buffers - avail_buffers;
 	if (size >= sizeof(struct pw_time))
-		time->avail_buffers = spa_ringbuffer_get_read_index(&impl->dequeued.ring, &index);
+		time->avail_buffers = avail_buffers;
 
 	pw_log_trace_fp("%p: %"PRIi64" %"PRIi64" %"PRIu64" %d/%d %"PRIu64" %"
-			PRIu64" %"PRIu64" %"PRIu64" %"PRIu64, stream,
+			PRIu64" %"PRIu64" %"PRIu64" %"PRIu64" %d/%d", stream,
 			time->now, time->delay, time->ticks,
 			time->rate.num, time->rate.denom, time->queued,
 			impl->dequeued.outcount, impl->dequeued.incount,
-			impl->queued.outcount, impl->queued.incount);
+			impl->queued.outcount, impl->queued.incount,
+			avail_buffers, impl->n_buffers);
 	return 0;
 }
 

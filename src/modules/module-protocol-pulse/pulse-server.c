@@ -1184,7 +1184,7 @@ static const struct spa_pod *get_buffers_param(struct stream *s,
 
 	param = spa_pod_builder_add_object(b,
 			SPA_TYPE_OBJECT_ParamBuffers, SPA_PARAM_Buffers,
-			SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(2,
+			SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(MIN_BUFFERS,
 				MIN_BUFFERS, MAX_BUFFERS),
 			SPA_PARAM_BUFFERS_blocks,  SPA_POD_Int(blocks),
 			SPA_PARAM_BUFFERS_size,    SPA_POD_CHOICE_RANGE_Int(
@@ -1819,6 +1819,8 @@ static int do_create_playback_stream(struct client *client, uint32_t command, ui
 			PW_STREAM_FLAG_RT_PROCESS |
 			PW_STREAM_FLAG_MAP_BUFFERS,
 			params, n_params);
+
+	stream_update_tag_param(stream);
 
 	return 0;
 
@@ -3215,7 +3217,8 @@ static int do_update_proplist(struct client *client, uint32_t command, uint32_t 
 		if (stream == NULL || stream->type == STREAM_TYPE_UPLOAD)
 			return -ENOENT;
 
-		pw_stream_update_properties(stream->stream, &props->dict);
+		if (pw_stream_update_properties(stream->stream, &props->dict) > 0)
+			stream_update_tag_param(stream);
 	} else {
 		if (pw_properties_update(client->props, &props->dict) > 0) {
 			client_update_quirks(client);
@@ -5099,12 +5102,12 @@ static int do_send_object_message(struct client *client, uint32_t command, uint3
 {
 	struct impl *impl = client->impl;
 	struct pw_manager *manager = client->manager;
-	const char *object_path = NULL;
-	const char *message = NULL;
-	const char *params = NULL;
-	struct message *reply;
+	const char *object_path = NULL, *message = NULL, *params = NULL;
 	struct pw_manager_object *o;
-	int len = 0;
+	spa_autofree char *response_str = NULL;
+	size_t path_len = 0, response_len = 0;
+	FILE *response;
+	int res = -ENOENT;
 
 	if (message_get(m,
 			TAG_STRING, &object_path,
@@ -5120,36 +5123,42 @@ static int do_send_object_message(struct client *client, uint32_t command, uint3
 	if (object_path == NULL || message == NULL)
 		return -EINVAL;
 
-	len = strlen(object_path);
-	if (len > 0 && object_path[len - 1] == '/')
-		--len;
-
-	spa_autofree char *path = strndup(object_path, len);
+	path_len = strlen(object_path);
+	if (path_len > 0 && object_path[path_len - 1] == '/')
+		--path_len;
+	spa_autofree char *path = strndup(object_path, path_len);
 	if (path == NULL)
 		return -ENOMEM;
 
-	spa_autofree char *response = NULL;
-	int res = -ENOENT;
-
 	spa_list_for_each(o, &manager->object_list, link) {
-		if (o->message_object_path && spa_streq(o->message_object_path, path)) {
-			if (o->message_handler)
-				res = o->message_handler(manager, o, message, params, &response);
-			else
-				res = -ENOSYS;
+		if (spa_streq(o->message_object_path, path))
 			break;
-		}
+	}
+	if (spa_list_is_end(o, &manager->object_list, link))
+		return -ENOENT;
+
+	if (o->message_handler == NULL)
+		return -ENOSYS;
+
+	response = open_memstream(&response_str, &response_len);
+	if (response == NULL)
+		return -errno;
+
+	res = o->message_handler(client, o, message, params, response);
+
+	if (fclose(response))
+		return -errno;
+
+	pw_log_debug("%p: object message response: (%d) '%s'", impl, res, response_str ? response_str : "<null>");
+
+	if (res >= 0) {
+		struct message *reply = reply_new(client, tag);
+
+		message_put(reply, TAG_STRING, response_str, TAG_INVALID);
+		res = client_queue_message(client, reply);
 	}
 
-	if (res < 0)
-		return res;
-
-	pw_log_debug("%p: object message response:'%s'", impl, response ? response : "<null>");
-
-	reply = reply_new(client, tag);
-	message_put(reply, TAG_STRING, response, TAG_INVALID);
-
-	return client_queue_message(client, reply);
+	return res;
 }
 
 static int do_error_access(struct client *client, uint32_t command, uint32_t tag, struct message *m)
@@ -5483,9 +5492,23 @@ struct pw_protocol_pulse *pw_protocol_pulse_new(struct pw_context *context,
 	const char *str;
 	int res = 0;
 
+	debug_messages = pw_log_topic_enabled(SPA_LOG_LEVEL_INFO, pulse_conn);
+
 	impl = calloc(1, sizeof(*impl) + user_data_size);
 	if (impl == NULL)
-		goto error_exit;
+		goto error_free_props;
+
+	impl->rate_limit.interval = 2 * SPA_NSEC_PER_SEC;
+	impl->rate_limit.burst = 1;
+	spa_hook_list_init(&impl->hooks);
+	spa_list_init(&impl->servers);
+	pw_map_init(&impl->samples, 16, 16);
+	pw_map_init(&impl->modules, 16, 16);
+	spa_list_init(&impl->cleanup_clients);
+	spa_list_init(&impl->free_messages);
+
+	impl->loop = pw_context_get_main_loop(context);
+	impl->work_queue = pw_context_get_work_queue(context);
 
 	if (props == NULL)
 		props = pw_properties_new(NULL, NULL);
@@ -5502,25 +5525,6 @@ struct pw_protocol_pulse *pw_protocol_pulse_new(struct pw_context *context,
 			pw_properties_update_string(props, str, strlen(str));
 		pw_properties_set(props, "vm.overrides", NULL);
 	}
-
-	load_defaults(&impl->defs, props);
-
-	debug_messages = pw_log_topic_enabled(SPA_LOG_LEVEL_INFO, pulse_conn);
-
-	impl->context = context;
-	impl->loop = pw_context_get_main_loop(context);
-	impl->props = props;
-
-	impl->work_queue = pw_context_get_work_queue(context);
-
-	spa_hook_list_init(&impl->hooks);
-	spa_list_init(&impl->servers);
-	impl->rate_limit.interval = 2 * SPA_NSEC_PER_SEC;
-	impl->rate_limit.burst = 1;
-	pw_map_init(&impl->samples, 16, 16);
-	pw_map_init(&impl->modules, 16, 16);
-	spa_list_init(&impl->cleanup_clients);
-	spa_list_init(&impl->free_messages);
 
 	str = pw_properties_get(props, "server.address");
 	if (str == NULL) {
@@ -5544,8 +5548,6 @@ struct pw_protocol_pulse *pw_protocol_pulse_new(struct pw_context *context,
 		pw_log_warn("%p: can't create pid file: %s",
 				impl, spa_strerror(res));
 	}
-	pw_context_add_listener(context, &impl->context_listener,
-			&context_events, impl);
 
 #ifdef HAVE_DBUS
 	str = pw_properties_get(props, "server.dbus-name");
@@ -5554,14 +5556,22 @@ struct pw_protocol_pulse *pw_protocol_pulse_new(struct pw_context *context,
 	if (strlen(str) > 0)
 		impl->dbus_name = dbus_request_name(context, str);
 #endif
+
+	load_defaults(&impl->defs, props);
+	impl->props = spa_steal_ptr(props);
+
+	pw_context_add_listener(context, &impl->context_listener,
+			&context_events, impl);
+	impl->context = context;
+
 	cmd_run(impl);
 
 	return (struct pw_protocol_pulse *) impl;
 
 error_free:
-	free(impl);
+	impl_free(impl);
 
-error_exit:
+error_free_props:
 	pw_properties_free(props);
 
 	if (res < 0)
