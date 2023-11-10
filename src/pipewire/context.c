@@ -32,6 +32,8 @@
 PW_LOG_TOPIC_EXTERN(log_context);
 #define PW_LOG_TOPIC_DEFAULT log_context
 
+#define MAX_HOPS	64
+
 /** \cond */
 struct impl {
 	struct pw_context this;
@@ -791,11 +793,16 @@ static int ensure_state(struct pw_impl_node *node, bool running)
  * and groups to active nodes and make them recursively runnable as well.
  */
 static inline int run_nodes(struct pw_context *context, struct pw_impl_node *node,
-		struct spa_list *nodes, enum pw_direction direction)
+		struct spa_list *nodes, enum pw_direction direction, int hop)
 {
 	struct pw_impl_node *t;
 	struct pw_impl_port *p;
 	struct pw_impl_link *l;
+
+	if (hop == MAX_HOPS) {
+		pw_log_warn("exceeded hops (%d)", hop);
+		return -EIO;
+	}
 
 	pw_log_debug("node %p: '%s' direction:%s", node, node->name,
 			pw_direction_as_string(direction));
@@ -807,12 +814,15 @@ static inline int run_nodes(struct pw_context *context, struct pw_impl_node *nod
 			spa_list_for_each(l, &p->links, input_link) {
 				t = l->output->node;
 
-				if (!t->active || !l->prepared || (!t->driving && SPA_FLAG_IS_SET(t->checked, 1u<<direction)))
+				if (!t->active || !l->prepared ||
+				    (!t->driving && SPA_FLAG_IS_SET(t->checked, 1u<<direction)))
+					continue;
+				if (t->driving && p->node == t)
 					continue;
 
 				pw_log_debug("  peer %p: '%s'", t, t->name);
 				t->runnable = true;
-				run_nodes(context, t, nodes, direction);
+				run_nodes(context, t, nodes, direction, hop + 1);
 			}
 		}
 	} else {
@@ -820,12 +830,15 @@ static inline int run_nodes(struct pw_context *context, struct pw_impl_node *nod
 			spa_list_for_each(l, &p->links, output_link) {
 				t = l->input->node;
 
-				if (!t->active || !l->prepared || (!t->driving && SPA_FLAG_IS_SET(t->checked, 1u<<direction)))
+				if (!t->active || !l->prepared ||
+				    (!t->driving && SPA_FLAG_IS_SET(t->checked, 1u<<direction)))
+					continue;
+				if (t->driving && p->node == t)
 					continue;
 
 				pw_log_debug("  peer %p: '%s'", t, t->name);
 				t->runnable = true;
-				run_nodes(context, t, nodes, direction);
+				run_nodes(context, t, nodes, direction, hop + 1);
 			}
 		}
 	}
@@ -834,18 +847,18 @@ static inline int run_nodes(struct pw_context *context, struct pw_impl_node *nod
 	 * don't get included here. They were added to the same driver but
 	 * need to otherwise stay idle unless some non-passive link activates
 	 * them. */
-	if (node->link_group != NULL) {
+	if (node->link_groups != NULL) {
 		spa_list_for_each(t, nodes, sort_link) {
 			if (t->exported || !t->active ||
 			    SPA_FLAG_IS_SET(t->checked, 1u<<direction))
 				continue;
-			if (!spa_streq(t->link_group, node->link_group))
+			if (pw_strv_find_common(t->link_groups, node->link_groups) < 0)
 				continue;
 
 			pw_log_debug("  group %p: '%s'", t, t->name);
 			t->runnable = true;
 			if (!t->driving)
-				run_nodes(context, t, nodes, direction);
+				run_nodes(context, t, nodes, direction, hop + 1);
 		}
 	}
 	return 0;
@@ -931,15 +944,15 @@ static int collect_nodes(struct pw_context *context, struct pw_impl_node *node, 
 		}
 		/* now go through all the nodes that have the same group and
 		 * that are not yet visited */
-		if (n->group != NULL || n->link_group != NULL) {
+		if (n->groups != NULL || n->link_groups != NULL) {
 			spa_list_for_each(t, &context->node_list, link) {
 				if (t->exported || !t->active || t->visited)
 					continue;
-				if ((t->group == NULL || !spa_streq(t->group, n->group)) &&
-				    (t->link_group == NULL || !spa_streq(t->link_group, n->link_group)))
+				if (pw_strv_find_common(t->groups, n->groups) < 0 &&
+				    pw_strv_find_common(t->link_groups, n->link_groups) < 0)
 					continue;
-				pw_log_debug("%p: %s join group:%s link-group:%s",
-						t, t->name, n->group, n->link_group);
+				pw_log_debug("%p: %s join group of %s",
+						t, t->name, n->name);
 				t->visited = true;
 				spa_list_append(&queue, &t->sort_link);
 			}
@@ -948,8 +961,8 @@ static int collect_nodes(struct pw_context *context, struct pw_impl_node *node, 
 	}
 	spa_list_for_each(n, collect, sort_link)
 		if (!n->driving && n->runnable) {
-			run_nodes(context, n, collect, PW_DIRECTION_OUTPUT);
-			run_nodes(context, n, collect, PW_DIRECTION_INPUT);
+			run_nodes(context, n, collect, PW_DIRECTION_OUTPUT, 0);
+			run_nodes(context, n, collect, PW_DIRECTION_INPUT, 0);
 		}
 
 	return 0;
@@ -1465,8 +1478,9 @@ again:
 			node_max_quantum = node_max_quantum * current_rate / node_rate_quantum;
 		}
 
-		/* calculate desired quantum */
-		if (max_latency.denom != 0) {
+		/* calculate desired quantum. Don't limit to the max_latency when we are
+		 * going to force a quantum or rate and reconfigure the nodes. */
+		if (max_latency.denom != 0 && !force_quantum && !force_rate) {
 			uint32_t tmp = (max_latency.num * current_rate / max_latency.denom);
 			if (tmp < node_max_quantum)
 				node_max_quantum = tmp;

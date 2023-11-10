@@ -110,6 +110,10 @@ struct globals {
 static struct globals globals;
 static bool mlock_warned = false;
 
+#define MIDI_SCRATCH_FRAMES	8192
+static float midi_scratch[MIDI_SCRATCH_FRAMES];
+
+
 #define OBJECT_CHUNK		8
 #define RECYCLE_THRESHOLD	128
 
@@ -122,9 +126,10 @@ struct object {
 
 	struct client *client;
 
-#define INTERFACE_Port		0
-#define INTERFACE_Node		1
-#define INTERFACE_Link		2
+#define INTERFACE_Invalid	0
+#define INTERFACE_Port		1
+#define INTERFACE_Node		2
+#define INTERFACE_Link		3
 	uint32_t type;
 	uint32_t id;
 	uint32_t serial;
@@ -502,7 +507,7 @@ static void recycle_objects(struct client *c, uint32_t remain)
 	pthread_mutex_lock(&globals.lock);
 	spa_list_for_each_safe(o, t, &c->context.objects, link) {
 		if (o->removed) {
-			pw_log_info("%p: recycle object:%p type:%d id:%u/%u",
+			pw_log_debug("%p: recycle object:%p type:%d id:%u/%u",
 					c, o, o->type, o->id, o->serial);
 			spa_list_remove(&o->link);
 			memset(o, 0, sizeof(struct object));
@@ -529,6 +534,15 @@ static void free_object(struct client *c, struct object *o)
 		recycle_objects(c, RECYCLE_THRESHOLD / 2);
 	pthread_mutex_unlock(&c->context.lock);
 
+}
+
+static inline struct object *port_to_object(const jack_port_t *port)
+{
+	return (struct object*)port;
+}
+static inline jack_port_t *object_to_port(struct object *o)
+{
+	return (jack_port_t*)o;
 }
 
 struct io_info {
@@ -2522,6 +2536,17 @@ static int client_node_port_set_param(void *data,
 	return 0;
 }
 
+static void midi_init_buffer(void *data, uint32_t max_frames)
+{
+	struct midi_buffer *mb = data;
+	mb->magic = MIDI_BUFFER_MAGIC;
+	mb->buffer_size = max_frames * sizeof(float);
+	mb->nframes = max_frames;
+	mb->write_pos = 0;
+	mb->event_count = 0;
+	mb->lost_events = 0;
+}
+
 static inline void *init_buffer(struct port *p)
 {
 	struct client *c = p->client;
@@ -2531,12 +2556,7 @@ static inline void *init_buffer(struct port *p)
 
 	if (p->object->port.type_id == TYPE_ID_MIDI) {
 		struct midi_buffer *mb = data;
-		mb->magic = MIDI_BUFFER_MAGIC;
-		mb->buffer_size = c->max_frames * sizeof(float);
-		mb->nframes = c->max_frames;
-		mb->write_pos = 0;
-		mb->event_count = 0;
-		mb->lost_events = 0;
+		midi_init_buffer(data, c->max_frames);
 		pw_log_debug("port %p: init midi buffer size:%d", p, mb->buffer_size);
 	} else
 		memset(data, 0, c->max_frames * sizeof(float));
@@ -3218,7 +3238,7 @@ static void node_info(void *data, const struct pw_node_info *info)
 }
 
 static const struct pw_node_events node_events = {
-	PW_VERSION_NODE,
+	PW_VERSION_NODE_EVENTS,
 	.info = node_info,
 };
 
@@ -3243,7 +3263,7 @@ static void port_param(void *data, int seq,
 }
 
 static const struct pw_port_events port_events = {
-	PW_VERSION_PORT,
+	PW_VERSION_PORT_EVENTS,
 	.param = port_param,
 };
 
@@ -3266,7 +3286,7 @@ static void registry_event_global(void *data, uint32_t id,
 	struct client *c = (struct client *) data;
 	struct object *o, *ot, *op;
 	const char *str;
-	bool do_emit = true;
+	bool do_emit = true, do_sync = false;
 	uint32_t serial;
 
 	if (props == NULL)
@@ -3348,6 +3368,7 @@ static void registry_event_global(void *data, uint32_t id,
 						&o->proxy_listener, &proxy_events, o);
 				pw_proxy_add_object_listener(o->proxy,
 						&o->object_listener, &node_events, o);
+				do_sync = true;
 			}
 		}
 		pthread_mutex_lock(&c->context.lock);
@@ -3442,6 +3463,7 @@ static void registry_event_global(void *data, uint32_t id,
 
 				pw_port_subscribe_params((struct pw_port*)o->proxy,
 						ids, 1);
+				do_sync = true;
 			}
 			pthread_mutex_lock(&c->context.lock);
 			spa_list_append(&c->context.objects, &o->link);
@@ -3563,6 +3585,7 @@ static void registry_event_global(void *data, uint32_t id,
 			pw_metadata_add_listener(proxy,
 					&c->metadata->listener,
 					&metadata_events, c);
+			do_sync = true;
 		} else if (spa_streq(str, "settings")) {
 			proxy = pw_registry_bind(c->registry,
 					id, type, PW_VERSION_METADATA, sizeof(struct metadata));
@@ -3572,6 +3595,7 @@ static void registry_event_global(void *data, uint32_t id,
 			pw_proxy_add_listener(proxy,
 					&c->settings->proxy_listener,
 					&settings_proxy_events, c);
+			do_sync = true;
 		}
 		goto exit;
 	}
@@ -3606,6 +3630,9 @@ static void registry_event_global(void *data, uint32_t id,
 	}
 
       exit:
+	if (do_sync)
+		c->pending_sync = pw_proxy_sync((struct pw_proxy*)c->core,
+				c->pending_sync);
 	return;
       exit_free:
 	free_object(c, o);
@@ -3958,13 +3985,15 @@ jack_client_t * jack_client_open (const char *client_name,
 	if (status)
 		*status = 0;
 
+	client->pending_sync = pw_proxy_sync((struct pw_proxy*)client->core, client->pending_sync);
+
 	while (true) {
 	        pw_thread_loop_wait(client->context.loop);
 
 		if (client->last_res < 0)
 			goto init_failed;
 
-		if (client->has_transport)
+		if (client->pending_sync == client->last_sync)
 			break;
 	}
 
@@ -4996,7 +5025,7 @@ jack_port_t * jack_port_register (jack_client_t *client,
 		goto error_free;
 	}
 
-	return (jack_port_t *) o;
+	return object_to_port(o);
 
 error_free:
 	free_port(c, p, true);
@@ -5028,7 +5057,7 @@ SPA_EXPORT
 int jack_port_unregister (jack_client_t *client, jack_port_t *port)
 {
 	struct client *c = (struct client *) client;
-	struct object *o = (struct object *) port;
+	struct object *o = port_to_object(port);
 	struct port *p;
 	int res;
 
@@ -5205,41 +5234,58 @@ static void *get_buffer_input_empty(struct port *p, jack_nframes_t frames)
 SPA_EXPORT
 void * jack_port_get_buffer (jack_port_t *port, jack_nframes_t frames)
 {
-	struct object *o = (struct object *) port;
+	struct object *o = port_to_object(port);
 	struct port *p;
-	void *ptr;
+	void *ptr = NULL;
 
 	return_val_if_fail(o != NULL, NULL);
 
 	if (o->type != INTERFACE_Port || o->client == NULL)
-		return NULL;
+		goto done;
 
 	if ((p = o->port.port) == NULL) {
 		struct mix *mix;
 		struct buffer *b;
 
 		if ((mix = find_mix_peer(o->client, o->id)) == NULL)
-			return NULL;
+			goto done;
 
 		pw_log_trace("peer mix: %p %d", mix, mix->peer_id);
 
 		if ((b = get_mix_buffer(mix, frames)) == NULL)
-			return NULL;
+			goto done;
 
-		return get_buffer_data(b, frames);
+		if (o->port.type_id == TYPE_ID_MIDI) {
+			struct spa_pod_sequence *seq[1];
+			struct spa_data *d;
+			void *pod;
+
+			ptr = midi_scratch;
+			midi_init_buffer(ptr, MIDI_SCRATCH_FRAMES);
+
+			d = &b->datas[0];
+			if ((pod = spa_pod_from_data(d->data, d->maxsize,
+							d->chunk->offset, d->chunk->size)) == NULL)
+				goto done;
+			if (!spa_pod_is_sequence(pod))
+				goto done;
+			seq[0] = pod;
+			convert_to_midi(seq, 1, ptr, o->client->fix_midi_events);
+		} else {
+			ptr = get_buffer_data(b, frames);
+		}
+	} else if (p->valid) {
+		ptr = p->get_buffer(p, frames);
 	}
-	if (!p->valid)
-		return NULL;
-
-	ptr = p->get_buffer(p, frames);
-	pw_log_trace_fp("%p: port %p buffer %p empty:%u", p->client, p, ptr, p->empty_out);
+done:
+	pw_log_trace_fp("%p: port %p buffer %p: %s", p->client, p, ptr);
 	return ptr;
 }
 
 SPA_EXPORT
 jack_uuid_t jack_port_uuid (const jack_port_t *port)
 {
-	struct object *o = (struct object *) port;
+	struct object *o = port_to_object(port);
 	return_val_if_fail(o != NULL, 0);
 	return jack_port_uuid_generate(o->serial);
 }
@@ -5260,47 +5306,57 @@ static const char *port_name(struct object *o)
 SPA_EXPORT
 const char * jack_port_name (const jack_port_t *port)
 {
-	struct object *o = (struct object *) port;
+	struct object *o = port_to_object(port);
 	return_val_if_fail(o != NULL, NULL);
+	if (o->type != INTERFACE_Port)
+		return NULL;
 	return port_name(o);
 }
 
 SPA_EXPORT
 const char * jack_port_short_name (const jack_port_t *port)
 {
-	struct object *o = (struct object *) port;
+	struct object *o = port_to_object(port);
 	return_val_if_fail(o != NULL, NULL);
+	if (o->type != INTERFACE_Port)
+		return NULL;
 	return strchr(port_name(o), ':') + 1;
 }
 
 SPA_EXPORT
 int jack_port_flags (const jack_port_t *port)
 {
-	struct object *o = (struct object *) port;
+	struct object *o = port_to_object(port);
 	return_val_if_fail(o != NULL, 0);
+	if (o->type != INTERFACE_Port)
+		return 0;
 	return o->port.flags;
 }
 
 SPA_EXPORT
 const char * jack_port_type (const jack_port_t *port)
 {
-	struct object *o = (struct object *) port;
+	struct object *o = port_to_object(port);
 	return_val_if_fail(o != NULL, NULL);
+	if (o->type != INTERFACE_Port)
+		return NULL;
 	return type_to_string(o->port.type_id);
 }
 
 SPA_EXPORT
 jack_port_type_id_t jack_port_type_id (const jack_port_t *port)
 {
-	struct object *o = (struct object *) port;
+	struct object *o = port_to_object(port);
 	return_val_if_fail(o != NULL, 0);
+	if (o->type != INTERFACE_Port)
+		return TYPE_ID_OTHER;
 	return o->port.type_id;
 }
 
 SPA_EXPORT
 int jack_port_is_mine (const jack_client_t *client, const jack_port_t *port)
 {
-	struct object *o = (struct object *) port;
+	struct object *o = port_to_object(port);
 	return_val_if_fail(o != NULL, 0);
 	return o->type == INTERFACE_Port &&
 		o->port.port != NULL &&
@@ -5310,7 +5366,7 @@ int jack_port_is_mine (const jack_client_t *client, const jack_port_t *port)
 SPA_EXPORT
 int jack_port_connected (const jack_port_t *port)
 {
-	struct object *o = (struct object *) port;
+	struct object *o = port_to_object(port);
 	struct client *c;
 	struct object *l;
 	int res = 0;
@@ -5340,7 +5396,7 @@ SPA_EXPORT
 int jack_port_connected_to (const jack_port_t *port,
                             const char *port_name)
 {
-	struct object *o = (struct object *) port;
+	struct object *o = port_to_object(port);
 	struct client *c;
 	struct object *p, *l;
 	int res = 0;
@@ -5380,7 +5436,7 @@ int jack_port_connected_to (const jack_port_t *port,
 SPA_EXPORT
 const char ** jack_port_get_connections (const jack_port_t *port)
 {
-	struct object *o = (struct object *) port;
+	struct object *o = port_to_object(port);
 
 	return_val_if_fail(o != NULL, NULL);
 	if (o->type != INTERFACE_Port || o->client == NULL)
@@ -5394,7 +5450,7 @@ const char ** jack_port_get_all_connections (const jack_client_t *client,
                                              const jack_port_t *port)
 {
 	struct client *c = (struct client *) client;
-	struct object *o = (struct object *) port;
+	struct object *o = port_to_object(port);
 	struct object *p, *l;
 	const char **res;
 	int count = 0;
@@ -5437,8 +5493,8 @@ const char ** jack_port_get_all_connections (const jack_client_t *client,
 SPA_EXPORT
 int jack_port_tie (jack_port_t *src, jack_port_t *dst)
 {
-	struct object *s = (struct object *) src;
-	struct object *d = (struct object *) dst;
+	struct object *s = port_to_object(src);
+	struct object *d = port_to_object(dst);
 	struct port *sp, *dp;
 
 	sp = s->port.port;
@@ -5455,7 +5511,7 @@ int jack_port_tie (jack_port_t *src, jack_port_t *dst)
 SPA_EXPORT
 int jack_port_untie (jack_port_t *port)
 {
-	struct object *o = (struct object *) port;
+	struct object *o = port_to_object(port);
 	struct port *p;
 
 	p = o->port.port;
@@ -5476,7 +5532,7 @@ SPA_EXPORT
 int jack_port_rename (jack_client_t* client, jack_port_t *port, const char *port_name)
 {
 	struct client *c = (struct client *) client;
-	struct object *o = (struct object *) port;
+	struct object *o = port_to_object(port);
 	struct port *p;
 	int res = 0;
 
@@ -5518,7 +5574,7 @@ done:
 SPA_EXPORT
 int jack_port_set_alias (jack_port_t *port, const char *alias)
 {
-	struct object *o = (struct object *) port;
+	struct object *o = port_to_object(port);
 	struct client *c;
 	struct port *p;
 	const char *key;
@@ -5574,7 +5630,7 @@ done:
 SPA_EXPORT
 int jack_port_unset_alias (jack_port_t *port, const char *alias)
 {
-	struct object *o = (struct object *) port;
+	struct object *o = port_to_object(port);
 	struct client *c;
 	struct port *p;
 	const char *key;
@@ -5625,7 +5681,7 @@ done:
 SPA_EXPORT
 int jack_port_get_aliases (const jack_port_t *port, char* const aliases[2])
 {
-	struct object *o = (struct object *) port;
+	struct object *o = port_to_object(port);
 	int res = 0;
 
 	return_val_if_fail(o != NULL, -EINVAL);
@@ -5648,7 +5704,7 @@ int jack_port_get_aliases (const jack_port_t *port, char* const aliases[2])
 SPA_EXPORT
 int jack_port_request_monitor (jack_port_t *port, int onoff)
 {
-	struct object *o = (struct object *) port;
+	struct object *o = port_to_object(port);
 
 	return_val_if_fail(o != NULL, -EINVAL);
 
@@ -5679,13 +5735,13 @@ int jack_port_request_monitor_by_name (jack_client_t *client,
 		return -1;
 	}
 
-	return jack_port_request_monitor((jack_port_t*)p, onoff);
+	return jack_port_request_monitor(object_to_port(p), onoff);
 }
 
 SPA_EXPORT
 int jack_port_ensure_monitor (jack_port_t *port, int onoff)
 {
-	struct object *o = (struct object *) port;
+	struct object *o = port_to_object(port);
 
 	return_val_if_fail(o != NULL, -EINVAL);
 
@@ -5702,7 +5758,7 @@ int jack_port_ensure_monitor (jack_port_t *port, int onoff)
 SPA_EXPORT
 int jack_port_monitoring_input (jack_port_t *port)
 {
-	struct object *o = (struct object *) port;
+	struct object *o = port_to_object(port);
 	return_val_if_fail(o != NULL, -EINVAL);
 	return o->port.monitor_requests > 0;
 }
@@ -5880,7 +5936,7 @@ SPA_EXPORT
 int jack_port_disconnect (jack_client_t *client, jack_port_t *port)
 {
 	struct client *c = (struct client *) client;
-	struct object *o = (struct object *) port;
+	struct object *o = port_to_object(port);
 	struct object *l;
 	int res;
 
@@ -5941,7 +5997,7 @@ size_t jack_port_type_get_buffer_size (jack_client_t *client, const char *port_t
 SPA_EXPORT
 void jack_port_set_latency (jack_port_t *port, jack_nframes_t frames)
 {
-	struct object *o = (struct object *) port;
+	struct object *o = port_to_object(port);
 	struct client *c;
 	jack_latency_range_t range = { frames, frames };
 
@@ -5961,16 +6017,19 @@ void jack_port_set_latency (jack_port_t *port, jack_nframes_t frames)
 SPA_EXPORT
 void jack_port_get_latency_range (jack_port_t *port, jack_latency_callback_mode_t mode, jack_latency_range_t *range)
 {
-	struct object *o = (struct object *) port;
+	struct object *o = port_to_object(port);
 	struct client *c;
 	jack_nframes_t nframes, rate;
 	int direction;
 	struct spa_latency_info *info;
 
 	return_if_fail(o != NULL);
-	if (o->type != INTERFACE_Port || o->client == NULL)
-		return;
 	c = o->client;
+
+	if (o->type != INTERFACE_Port || c == NULL) {
+		range->min = range->max = 0;
+		return;
+	}
 
 	if (mode == JackCaptureLatency)
 		direction = SPA_DIRECTION_OUTPUT;
@@ -6003,7 +6062,7 @@ do_port_check_latency(struct spa_loop *loop,
 SPA_EXPORT
 void jack_port_set_latency_range (jack_port_t *port, jack_latency_callback_mode_t mode, jack_latency_range_t *range)
 {
-	struct object *o = (struct object *) port;
+	struct object *o = port_to_object(port);
 	struct client *c;
 	enum spa_direction direction;
 	struct spa_latency_info latency;
@@ -6056,7 +6115,7 @@ int jack_recompute_total_latencies (jack_client_t *client)
 
 static jack_nframes_t port_get_latency (jack_port_t *port)
 {
-	struct object *o = (struct object *) port;
+	struct object *o = port_to_object(port);
 	jack_latency_range_t range = { 0, 0 };
 
 	return_val_if_fail(o != NULL, 0);
@@ -6256,7 +6315,7 @@ jack_port_t * jack_port_by_name (jack_client_t *client, const char *port_name)
 	if (res == NULL)
 		pw_log_info("%p: port \"%s\" not found", c, port_name);
 
-	return (jack_port_t *)res;
+	return object_to_port(res);
 }
 
 SPA_EXPORT
@@ -6278,7 +6337,7 @@ jack_port_t * jack_port_by_id (jack_client_t *client,
 	if (res == NULL)
 		pw_log_info("%p: port %d not found", c, port_id);
 
-	return (jack_port_t *)res;
+	return object_to_port(res);
 }
 
 SPA_EXPORT
