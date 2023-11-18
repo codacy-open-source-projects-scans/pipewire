@@ -2268,6 +2268,7 @@ static void reset_buffers(struct state *this)
 
 	spa_list_init(&this->free);
 	spa_list_init(&this->ready);
+	this->ready_offset = 0;
 
 	for (i = 0; i < this->n_buffers; i++) {
 		struct buffer *b = &this->buffers[i];
@@ -2318,7 +2319,7 @@ static int do_prepare(struct state *state)
 static inline int do_drop(struct state *state)
 {
 	int res;
-	spa_log_debug(state->log, "%p: snd_pcm_drop %u", state, state->linked);
+	spa_log_debug(state->log, "%p: snd_pcm_drop linked:%u", state, state->linked);
 	if (!state->linked && (res = snd_pcm_drop(state->hndl)) < 0) {
 		spa_log_error(state->log, "%s: snd_pcm_drop: %s",
 				state->name, snd_strerror(res));
@@ -2331,7 +2332,7 @@ static inline int do_start(struct state *state)
 {
 	int res;
 	if (SPA_UNLIKELY(!state->alsa_started)) {
-		spa_log_debug(state->log, "%p: snd_pcm_start %u", state, state->linked);
+		spa_log_debug(state->log, "%p: snd_pcm_start linked:%u", state, state->linked);
 		if (!state->linked && (res = snd_pcm_start(state->hndl)) < 0) {
 			spa_log_error(state->log, "%s: snd_pcm_start: %s",
 					state->name, snd_strerror(res));
@@ -2344,7 +2345,7 @@ static inline int do_start(struct state *state)
 
 static inline int check_position_config(struct state *state);
 
-static int alsa_recover(struct state *state, int err)
+static int alsa_recover(struct state *state)
 {
 	int res, st, retry = 0;
 	snd_pcm_status_t *status;
@@ -2386,10 +2387,10 @@ static int alsa_recover(struct state *state, int err)
 	case SND_PCM_STATE_SUSPENDED:
 		spa_log_info(state->log, "%s: recover from state %s",
 				state->name, snd_pcm_state_name(st));
-		while (retry++ < 5 && (err = snd_pcm_resume(state->hndl)) == -EAGAIN)
+		while (retry++ < 5 && (res = snd_pcm_resume(state->hndl)) == -EAGAIN)
 			/* wait until suspend flag is released */
 			poll(NULL, 0, 1000);
-		if (err >= 0)
+		if (res >= 0)
 			return res;
 		/* try to drop and prepare below */
 		break;
@@ -2422,8 +2423,7 @@ recover:
 		if (follower != driver && follower->linked)
 			do_start(follower);
 	}
-
-	return res;
+	return 0;
 }
 
 static inline snd_pcm_sframes_t alsa_avail(struct state *state)
@@ -2442,7 +2442,7 @@ static int get_avail(struct state *state, uint64_t current_time, snd_pcm_uframes
 	snd_pcm_sframes_t avail;
 
 	if (SPA_UNLIKELY((avail = alsa_avail(state)) < 0)) {
-		if ((res = alsa_recover(state, avail)) < 0)
+		if ((res = alsa_recover(state)) < 0)
 			return res;
 		if ((avail = alsa_avail(state)) < 0) {
 			if ((suppressed = spa_ratelimit_test(&state->rate_limit, current_time)) >= 0) {
@@ -2705,7 +2705,7 @@ static int alsa_write_sync(struct state *state, uint64_t current_time)
 		return res;
 
 	if (SPA_UNLIKELY((res = get_status(state, current_time, &avail, &delay, &target)) < 0)) {
-		spa_log_error(state->log, "get_status error");
+		spa_log_error(state->log, "get_status error: %s", spa_strerror(res));
 		state->next_time += state->threshold * 1e9 / state->rate;
 		return res;
 	}
@@ -2767,7 +2767,7 @@ again:
 		if (SPA_UNLIKELY((res = snd_pcm_mmap_begin(hndl, &my_areas, &offset, &frames)) < 0)) {
 			spa_log_error(state->log, "%s: snd_pcm_mmap_begin error: %s",
 					state->name, snd_strerror(res));
-			alsa_recover(state, res);
+			alsa_recover(state);
 			return res;
 		}
 		spa_log_trace_fp(state->log, "%p: begin offset:%ld avail:%ld threshold:%d",
@@ -2966,7 +2966,7 @@ static int alsa_read_sync(struct state *state, uint64_t current_time)
 		return res;
 
 	if (SPA_UNLIKELY((res = get_status(state, current_time, &avail, &delay, &target)) < 0)) {
-		spa_log_error(state->log, "get_status error");
+		spa_log_error(state->log, "get_status error: %s", spa_strerror(res));
 		state->next_time += state->threshold * 1e9 / state->rate;
 		return res;
 	}
@@ -3033,7 +3033,7 @@ static int alsa_read_frames(struct state *state)
 		if ((res = snd_pcm_mmap_begin(hndl, &my_areas, &offset, &avail)) < 0) {
 			spa_log_error(state->log, "%s: snd_pcm_mmap_begin error: %s",
 					state->name, snd_strerror(res));
-			alsa_recover(state, res);
+			alsa_recover(state);
 			return res;
 		}
 		spa_log_trace_fp(state->log, "%p: begin offs:%ld frames:%ld avail:%ld thres:%d", state,
@@ -3203,6 +3203,11 @@ static void alsa_wakeup_event(struct spa_source *source)
 		if (!revents) {
 			spa_log_trace_fp(state->log, "Woken up with no work to do");
 			return;
+		}
+		if (revents & POLLERR) {
+			spa_log_trace_fp(state->log, "poll error");
+			if ((res = alsa_recover(state)) < 0)
+				return;
 		}
 	} else {
 		if (SPA_LIKELY(state->started)) {
