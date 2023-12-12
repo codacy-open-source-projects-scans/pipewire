@@ -53,7 +53,7 @@ struct props {
 };
 
 #define FILL_FRAMES 4
-#define MIN_BUFFERS 2
+#define MIN_BUFFERS 3
 #define MAX_BUFFERS 32
 #define BUFFER_SIZE	(8192*8)
 #define RATE_CTL_DIFF_MAX 0.005
@@ -888,7 +888,7 @@ again:
 			 */
 #if 1
 			this->next_flush_time += SPA_MIN(packet_time,
-					duration_ns * (port->n_buffers - 1));
+					duration_ns * (SPA_MAX(port->n_buffers, 2u) - 2));
 #endif
 		} else {
 			if (this->next_flush_time == 0)
@@ -1083,7 +1083,7 @@ static void media_on_timeout(struct spa_source *source)
 	uint32_t rate;
 	struct spa_io_buffers *io = port->io;
 	uint64_t prev_time, now_time;
-	int res;
+	int status, res;
 
 	if (this->started) {
 		if ((res = spa_system_timerfd_read(this->data_system, this->timerfd, &exp)) < 0) {
@@ -1131,10 +1131,12 @@ static void media_on_timeout(struct spa_source *source)
 		this->clock->delay = (delay_nsec * this->clock->rate.denom) / SPA_NSEC_PER_SEC;
 	}
 
+	status = this->transport_started ? SPA_STATUS_NEED_DATA : SPA_STATUS_HAVE_DATA;
 
-	spa_log_trace(this->log, "%p: %d", this, io->status);
-	io->status = SPA_STATUS_NEED_DATA;
-	spa_node_call_ready(&this->callbacks, SPA_STATUS_NEED_DATA);
+	spa_log_trace(this->log, "%p: %d -> %d", this, io->status, status);
+	io->status = status;
+	io->buffer_id = SPA_ID_INVALID;
+	spa_node_call_ready(&this->callbacks, status);
 
 	set_timeout(this, this->next_time);
 }
@@ -1330,6 +1332,9 @@ static int do_remove_transport_source(struct spa_loop *loop,
 
 	if (this->transport->iso_io)
 		spa_bt_iso_io_set_cb(this->transport->iso_io, NULL, NULL);
+
+	/* Drop queued data */
+	drop_frames(this, UINT32_MAX);
 
 	return 0;
 }
@@ -1847,8 +1852,13 @@ static int impl_node_process(void *object)
 		return SPA_STATUS_HAVE_DATA;
 	}
 
-	if (!this->started || !this->transport_started)
-		return SPA_STATUS_OK;
+	if (!this->started || !this->transport_started) {
+		if (io->status != SPA_STATUS_HAVE_DATA) {
+			io->status = SPA_STATUS_HAVE_DATA;
+			io->buffer_id = SPA_ID_INVALID;
+		}
+		return SPA_STATUS_HAVE_DATA;
+	}
 
 	if (io->status == SPA_STATUS_HAVE_DATA && io->buffer_id < port->n_buffers) {
 		struct buffer *b = &port->buffers[io->buffer_id];
