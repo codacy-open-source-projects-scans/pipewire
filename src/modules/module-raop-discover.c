@@ -60,8 +60,6 @@
  *         stream.rules = [
  *             {   matches = [
  *                     {    raop.ip = "~.*"
- *                          #raop.ip.version = 4 | 6
- *                          #raop.ip.version = 4
  *                          #raop.port = 1000
  *                          #raop.name = ""
  *                          #raop.hostname = ""
@@ -365,15 +363,20 @@ static void resolver_cb(AvahiServiceResolver *r, AvahiIfIndex interface, AvahiPr
 	struct impl *impl = userdata;
 	struct tunnel_info tinfo;
 	struct tunnel *t;
-	const char *str;
+	const char *str, *link_local_range = "169.254.";
 	AvahiStringList *l;
 	struct pw_properties *props = NULL;
 	char at[AVAHI_ADDRESS_STR_MAX];
-	int ipv;
 
 	if (event != AVAHI_RESOLVER_FOUND) {
 		pw_log_error("Resolving of '%s' failed: %s", name,
 				avahi_strerror(avahi_client_errno(impl->client)));
+		goto done;
+	}
+
+	avahi_address_snprint(at, sizeof(at), a);
+	if (spa_strstartswith(at, link_local_range)) {
+		pw_log_info("found link-local ip address %s - skipping tunnel creation", at);
 		goto done;
 	}
 
@@ -387,7 +390,7 @@ static void resolver_cb(AvahiServiceResolver *r, AvahiIfIndex interface, AvahiPr
 		goto done;
 	}
 	if (t->module != NULL) {
-		pw_log_info("found duplicate mdns entry - skipping tunnel creation");
+		pw_log_info("found duplicate mdns entry for %s on IP %s - skipping tunnel creation", name, at);
 		goto done;
 	}
 
@@ -397,10 +400,7 @@ static void resolver_cb(AvahiServiceResolver *r, AvahiIfIndex interface, AvahiPr
 		goto done;
 	}
 
-	avahi_address_snprint(at, sizeof(at), a);
-	ipv = protocol == AVAHI_PROTO_INET ? 4 : 6;
 	pw_properties_setf(props, "raop.ip", "%s", at);
-	pw_properties_setf(props, "raop.ip.version", "%d", ipv);
 	pw_properties_setf(props, "raop.port", "%u", port);
 	pw_properties_setf(props, "raop.name", "%s", name);
 	pw_properties_setf(props, "raop.hostname", "%s", host_name);
