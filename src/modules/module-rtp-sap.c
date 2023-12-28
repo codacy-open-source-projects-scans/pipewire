@@ -17,6 +17,7 @@
 
 #include <spa/utils/hook.h>
 #include <spa/utils/result.h>
+#include <spa/utils/json.h>
 #include <spa/debug/types.h>
 
 #include <pipewire/pipewire.h>
@@ -56,6 +57,8 @@
  * - `net.ttl = <int>`: TTL to use, default 1
  * - `net.loop = <bool>`: loopback multicast, default false
  * - `stream.rules` = <rules>: match rules, use create-stream and announce-stream actions
+ * - `sap.preamble-extra = [strings]`: extra attributes to add to the atomic SDP preamble
+ * - `sap.end-extra = [strings]`: extra attributes to add to the end of the SDP message
  *
  * ## General options
  *
@@ -164,6 +167,7 @@ static const struct spa_dict_item module_info[] = {
 struct sdp_info {
 	uint16_t hash;
 	uint32_t ntp;
+	uint32_t t_ntp;
 
 	char *origin;
 	char *session_name;
@@ -183,6 +187,7 @@ struct sdp_info {
 	uint32_t channels;
 
 	float ptime;
+	uint32_t framecount;
 
 	uint32_t ts_offset;
 	char *ts_refclk;
@@ -254,6 +259,9 @@ struct impl {
 
 	uint32_t n_sessions;
 	struct spa_list sessions;
+
+	char *extra_attrs_preamble;
+	char *extra_attrs_end;
 };
 
 struct format_info {
@@ -544,14 +552,25 @@ static int send_sap(struct impl *impl, struct session *sess, bool bye)
 			user_name, sdp->ntp, src_ip4 ? "IP4" : "IP6", src_addr,
 			sdp->session_name,
 			dst_ip4 ? "IP4" : "IP6", dst_addr, dst_ttl,
-			sdp->ntp,
+			sdp->t_ntp,
 			sdp->media_type, sdp->dst_port, sdp->payload);
+
+	if (impl->extra_attrs_preamble)
+		spa_strbuf_append(&buf, "%s", impl->extra_attrs_preamble);
 
 	if (sdp->channels) {
 		if (sdp->channelmap[0] != 0) {
+			// Produce Audinate format channel record. It's recognized by RAVENNA
 			spa_strbuf_append(&buf,
 				"i=%d channels: %s\n", sdp->channels,
 				sdp->channelmap);
+		} else {
+			spa_strbuf_append(&buf, "i=%d channels:", sdp->channels);
+			for (uint i = 1; i <= sdp->channels; i++) {
+				if (i > 1) spa_strbuf_append(&buf, ",");
+				spa_strbuf_append(&buf, " AUX%u", i);
+			}
+			spa_strbuf_append(&buf, "\n");
 		}
 		spa_strbuf_append(&buf,
 			"a=recvonly\n"
@@ -564,9 +583,18 @@ static int send_sap(struct impl *impl, struct session *sess, bool bye)
 				sdp->payload, sdp->mime_type, sdp->rate);
 	}
 
+	if (is_multicast((struct sockaddr*)&sdp->dst_addr, sdp->dst_len))
+		spa_strbuf_append(&buf,
+			"a=source-filter: incl IN %s %s %s\n", dst_ip4 ? "IP4" : "IP6",
+				dst_addr, src_addr);
+
 	if (sdp->ptime > 0)
 		spa_strbuf_append(&buf,
 			"a=ptime:%.6g\n", sdp->ptime);
+
+	if (sdp->framecount > 0)
+		spa_strbuf_append(&buf,
+			"a=framecount:%u\n", sdp->framecount);
 
 	if (sdp->ts_refclk != NULL) {
 		spa_strbuf_append(&buf,
@@ -582,6 +610,9 @@ static int send_sap(struct impl *impl, struct session *sess, bool bye)
 		"a=tool:PipeWire %s\n"
 		"a=type:broadcast\n",
 		pw_get_library_version());
+
+	if (impl->extra_attrs_end)
+		spa_strbuf_append(&buf, "%s", impl->extra_attrs_end);
 
 	pw_log_debug("sending SAP for %u %s", sess->node->id, buffer);
 
@@ -665,7 +696,8 @@ static struct session *session_new_announce(struct impl *impl, struct node *node
 	sess->announce = true;
 
 	sdp->hash = pw_rand32();
-	sdp->ntp = (uint32_t) time(NULL) + 2208988800U;
+	sdp->ntp = (uint32_t) time(NULL) + 2208988800U + impl->n_sessions;
+	sdp->t_ntp = pw_properties_get_uint32(props, "rtp.ntp", sdp->ntp);
 	sess->props = props;
 
 	if ((str = pw_properties_get(props, "sess.name")) == NULL)
@@ -691,6 +723,10 @@ static struct session *session_new_announce(struct impl *impl, struct node *node
 		if (!spa_atof(str, &sdp->ptime))
 			sdp->ptime = 0.0;
 
+	if ((str = pw_properties_get(props, "rtp.framecount")) != NULL)
+		if (!spa_atou32(str, &sdp->framecount, 0))
+			sdp->framecount = 0;
+
 	if ((str = pw_properties_get(props, "rtp.media")) != NULL)
 		sdp->media_type = strdup(str);
 	if ((str = pw_properties_get(props, "rtp.mime")) != NULL)
@@ -703,8 +739,22 @@ static struct session *session_new_announce(struct impl *impl, struct node *node
 		sdp->ts_offset = atoi(str);
 	if ((str = pw_properties_get(props, "rtp.ts-refclk")) != NULL)
 		sdp->ts_refclk = strdup(str);
-	if ((str = pw_properties_get(props, PW_KEY_NODE_CHANNELNAMES)) != NULL)
-		snprintf(sdp->channelmap, sizeof(sdp->channelmap), "%s", str);
+	if ((str = pw_properties_get(props, PW_KEY_NODE_CHANNELNAMES)) != NULL) {
+		struct spa_strbuf buf;
+		spa_strbuf_init(&buf, sdp->channelmap, sizeof(sdp->channelmap));
+
+		struct spa_json it[2];
+		char v[256];
+
+		spa_json_init(&it[0], str, strlen(str));
+		if (spa_json_enter_array(&it[0], &it[1]) <= 0)
+			spa_json_init(&it[1], str, strlen(str));
+
+		if (spa_json_get_string(&it[1], v, sizeof(v)) > 0)
+			spa_strbuf_append(&buf, "%s", v);
+		while (spa_json_get_string(&it[1], v, sizeof(v)) > 0)
+			spa_strbuf_append(&buf, ", %s", v);
+	}
 
 	pw_log_info("created new session for node:%u", node->id);
 	node->session = sess;
@@ -909,6 +959,7 @@ static struct session *session_new(struct impl *impl, struct sdp_info *info)
 	pw_properties_setf(props, "rtp.destination.port", "%u", info->dst_port);
 	pw_properties_setf(props, "rtp.payload", "%u", info->payload);
 	pw_properties_set(props, "rtp.ptime", spa_dtoa(tmp, sizeof(tmp), info->ptime));
+	pw_properties_setf(props, "rtp.framecount", "%u", info->framecount);
 	pw_properties_setf(props, "rtp.media", "%s", info->media_type);
 	pw_properties_setf(props, "rtp.mime", "%s", info->mime_type);
 	pw_properties_setf(props, "rtp.rate", "%u", info->rate);
@@ -1006,7 +1057,8 @@ static int parse_sdp_m(struct impl *impl, char *c, struct sdp_info *info)
 /* some AES67 devices have channelmap encoded in i=*
  * if `i` record is found, it matches the template
  * and channel count matches, name the channels respectively
- * `i=2 channels: 01, 08` is the format */
+ * `i=2 channels: 01, 08` is the format
+ * This is Audinate format. TODO: parse RAVENNA `i=CH1,CH2,CH3` format */
 static int parse_sdp_i(struct impl *impl, char *c, struct sdp_info *info)
 {
 	if (!strstr(c, " channels: ")) {
@@ -1060,8 +1112,18 @@ static int parse_sdp_a_rtpmap(struct impl *impl, char *c, struct sdp_info *info)
 	} else
 		return -EINVAL;
 
-	pw_log_debug("rate: %d, ch: %d", info->rate, info->channels);
+	pw_log_debug("a=rtpmap: rate: %d, ch: %d", info->rate, info->channels);
 
+	return 0;
+}
+
+static int parse_sdp_a_ptime(struct impl *impl, char *c, struct sdp_info *info)
+{
+	if (!spa_strstartswith(c, "a=ptime:"))
+		return 0;
+
+	c += strlen("a=ptime:");
+	spa_atof(c, &info->ptime);
 	return 0;
 }
 
@@ -1105,7 +1167,7 @@ static int parse_sdp(struct impl *impl, char *sdp, struct sdp_info *info)
 			goto too_short;
 
 		s[l] = 0;
-		pw_log_debug("%d: %s", count, s);
+		pw_log_debug("SDP line: %d: %s", count, s);
 
 		if (count++ == 0 && strcmp(s, "v=0") != 0)
 			goto invalid_version;
@@ -1120,6 +1182,8 @@ static int parse_sdp(struct impl *impl, char *sdp, struct sdp_info *info)
 			res = parse_sdp_m(impl, s, info);
 		else if (spa_strstartswith(s, "a=rtpmap:"))
 			res = parse_sdp_a_rtpmap(impl, s, info);
+		else if (spa_strstartswith(s, "a=ptime:"))
+			res = parse_sdp_a_ptime(impl, s, info);
 		else if (spa_strstartswith(s, "a=mediaclk:"))
 			res = parse_sdp_a_mediaclk(impl, s, info);
 		else if (spa_strstartswith(s, "a=ts-refclk:"))
@@ -1403,6 +1467,9 @@ static void impl_destroy(struct impl *impl)
 
 	pw_properties_free(impl->props);
 
+	free(impl->extra_attrs_preamble);
+	free(impl->extra_attrs_end);
+
 	free(impl->ifname);
 	free(impl);
 }
@@ -1514,6 +1581,39 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 
 	impl->ttl = pw_properties_get_uint32(props, "net.ttl", DEFAULT_TTL);
 	impl->mcast_loop = pw_properties_get_bool(props, "net.loop", DEFAULT_LOOP);
+
+	impl->extra_attrs_preamble = NULL;
+	impl->extra_attrs_end = NULL;
+	char buffer[2048];
+	struct spa_strbuf buf;
+	if ((str = pw_properties_get(props, "sap.preamble-extra")) != NULL) {
+		spa_strbuf_init(&buf, buffer, sizeof(buffer));
+		struct spa_json it[2];
+		char line[256];
+
+		spa_json_init(&it[0], str, strlen(str));
+		if (spa_json_enter_array(&it[0], &it[1]) <= 0)
+			spa_json_init(&it[1], str, strlen(str));
+
+		while (spa_json_get_string(&it[1], line, sizeof(line)) > 0)
+			spa_strbuf_append(&buf, "%s\n", line);
+
+		impl->extra_attrs_preamble = strdup(buffer);
+	}
+	if ((str = pw_properties_get(props, "sap.end-extra")) != NULL) {
+		spa_strbuf_init(&buf, buffer, sizeof(buffer));
+		struct spa_json it[2];
+		char line[256];
+
+		spa_json_init(&it[0], str, strlen(str));
+		if (spa_json_enter_array(&it[0], &it[1]) <= 0)
+			spa_json_init(&it[1], str, strlen(str));
+
+		while (spa_json_get_string(&it[1], line, sizeof(line)) > 0)
+			spa_strbuf_append(&buf, "%s\n", line);
+
+		impl->extra_attrs_end = strdup(buffer);
+	}
 
 	impl->core = pw_context_get_object(context, PW_TYPE_INTERFACE_Core);
 	if (impl->core == NULL) {

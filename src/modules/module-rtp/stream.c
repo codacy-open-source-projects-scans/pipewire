@@ -416,15 +416,34 @@ struct rtp_stream *rtp_stream_new(struct pw_core *core,
 		if (!spa_atof(str, &ptime))
 			ptime = 0.0;
 
-	if (ptime) {
-		impl->psamples = ptime * impl->rate / 1000;
-	} else {
-		impl->psamples = impl->mtu / impl->stride;
-		impl->psamples = SPA_CLAMP(impl->psamples, min_samples, max_samples);
-		if (direction == PW_DIRECTION_INPUT)
+	uint32_t framecount = 0;
+	if ((str = pw_properties_get(props, "rtp.framecount")) != NULL)
+		if (!spa_atou32(str, &framecount, 0))
+			framecount = 0;
+
+	if (ptime > 0 || framecount > 0) {
+		if (!framecount) {
+			impl->psamples = ptime * impl->rate / 1000;
+			pw_properties_setf(props, "rtp.framecount", "%u", impl->psamples);
+		} else if (!ptime) {
+			impl->psamples = framecount;
 			pw_properties_set(props, "rtp.ptime",
 					spa_dtoa(tmp, sizeof(tmp),
 						impl->psamples * 1000.0 / impl->rate));
+		} else if (fabs((impl->psamples * 1000.0 / impl->rate) - ptime) > 0.1) {
+			impl->psamples = ptime * impl->rate / 1000;
+			pw_log_warn("rtp.ptime doesn't match rtp.framecount. Choosing rtp.ptime");
+		}
+	} else {
+		impl->psamples = impl->mtu / impl->stride;
+		impl->psamples = SPA_CLAMP(impl->psamples, min_samples, max_samples);
+		if (direction == PW_DIRECTION_INPUT) {
+			pw_properties_set(props, "rtp.ptime",
+					spa_dtoa(tmp, sizeof(tmp),
+						impl->psamples * 1000.0 / impl->rate));
+
+			pw_properties_setf(props, "rtp.framecount", "%u", impl->psamples);
+		}
 	}
 	latency_msec = pw_properties_get_uint32(props,
 			"sess.latency.msec", DEFAULT_SESS_LATENCY);
@@ -433,6 +452,7 @@ struct rtp_stream *rtp_stream_new(struct pw_core *core,
 
 	pw_properties_setf(props, PW_KEY_NODE_RATE, "1/%d", impl->rate);
 	if (direction == PW_DIRECTION_INPUT) {
+		// TODO: make sess.latency.msec work for sender streams
 		pw_properties_setf(props, PW_KEY_NODE_LATENCY, "%d/%d",
 				impl->psamples, impl->rate);
 	} else {
