@@ -32,6 +32,7 @@
 #include <spa/utils/result.h>
 #include <spa/utils/string.h>
 #include <spa/utils/json.h>
+#include <spa/debug/log.h>
 
 #ifdef HAVE_SYSTEMD
 #include <systemd/sd-daemon.h>
@@ -157,8 +158,6 @@ static const struct spa_dict_item module_props[] = {
 #define SO_PEERSEC 31
 #endif
 
-static bool debug_messages = 0;
-
 #define LOCK_SUFFIX     ".lock"
 #define LOCK_SUFFIXLEN  5
 
@@ -253,7 +252,7 @@ static void debug_msg(const char *prefix, const struct pw_protocol_native_messag
 	else
 		hex = true;
 	if (hex)
-		spa_debug_mem(0, msg->data, msg->size);
+		spa_debug_log_mem(pw_log_get(), SPA_LOG_LEVEL_DEBUG, 0, msg->data, msg->size);
 
 	pw_logt_debug(mod_topic_connection, "%s ****", prefix);
 
@@ -341,7 +340,7 @@ process_messages(struct client_data *data)
 		pw_log_trace("%p: got message %d from %u", client->protocol,
 			     msg->opcode, msg->id);
 
-		if (debug_messages)
+		if (pw_log_topic_custom_enabled(SPA_LOG_LEVEL_DEBUG, mod_topic_connection))
 			debug_msg("<<<<<< in", msg, false);
 
 		pre_demarshal(conn, msg, client, footer_client_demarshal,
@@ -995,7 +994,7 @@ process_remote(struct client *impl)
 
 		this->recv_seq = msg->seq;
 
-		if (debug_messages)
+		if (pw_log_topic_custom_enabled(SPA_LOG_LEVEL_DEBUG, mod_topic_connection))
 			debug_msg("<<<<<< in", msg, false);
 
 		pre_demarshal(conn, msg, this, footer_core_demarshal,
@@ -1709,15 +1708,13 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args_str)
 	if (this == NULL)
 		return -errno;
 
-	debug_messages = mod_topic_connection->level >= SPA_LOG_LEVEL_DEBUG;
-
 	this->implementation = &protocol_impl;
 	this->extension = &protocol_ext_impl;
 
 	pw_protocol_native_init(this);
 	pw_protocol_native0_init(this);
 
-	pw_log_debug("%p: new debug:%d", this, debug_messages);
+	pw_log_debug("%p: new", this);
 
 	d = pw_protocol_get_user_data(this);
 	d->protocol = this;

@@ -22,7 +22,7 @@
 #include "media-codecs.h"
 #include "defs.h"
 
-static struct spa_log_topic log_topic = SPA_LOG_TOPIC(0, "spa.bluez5.iso");
+SPA_LOG_TOPIC_DEFINE_STATIC(log_topic, "spa.bluez5.iso");
 #undef SPA_LOG_TOPIC_DEFAULT
 #define SPA_LOG_TOPIC_DEFAULT &log_topic
 
@@ -31,7 +31,6 @@ static struct spa_log_topic log_topic = SPA_LOG_TOPIC(0, "spa.bluez5.iso");
 
 struct group {
 	struct spa_log *log;
-	struct spa_log_topic log_topic;
 	struct spa_loop *data_loop;
 	struct spa_system *data_system;
 	struct spa_source source;
