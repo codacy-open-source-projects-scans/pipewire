@@ -100,6 +100,7 @@ struct stream {
 	struct spa_io_buffers *io;
 	struct spa_io_rate_match *rate_match;
 	uint32_t rate_queued;
+	uint64_t rate_size;
 	struct {
 		struct spa_io_position *position;
 	} rt;
@@ -237,6 +238,8 @@ static int add_param(struct stream *impl,
 		return -EINVAL;
 	if (param == NULL || !spa_pod_object_has_props((struct spa_pod_object*)param))
 		return 0;
+
+	pw_log_pod(SPA_LOG_LEVEL_DEBUG, param);
 
 	if (id == SPA_ID_INVALID)
 		id = SPA_POD_OBJECT_ID(param);
@@ -420,7 +423,7 @@ static struct buffer *get_buffer(struct pw_stream *stream, uint32_t id)
 
 static inline uint32_t update_requested(struct stream *impl)
 {
-	uint32_t index, id, res = 0;
+	uint32_t index, id;
 	struct buffer *buffer;
 	struct spa_io_rate_match *r = impl->rate_match;
 
@@ -431,15 +434,11 @@ static inline uint32_t update_requested(struct stream *impl)
 
 	id = impl->dequeued.ids[index & MASK_BUFFERS];
 	buffer = &impl->buffers[id];
-	if (r) {
-		buffer->this.requested = r->size;
-		res = r->size > 0 ? 1 : 0;
-	} else {
-		buffer->this.requested = impl->quantum;
-		res = 1;
-	}
+	buffer->this.requested = r ? r->size : impl->quantum;
+
 	pw_log_trace_fp("%p: update buffer:%u req:%"PRIu64, impl, id, buffer->this.requested);
-	return res;
+
+	return buffer->this.requested > 0 ? 1 : 0;
 }
 
 static int
@@ -643,8 +642,10 @@ static inline void copy_position(struct stream *impl, int64_t queued)
 		impl->time.queued = queued;
 		impl->quantum = p->clock.duration;
 	}
-	if (SPA_LIKELY(impl->rate_match != NULL))
+	if (SPA_LIKELY(impl->rate_match != NULL)) {
 		impl->rate_queued = impl->rate_match->delay;
+		impl->rate_size = impl->rate_match->size;
+	}
 	SPA_SEQ_WRITE(impl->seq);
 }
 
@@ -677,11 +678,11 @@ static int impl_send_command(void *object, const struct spa_command *command)
 				if (impl->io != NULL)
 					impl->io->status = SPA_STATUS_NEED_DATA;
 			}
-			else if (!impl->process_rt && !impl->driving) {
+			else {
 				copy_position(impl, impl->queued.incount);
-				call_process(impl);
+				if (!impl->process_rt && !impl->driving)
+					call_process(impl);
 			}
-
 			stream_set_state(stream, PW_STREAM_STATE_STREAMING, 0, NULL);
 		}
 		break;
@@ -2215,9 +2216,10 @@ int pw_stream_update_params(struct pw_stream *stream,
 	if ((res = update_params(impl, SPA_ID_INVALID, params, n_params)) < 0)
 		return res;
 
-	emit_node_info(impl, false);
-	emit_port_info(impl, false);
-
+	if (impl->in_emit_param_changed == 0) {
+		emit_node_info(impl, false);
+		emit_port_info(impl, false);
+	}
 	return res;
 }
 
@@ -2355,13 +2357,14 @@ int pw_stream_get_time_n(struct pw_stream *stream, struct pw_time *time, size_t 
 {
 	struct stream *impl = SPA_CONTAINER_OF(stream, struct stream, this);
 	uintptr_t seq1, seq2;
-	uint32_t buffered, quantum, index;
+	uint32_t buffered, quantum, index, rate_size;
 	int32_t avail_buffers;
 
 	do {
 		seq1 = SPA_SEQ_READ(impl->seq);
 		memcpy(time, &impl->time, SPA_MIN(size, sizeof(struct pw_time)));
 		buffered = impl->rate_queued;
+		rate_size = impl->rate_size;
 		quantum = impl->quantum;
 		seq2 = SPA_SEQ_READ(impl->seq);
 	} while (!SPA_SEQ_READ_SUCCESS(seq1, seq2));
@@ -2382,8 +2385,10 @@ int pw_stream_get_time_n(struct pw_stream *stream, struct pw_time *time, size_t 
 		time->buffered = buffered;
 	if (size >= offsetof(struct pw_time, avail_buffers))
 		time->queued_buffers = impl->n_buffers - avail_buffers;
-	if (size >= sizeof(struct pw_time))
+	if (size >= offsetof(struct pw_time, size))
 		time->avail_buffers = avail_buffers;
+	if (size >= sizeof(struct pw_time))
+		time->size = rate_size;
 
 	pw_log_trace_fp("%p: %"PRIi64" %"PRIi64" %"PRIu64" %d/%d %"PRIu64" %"
 			PRIu64" %"PRIu64" %"PRIu64" %"PRIu64" %d/%d", stream,

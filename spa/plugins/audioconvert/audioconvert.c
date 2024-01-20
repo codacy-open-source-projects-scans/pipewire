@@ -1813,10 +1813,56 @@ static int ensure_tmp(struct impl *this, uint32_t maxsize, uint32_t maxports)
 	return 0;
 }
 
+static uint32_t resample_update_rate_match(struct impl *this, bool passthrough, uint32_t size, uint32_t queued)
+{
+	uint32_t delay, match_size;
+
+	if (passthrough) {
+		delay = 0;
+		match_size = size;
+	} else {
+		double rate = this->rate_scale / this->props.rate;
+		if (this->io_rate_match &&
+		    SPA_FLAG_IS_SET(this->io_rate_match->flags, SPA_IO_RATE_MATCH_FLAG_ACTIVE))
+			rate *= this->io_rate_match->rate;
+		resample_update_rate(&this->resample, rate);
+		delay = resample_delay(&this->resample);
+		if (this->direction == SPA_DIRECTION_INPUT)
+			match_size = resample_in_len(&this->resample, size);
+		else
+			match_size = resample_out_len(&this->resample, size);
+	}
+	match_size -= SPA_MIN(match_size, queued);
+
+	spa_log_trace_fp(this->log, "%p: next match %u", this, match_size);
+
+	if (this->io_rate_match) {
+		this->io_rate_match->delay = delay + queued;
+		this->io_rate_match->size = match_size;
+	}
+	return match_size;
+}
+
+static inline bool resample_is_passthrough(struct impl *this)
+{
+	if (this->props.resample_disabled)
+		return true;
+	if (this->resample.i_rate != this->resample.o_rate)
+		return false;
+	if (this->rate_scale != 1.0)
+		return false;
+	if (this->rate_adjust)
+		return false;
+	if (this->io_rate_match != NULL &&
+	    SPA_FLAG_IS_SET(this->io_rate_match->flags, SPA_IO_RATE_MATCH_FLAG_ACTIVE))
+		return false;
+	return true;
+}
+
 static int setup_convert(struct impl *this)
 {
 	struct dir *in, *out;
-	uint32_t i, rate, maxsize, maxports;
+	uint32_t i, rate, maxsize, maxports, duration;
 	struct port *p;
 	int res;
 
@@ -1832,7 +1878,13 @@ static int setup_convert(struct impl *this)
 	if (!in->have_format || !out->have_format)
 		return -EINVAL;
 
-	rate = this->io_position ? this->io_position->clock.target_rate.denom : DEFAULT_RATE;
+	if (this->io_position != NULL) {
+		rate = this->io_position->clock.target_rate.denom;
+		duration = this->io_position->clock.target_duration;
+	} else {
+		rate = DEFAULT_RATE;
+		duration = this->quantum_limit;
+	}
 
 	/* in DSP mode we always convert to the DSP rate */
 	if (in->mode == SPA_PARAM_PORT_CONFIG_MODE_dsp)
@@ -1878,6 +1930,8 @@ static int setup_convert(struct impl *this)
 	maxports = SPA_MAX(in->format.info.raw.channels, out->format.info.raw.channels);
 	if ((res = ensure_tmp(this, maxsize, maxports)) < 0)
 		return res;
+
+	resample_update_rate_match(this, resample_is_passthrough(this), duration, 0);
 
 	this->setup = true;
 
@@ -2736,49 +2790,6 @@ static inline uint32_t resample_get_in_size(struct impl *this, bool passthrough,
 	return match_size;
 }
 
-static uint32_t resample_update_rate_match(struct impl *this, bool passthrough, uint32_t out_size, uint32_t in_queued)
-{
-	uint32_t delay, match_size;
-
-	if (passthrough) {
-		delay = 0;
-		match_size = out_size;
-	} else {
-		double rate = this->rate_scale / this->props.rate;
-		if (this->io_rate_match &&
-		    SPA_FLAG_IS_SET(this->io_rate_match->flags, SPA_IO_RATE_MATCH_FLAG_ACTIVE))
-			rate *= this->io_rate_match->rate;
-		resample_update_rate(&this->resample, rate);
-		delay = resample_delay(&this->resample);
-		match_size = resample_in_len(&this->resample, out_size);
-	}
-	match_size -= SPA_MIN(match_size, in_queued);
-
-	spa_log_trace_fp(this->log, "%p: next match %u", this, match_size);
-
-	if (this->io_rate_match) {
-		this->io_rate_match->delay = delay + in_queued;
-		this->io_rate_match->size = match_size;
-	}
-	return match_size;
-}
-
-static inline bool resample_is_passthrough(struct impl *this)
-{
-	if (this->props.resample_disabled)
-		return true;
-	if (this->resample.i_rate != this->resample.o_rate)
-		return false;
-	if (this->rate_scale != 1.0)
-		return false;
-	if (this->rate_adjust)
-		return false;
-	if (this->io_rate_match != NULL &&
-	    SPA_FLAG_IS_SET(this->io_rate_match->flags, SPA_IO_RATE_MATCH_FLAG_ACTIVE))
-		return false;
-	return true;
-}
-
 static uint64_t get_time_ns(struct impl *impl)
 {
 	struct timespec now;
@@ -3243,10 +3254,20 @@ static int impl_node_process(void *object)
 			spa_log_trace_fp(this->log, "%p: no output buffer", this);
 		}
 	}
-	if (resample_update_rate_match(this, resample_passthrough,
-			max_out - this->out_offset,
-			max_in - this->in_offset) > 0)
-		res |= SPA_STATUS_NEED_DATA;
+	{
+		uint32_t size, queued;
+
+		if (this->direction == SPA_DIRECTION_INPUT) {
+			size = max_out - this->out_offset;
+			queued = max_in - this->in_offset;
+		} else {
+			size = quant_samples;
+			queued = 0;
+		}
+		if (resample_update_rate_match(this, resample_passthrough,
+					size, queued) > 0)
+			res |= SPA_STATUS_NEED_DATA;
+	}
 
 	return res;
 }
