@@ -457,6 +457,8 @@ static const struct media_codec *media_endpoint_to_codec(struct spa_bt_monitor *
 		const char *codec_ep_name =
 			codec->endpoint_name ? codec->endpoint_name : codec->name;
 
+		if (!preferred && !codec->fill_caps)
+			continue;
 		if (!spa_streq(ep_name, codec_ep_name))
 			continue;
 		if ((*sink && !codec->decode) || (!*sink && !codec->encode))
@@ -880,10 +882,10 @@ static DBusHandlerResult endpoint_select_properties(DBusConnection *conn, DBusMe
 	int res;
 	const struct media_codec *codec;
 	struct spa_bt_remote_endpoint *ep;
-	bool sink;
+	bool sink, duplex;
 	const char *err_msg = "Unknown error";
 	struct spa_dict settings;
-	struct spa_dict_item setting_items[SPA_N_ELEMENTS(monitor->global_setting_items) + 3];
+	struct spa_dict_item setting_items[SPA_N_ELEMENTS(monitor->global_setting_items) + 5];
 	int i;
 
 	const char *endpoint_path = NULL;
@@ -931,10 +933,12 @@ static DBusHandlerResult endpoint_select_properties(DBusConnection *conn, DBusMe
 		spa_scnprintf(channel_allocation, sizeof(channel_allocation), "%"PRIu32, endpoint_qos.channel_allocation);
 
 	ep = remote_endpoint_find(monitor, endpoint_path);
-	if (!ep) {
+	if (!ep || !ep->device) {
 		spa_log_warn(monitor->log, "Unable to find remote endpoint for %s", endpoint_path);
 		goto error_invalid;
 	}
+
+	duplex = SPA_FLAG_IS_SET(ep->device->profiles, SPA_BT_PROFILE_BAP_DUPLEX);
 
 	/* Call of SelectProperties means that local device acts as an initiator
 	 * and therefor remote endpoint is an acceptor
@@ -945,6 +949,8 @@ static DBusHandlerResult endpoint_select_properties(DBusConnection *conn, DBusMe
 		setting_items[i] = monitor->global_settings.items[i];
 	setting_items[i++] = SPA_DICT_ITEM_INIT("bluez5.bap.locations", locations);
 	setting_items[i++] = SPA_DICT_ITEM_INIT("bluez5.bap.channel-allocation", channel_allocation);
+	setting_items[i++] = SPA_DICT_ITEM_INIT("bluez5.bap.sink", sink ? "true" : "false");
+	setting_items[i++] = SPA_DICT_ITEM_INIT("bluez5.bap.duplex", duplex ? "true" : "false");
 	setting_items[i++] = SPA_DICT_ITEM_INIT("bluez5.bap.debug", "true");
 	settings = SPA_DICT_INIT(setting_items, i);
 	spa_assert((size_t)i <= SPA_N_ELEMENTS(setting_items));
@@ -2678,6 +2684,19 @@ static int remote_endpoint_update_props(struct spa_bt_remote_endpoint *remote_en
 next:
 		dbus_message_iter_next(props_iter);
 	}
+
+	/* BAP profile UUIDs do not appear in device UUID list.
+	 * Instead, we detect these capabilities based on available
+	 * endpoints (i.e. PACs).
+	 */
+	if (remote_endpoint->uuid && remote_endpoint->device) {
+		enum spa_bt_profile profile;
+
+		profile = spa_bt_profile_from_uuid(remote_endpoint->uuid);
+		if (profile & SPA_BT_PROFILE_BAP_AUDIO)
+			spa_bt_device_add_profile(remote_endpoint->device, profile);
+	}
+
 	return 0;
 }
 
@@ -3167,6 +3186,7 @@ int64_t spa_bt_transport_get_delay_nsec(struct spa_bt_transport *t)
 		return 150 * SPA_NSEC_PER_MSEC;
 	case SPA_BLUETOOTH_AUDIO_CODEC_LDAC:
 		return 175 * SPA_NSEC_PER_MSEC;
+	case SPA_BLUETOOTH_AUDIO_CODEC_AAC_ELD:
 	case SPA_BLUETOOTH_AUDIO_CODEC_APTX_LL:
 	case SPA_BLUETOOTH_AUDIO_CODEC_APTX_LL_DUPLEX:
 	case SPA_BLUETOOTH_AUDIO_CODEC_FASTSTREAM:

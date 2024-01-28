@@ -762,6 +762,8 @@ int spa_alsa_init(struct state *state, const struct spa_dict *info)
 			state->card_index = atoi(s);
 		} else if (spa_streq(k, SPA_KEY_API_ALSA_OPEN_UCM)) {
 			state->open_ucm = spa_atob(s);
+			if (state->open_ucm)
+				state->props.use_chmap = true;
 		} else if (spa_streq(k, "clock.quantum-limit")) {
 			spa_atou32(s, &state->quantum_limit, 0);
 		} else if (spa_streq(k, SPA_KEY_API_ALSA_BIND_CTLS)) {
@@ -1353,6 +1355,8 @@ skip_channels:
 			goto skip_channels;
 		}
 
+		spa_log_debug(state->log, "%p: using chmap", state);
+
 		sanitize_map(map);
 		spa_pod_builder_int(b, map->channels);
 
@@ -1385,10 +1389,13 @@ skip_channels:
 		spa_pod_builder_pop(b, &f[0]);
 
 		if (min == max) {
-			if (state->default_pos.channels == min)
+			if (state->default_pos.channels == min) {
 				map = &state->default_pos;
-			else if (min == max && min <= 8)
+				spa_log_debug(state->log, "%p: using provided default", state);
+			} else if (min <= 8) {
 				map = &default_map[min];
+				spa_log_debug(state->log, "%p: using default %d channel map", state, min);
+			}
 		}
 		if (map) {
 			spa_pod_builder_prop(b, SPA_FORMAT_AUDIO_position, 0);
@@ -3535,7 +3542,8 @@ void spa_alsa_emit_node_info(struct state *state, bool full)
 		items[n_items++] = SPA_DICT_ITEM_INIT(SPA_KEY_NODE_DRIVER, "true");
 
 		if (state->have_format)
-			snprintf(latency, sizeof(latency), "%lu/%d", state->buffer_frames / 2, state->rate);
+			snprintf(latency, sizeof(latency), "%lu/%d",
+					state->buffer_frames / (2 * state->frame_scale), state->rate);
 		items[n_items++] = SPA_DICT_ITEM_INIT(SPA_KEY_NODE_MAX_LATENCY, latency[0] ? latency : NULL);
 
 		if (state->have_format)

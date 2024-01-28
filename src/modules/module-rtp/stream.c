@@ -262,9 +262,13 @@ static void parse_audio_info(const struct pw_properties *props, struct spa_audio
 		parse_position(info, DEFAULT_POSITION, strlen(DEFAULT_POSITION));
 }
 
-static uint32_t msec_to_samples(struct impl *impl, uint32_t msec)
+static uint32_t msec_to_samples(struct impl *impl, float msec)
 {
 	return msec * impl->rate / 1000;
+}
+static float samples_to_msec(struct impl *impl, uint32_t samples)
+{
+	return samples * 1000.0f / impl->rate;
 }
 
 struct rtp_stream *rtp_stream_new(struct pw_core *core,
@@ -280,7 +284,7 @@ struct rtp_stream *rtp_stream_new(struct pw_core *core,
 	float min_ptime, max_ptime;
 	const struct spa_pod *params[1];
 	enum pw_stream_flags flags;
-	int latency_msec;
+	float latency_msec;
 	int res;
 
 	impl = calloc(1, sizeof(*impl));
@@ -409,30 +413,30 @@ struct rtp_stream *rtp_stream_new(struct pw_core *core,
 	if (!spa_atof(str, &max_ptime))
 		max_ptime = DEFAULT_MAX_PTIME;
 
-	min_samples = min_ptime * impl->rate / 1000;
-	max_samples = max_ptime * impl->rate / 1000;
+	min_samples = msec_to_samples(impl, min_ptime);
+	max_samples = msec_to_samples(impl, max_ptime);
 
 	float ptime = 0;
 	if ((str = pw_properties_get(props, "rtp.ptime")) != NULL)
 		if (!spa_atof(str, &ptime))
-			ptime = 0.0;
+			ptime = 0.0f;
 
 	uint32_t framecount = 0;
 	if ((str = pw_properties_get(props, "rtp.framecount")) != NULL)
 		if (!spa_atou32(str, &framecount, 0))
 			framecount = 0;
 
-	if (ptime > 0 || framecount > 0) {
+	if (ptime > 0.0f || framecount > 0) {
 		if (!framecount) {
-			impl->psamples = ptime * impl->rate / 1000;
+			impl->psamples = msec_to_samples(impl, ptime);
 			pw_properties_setf(props, "rtp.framecount", "%u", impl->psamples);
 		} else if (!ptime) {
 			impl->psamples = framecount;
 			pw_properties_set(props, "rtp.ptime",
 					spa_dtoa(tmp, sizeof(tmp),
-						impl->psamples * 1000.0 / impl->rate));
-		} else if (fabs((impl->psamples * 1000.0 / impl->rate) - ptime) > 0.1) {
-			impl->psamples = ptime * impl->rate / 1000;
+						samples_to_msec(impl, impl->psamples)));
+		} else if (fabsf((samples_to_msec(impl, framecount)) - ptime) > 0.1f) {
+			impl->psamples = msec_to_samples(impl, ptime);
 			pw_log_warn("rtp.ptime doesn't match rtp.framecount. Choosing rtp.ptime");
 		}
 	} else {
@@ -441,21 +445,28 @@ struct rtp_stream *rtp_stream_new(struct pw_core *core,
 		if (direction == PW_DIRECTION_INPUT) {
 			pw_properties_set(props, "rtp.ptime",
 					spa_dtoa(tmp, sizeof(tmp),
-						impl->psamples * 1000.0 / impl->rate));
+						samples_to_msec(impl, impl->psamples)));
 
 			pw_properties_setf(props, "rtp.framecount", "%u", impl->psamples);
 		}
 	}
-	latency_msec = pw_properties_get_uint32(props,
-			"sess.latency.msec", DEFAULT_SESS_LATENCY);
+	/* For senders, the default latency is ptime and for a receiver it is
+	 * DEFAULT_SESS_LATENCY. Setting the sess.latency.msec for a sender to
+	 * something smaller/bigger will influence the quantum and the amount
+	 * of packets we send in one cycle */
+	str = pw_properties_get(props, "sess.latency.msec");
+	if (!spa_atof(str, &latency_msec)) {
+		latency_msec = direction == PW_DIRECTION_INPUT ?
+			samples_to_msec(impl, impl->psamples) :
+			DEFAULT_SESS_LATENCY;
+	}
 	impl->target_buffer = msec_to_samples(impl, latency_msec);
 	impl->max_error = msec_to_samples(impl, ERROR_MSEC);
 
 	pw_properties_setf(props, PW_KEY_NODE_RATE, "1/%d", impl->rate);
 	if (direction == PW_DIRECTION_INPUT) {
-		// TODO: make sess.latency.msec work for sender streams
 		pw_properties_setf(props, PW_KEY_NODE_LATENCY, "%d/%d",
-				impl->psamples, impl->rate);
+				impl->target_buffer, impl->rate);
 	} else {
 		pw_properties_setf(props, PW_KEY_NODE_LATENCY, "%d/%d",
 				impl->target_buffer / 2, impl->rate);

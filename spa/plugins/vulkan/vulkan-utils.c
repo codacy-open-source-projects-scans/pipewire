@@ -213,8 +213,10 @@ static int createDevice(struct vulkan_base *s, struct vulkan_base_info *info)
 		VK_KHR_IMAGE_FORMAT_LIST_EXTENSION_NAME,
 		VK_KHR_EXTERNAL_SEMAPHORE_FD_EXTENSION_NAME,
 		VK_KHR_SYNCHRONIZATION_2_EXTENSION_NAME,
-		VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME
+		VK_EXT_IMAGE_DRM_FORMAT_MODIFIER_EXTENSION_NAME,
+		VK_EXT_QUEUE_FAMILY_FOREIGN_EXTENSION_NAME,
 	};
+
 	const VkDeviceCreateInfo deviceCreateInfo = {
 		.sType = VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO,
 		.queueCreateInfoCount = 1,
@@ -229,113 +231,6 @@ static int createDevice(struct vulkan_base *s, struct vulkan_base_info *info)
 	vkGetDeviceQueue(s->device, s->queueFamilyIndex, 0, &s->queue);
 
 	return 0;
-}
-
-static int queryFormatInfo(struct vulkan_base *s, struct vulkan_base_info *info)
-{
-	if (s->formatInfos)
-		return 0;
-
-	s->formatInfos = calloc(info->formatInfo.formatCount, sizeof(struct vulkan_format_info));
-	if (!s->formatInfos)
-		return -ENOMEM;
-
-	for (uint32_t i = 0; i < info->formatInfo.formatCount; i++) {
-		VkFormat format = vulkan_id_to_vkformat(info->formatInfo.formats[i]);
-		if (format == VK_FORMAT_UNDEFINED)
-			continue;
-		struct vulkan_format_info *f_info = &s->formatInfos[s->formatInfoCount++];
-		f_info->spa_format = info->formatInfo.formats[i];
-		f_info->vk_format = format;
-
-		VkDrmFormatModifierPropertiesListEXT modPropsList = {
-			.sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
-		};
-		VkFormatProperties2 fmtProps = {
-			.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
-			.pNext = &modPropsList,
-		};
-		vkGetPhysicalDeviceFormatProperties2(s->physicalDevice, format, &fmtProps);
-
-		if (!modPropsList.drmFormatModifierCount)
-			continue;
-
-		modPropsList.pDrmFormatModifierProperties = calloc(modPropsList.drmFormatModifierCount,
-				sizeof(modPropsList.pDrmFormatModifierProperties[0]));
-		if (!modPropsList.pDrmFormatModifierProperties)
-			continue;
-		vkGetPhysicalDeviceFormatProperties2(s->physicalDevice, format, &fmtProps);
-
-		f_info->infos = calloc(modPropsList.drmFormatModifierCount, sizeof(f_info->infos[0]));
-		if (!f_info->infos) {
-			free(modPropsList.pDrmFormatModifierProperties);
-			continue;
-		}
-
-		for (uint32_t j = 0; j < modPropsList.drmFormatModifierCount; j++) {
-			VkDrmFormatModifierPropertiesEXT props = modPropsList.pDrmFormatModifierProperties[j];
-
-			if (!(props.drmFormatModifierTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT))
-				continue;
-
-			if (props.drmFormatModifierPlaneCount > DMABUF_MAX_PLANES)
-				continue;
-
-			VkPhysicalDeviceImageDrmFormatModifierInfoEXT modInfo = {
-				.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
-				.drmFormatModifier = props.drmFormatModifier,
-				.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
-			};
-			VkPhysicalDeviceExternalImageFormatInfo extImgFmtInfo = {
-				.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
-				.pNext = &modInfo,
-				.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
-			};
-			VkPhysicalDeviceImageFormatInfo2 imgFmtInfo = {
-				.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
-				.pNext = &extImgFmtInfo,
-				.type = VK_IMAGE_TYPE_2D,
-				.format = format,
-				.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
-				.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
-			};
-
-			VkExternalImageFormatProperties extImgFmtProps = {
-				.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
-			};
-			VkImageFormatProperties2 imgFmtProps = {
-				.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
-				.pNext = &extImgFmtProps,
-			};
-
-			VK_CHECK_RESULT_LOOP(vkGetPhysicalDeviceImageFormatProperties2(s->physicalDevice, &imgFmtInfo, &imgFmtProps))
-
-			VkExternalMemoryFeatureFlags extMemFeatures =
-				extImgFmtProps.externalMemoryProperties.externalMemoryFeatures;
-			if (!(extMemFeatures & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT)) {
-				continue;
-			}
-
-			VkExtent3D max_extent = imgFmtProps.imageFormatProperties.maxExtent;
-			f_info->infos[f_info->modifierCount++] = (struct vulkan_modifier_info){
-				.props = props,
-				.max_extent = { .width = max_extent.width, .height = max_extent.height },
-			};
-
-		}
-		free(modPropsList.pDrmFormatModifierProperties);
-	}
-	return 0;
-}
-
-static void destroyFormatInfo(struct vulkan_base *s)
-{
-	for (uint32_t i = 0; i < s->formatInfoCount; i++) {
-		free(s->formatInfos[i].infos);
-	}
-	free(s->formatInfos);
-	s->formatInfos = NULL;
-	s->formatInfoCount = 0;
 }
 
 int vulkan_read_pixels(struct vulkan_base *s, struct vulkan_read_pixels_info *info, struct vulkan_buffer *vk_buf)
@@ -353,13 +248,13 @@ int vulkan_read_pixels(struct vulkan_base *s, struct vulkan_read_pixels_info *in
 
 	const char *d = (const char *)v + img_sub_layout.offset;
 	unsigned char *p = (unsigned char *)info->data + info->offset;
-	uint32_t bytes_per_pixel = 16;
 	uint32_t pack_stride = img_sub_layout.rowPitch;
+	spa_log_trace_fp(s->log, "Read pixels: %p to %p, stride: %d, width %d, height %d, offset %d, pack_stride %d", d, p, info->stride, info->size.width, info->size.height, info->offset, pack_stride);
 	if (pack_stride == info->stride) {
 		memcpy(p, d, info->stride * info->size.height);
 	} else {
 		for (uint32_t i = 0; i < info->size.height; i++) {
-			memcpy(p + i * info->stride, d + i * pack_stride, info->size.width * bytes_per_pixel);
+			memcpy(p + i * info->stride, d + i * pack_stride, info->size.width * info->bytes_per_pixel);
 		}
 	}
 	vkUnmapMemory(s->device, vk_buf->memory);
@@ -420,6 +315,17 @@ bool vulkan_sync_export_dmabuf(struct vulkan_base *s, struct vulkan_buffer *vk_b
 	return dmabuf_import_sync_file(s->log, vk_buf->fd, DMA_BUF_SYNC_WRITE, sync_file_fd);
 }
 
+int vulkan_fence_create(struct vulkan_base *s, VkFence *fence)
+{
+	VkFenceCreateInfo createInfo = {
+		.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
+		.flags = 0,
+	};
+	VK_CHECK_RESULT(vkCreateFence(s->device, &createInfo, NULL, fence));
+
+	return 0;
+}
+
 int vulkan_commandPool_create(struct vulkan_base *s, VkCommandPool *commandPool)
 {
 	const VkCommandPoolCreateInfo commandPoolCreateInfo = {
@@ -465,18 +371,18 @@ uint32_t vulkan_memoryType_find(struct vulkan_base *s,
 	return -1;
 }
 
-struct vulkan_format_info *vulkan_formatInfo_find(struct vulkan_base *s, VkFormat format)
+struct vulkan_format_info *vulkan_formatInfo_find(struct vulkan_format_infos *fmtInfo, VkFormat format)
 {
-	for (uint32_t i = 0; i < s->formatInfoCount; i++) {
-		if (s->formatInfos[i].vk_format == format)
-			return &s->formatInfos[i];
+	for (uint32_t i = 0; i < fmtInfo->formatCount; i++) {
+		if (fmtInfo->infos[i].vk_format == format)
+			return &fmtInfo->infos[i];
 	}
 	return NULL;
 }
 
-struct vulkan_modifier_info *vulkan_modifierInfo_find(struct vulkan_base *s, VkFormat format, uint64_t mod)
+struct vulkan_modifier_info *vulkan_modifierInfo_find(struct vulkan_format_infos *fmtInfo, VkFormat format, uint64_t mod)
 {
-	struct vulkan_format_info *f_info = vulkan_formatInfo_find(s, format);
+	struct vulkan_format_info *f_info = vulkan_formatInfo_find(fmtInfo, format);
 	if (!f_info)
 		return NULL;
 	for (uint32_t i = 0; i < f_info->modifierCount; i++) {
@@ -566,6 +472,19 @@ static int allocate_dmabuf(struct vulkan_base *s, VkFormat format, uint32_t modi
 	return 0;
 }
 
+int vulkan_validate_dmabuf_properties(const struct vulkan_modifier_info *modInfo, uint32_t *planeCount, struct spa_rectangle *dim)
+{
+	if (planeCount) {
+		if (*planeCount != modInfo->props.drmFormatModifierPlaneCount)
+			return -1;
+	}
+	if (dim) {
+		if (dim->width > modInfo->max_extent.width || dim->height > modInfo->max_extent.height)
+			return -1;
+	}
+	return 0;
+}
+
 int vulkan_fixate_modifier(struct vulkan_base *s, struct dmabuf_fixation_info *info, uint64_t *modifier)
 {
 	VULKAN_INSTANCE_FUNCTION(vkGetImageDrmFormatModifierPropertiesEXT);
@@ -603,11 +522,6 @@ int vulkan_create_dmabuf(struct vulkan_base *s, struct external_buffer_info *inf
 	};
 	int fd = -1;
 	VK_CHECK_RESULT(vkGetMemoryFdKHR(s->device, &getFdInfo, &fd));
-
-	const struct vulkan_modifier_info *modInfo = vulkan_modifierInfo_find(s, info->format, info->modifier);
-
-	if (info->spa_buf->n_datas != modInfo->props.drmFormatModifierPlaneCount)
-		return -1;
 
 	VkMemoryRequirements memoryRequirements = {0};
 	vkGetImageMemoryRequirements(s->device,
@@ -658,17 +572,7 @@ int vulkan_import_dmabuf(struct vulkan_base *s, struct external_buffer_info *inf
 	if (info->spa_buf->n_datas == 0 || info->spa_buf->n_datas > DMABUF_MAX_PLANES)
 		return -1;
 
-	struct vulkan_modifier_info *modProps = vulkan_modifierInfo_find(s, info->format, info->modifier);
-	if (!modProps)
-		return -1;
-
 	uint32_t planeCount = info->spa_buf->n_datas;
-
-	if (planeCount != modProps->props.drmFormatModifierPlaneCount)
-		return -1;
-
-	if (info->size.width > modProps->max_extent.width || info->size.height > modProps->max_extent.height)
-		return -1;
 
 	VkSubresourceLayout planeLayouts[DMABUF_MAX_PLANES] = {0};
 	for (uint32_t i = 0; i < planeCount; i++) {
@@ -817,17 +721,6 @@ int vulkan_import_memptr(struct vulkan_base *s, struct external_buffer_info *inf
 	return 0;
 }
 
-int vulkan_stream_init(struct vulkan_stream *stream, enum spa_direction direction,
-		struct spa_dict *props)
-{
-	spa_zero(*stream);
-	stream->direction = direction;
-	stream->current_buffer_id = SPA_ID_INVALID;
-	stream->busy_buffer_id = SPA_ID_INVALID;
-	stream->ready_buffer_id = SPA_ID_INVALID;
-	return 0;
-}
-
 uint32_t vulkan_vkformat_to_id(VkFormat format)
 {
 	SPA_FOR_EACH_ELEMENT_VAR(vk_video_format_convs, f) {
@@ -865,13 +758,132 @@ int vulkan_wait_idle(struct vulkan_base *s)
 	return 0;
 }
 
+int vulkan_format_infos_init(struct vulkan_base *s, uint32_t formatCount, uint32_t *formats,
+		struct vulkan_format_infos *info)
+{
+	if (info->infos)
+		return 0;
+
+
+	info->infos = calloc(formatCount, sizeof(struct vulkan_format_info));
+	if (!info->infos)
+		return -ENOMEM;
+
+	uint32_t i;
+	for (i = 0; i < formatCount; i++) {
+		VkFormat format = vulkan_id_to_vkformat(formats[i]);
+		if (format == VK_FORMAT_UNDEFINED)
+			continue;
+		struct vulkan_format_info *f_info = &info->infos[info->formatCount++];
+		f_info->spa_format = formats[i];
+		f_info->vk_format = format;
+		spa_log_info(s->log, "Adding format %d (spa_format %d)", format, formats[i]);
+
+		VkDrmFormatModifierPropertiesListEXT modPropsList = {
+			.sType = VK_STRUCTURE_TYPE_DRM_FORMAT_MODIFIER_PROPERTIES_LIST_EXT,
+		};
+		VkFormatProperties2 fmtProps = {
+			.sType = VK_STRUCTURE_TYPE_FORMAT_PROPERTIES_2,
+			.pNext = &modPropsList,
+		};
+		vkGetPhysicalDeviceFormatProperties2(s->physicalDevice, format, &fmtProps);
+
+		if (modPropsList.drmFormatModifierCount == 0) {
+			spa_log_info(s->log, "Format has no modifiers");
+			continue;
+		}
+
+		modPropsList.pDrmFormatModifierProperties = calloc(modPropsList.drmFormatModifierCount,
+				sizeof(modPropsList.pDrmFormatModifierProperties[0]));
+		if (!modPropsList.pDrmFormatModifierProperties) {
+			spa_log_info(s->log, "Failed to allocate DrmFormatModifierProperties");
+			continue;
+		}
+		vkGetPhysicalDeviceFormatProperties2(s->physicalDevice, format, &fmtProps);
+
+		f_info->infos = calloc(modPropsList.drmFormatModifierCount, sizeof(f_info->infos[0]));
+		if (!f_info->infos) {
+			spa_log_info(s->log, "Failed to allocate modifier infos");
+			free(modPropsList.pDrmFormatModifierProperties);
+			continue;
+		}
+
+		spa_log_info(s->log, "Found %d modifiers", modPropsList.drmFormatModifierCount);
+		for (uint32_t j = 0; j < modPropsList.drmFormatModifierCount; j++) {
+			VkDrmFormatModifierPropertiesEXT props = modPropsList.pDrmFormatModifierProperties[j];
+
+			if (!(props.drmFormatModifierTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT))
+				continue;
+
+			if (props.drmFormatModifierPlaneCount > DMABUF_MAX_PLANES)
+				continue;
+
+			VkPhysicalDeviceImageDrmFormatModifierInfoEXT modInfo = {
+				.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_DRM_FORMAT_MODIFIER_INFO_EXT,
+				.drmFormatModifier = props.drmFormatModifier,
+				.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+			};
+			VkPhysicalDeviceExternalImageFormatInfo extImgFmtInfo = {
+				.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_EXTERNAL_IMAGE_FORMAT_INFO,
+				.pNext = &modInfo,
+				.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_DMA_BUF_BIT_EXT,
+			};
+			VkPhysicalDeviceImageFormatInfo2 imgFmtInfo = {
+				.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_IMAGE_FORMAT_INFO_2,
+				.pNext = &extImgFmtInfo,
+				.type = VK_IMAGE_TYPE_2D,
+				.format = format,
+				.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT,
+				.tiling = VK_IMAGE_TILING_DRM_FORMAT_MODIFIER_EXT,
+			};
+
+			VkExternalImageFormatProperties extImgFmtProps = {
+				.sType = VK_STRUCTURE_TYPE_EXTERNAL_IMAGE_FORMAT_PROPERTIES,
+			};
+			VkImageFormatProperties2 imgFmtProps = {
+				.sType = VK_STRUCTURE_TYPE_IMAGE_FORMAT_PROPERTIES_2,
+				.pNext = &extImgFmtProps,
+			};
+
+			VK_CHECK_RESULT_LOOP(vkGetPhysicalDeviceImageFormatProperties2(s->physicalDevice, &imgFmtInfo, &imgFmtProps))
+
+			VkExternalMemoryFeatureFlags extMemFeatures =
+				extImgFmtProps.externalMemoryProperties.externalMemoryFeatures;
+			if (!(extMemFeatures & VK_EXTERNAL_MEMORY_FEATURE_EXPORTABLE_BIT)) {
+				continue;
+			}
+
+			VkExtent3D max_extent = imgFmtProps.imageFormatProperties.maxExtent;
+			f_info->infos[f_info->modifierCount++] = (struct vulkan_modifier_info){
+				.props = props,
+				.max_extent = { .width = max_extent.width, .height = max_extent.height },
+			};
+			spa_log_info(s->log, "Adding modifier %"PRIu64, props.drmFormatModifier);
+
+		}
+		free(modPropsList.pDrmFormatModifierProperties);
+	}
+	for (i = 0; i < info->formatCount; i++) {
+		if (info->infos[i].modifierCount > 0)
+			info->formatsWithModifiersCount++;
+	}
+	return 0;
+}
+
+void vulkan_format_infos_deinit(struct vulkan_format_infos *info)
+{
+	for (uint32_t i = 0; i < info->formatCount; i++) {
+		free(info->infos[i].infos);
+	}
+	free(info->infos);
+}
+
 int vulkan_base_init(struct vulkan_base *s, struct vulkan_base_info *info)
 {
 	if (!s->initialized) {
 		CHECK(createInstance(s));
 		CHECK(findPhysicalDevice(s));
 		CHECK(createDevice(s, info));
-		CHECK(queryFormatInfo(s, info));
 		s->implicit_sync_interop = dmabuf_check_sync_file_import_export(s->log);
 		s->initialized = true;
 	}
@@ -881,7 +893,6 @@ int vulkan_base_init(struct vulkan_base *s, struct vulkan_base_info *info)
 void vulkan_base_deinit(struct vulkan_base *s)
 {
 	if (s->initialized) {
-		destroyFormatInfo(s);
 		vkDestroyDevice(s->device, NULL);
 		vkDestroyInstance(s->instance, NULL);
 		s->initialized = false;

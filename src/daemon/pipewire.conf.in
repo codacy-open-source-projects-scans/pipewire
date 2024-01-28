@@ -70,6 +70,7 @@ context.spa-libs = {
     api.vulkan.*    = vulkan/libspa-vulkan
     api.jack.*      = jack/libspa-jack
     support.*       = support/libspa-support
+    video.convert.* = videoconvert/libspa-videoconvert
     #videotestsrc   = videotestsrc/libspa-videotestsrc
     #audiotestsrc   = audiotestsrc/libspa-audiotestsrc
 }
@@ -243,6 +244,7 @@ context.objects = [
             priority.driver = 19000
             node.group      = pipewire.freewheel
             node.freewheel  = true
+            #freewheel.wait = 10
         }
     }
 

@@ -27,19 +27,11 @@
 
 #include "vulkan-compute-utils.h"
 #include "vulkan-utils.h"
+#include "utils.h"
+#include "pixel-formats.h"
 
 #define VULKAN_INSTANCE_FUNCTION(name)						\
 	PFN_##name name = (PFN_##name)vkGetInstanceProcAddr(s->base.instance, #name)
-
-static int createFence(struct vulkan_compute_state *s) {
-	VkFenceCreateInfo createInfo = {
-		.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO,
-		.flags = 0,
-	};
-	VK_CHECK_RESULT(vkCreateFence(s->base.device, &createInfo, NULL, &s->fence));
-
-	return 0;
-};
 
 static int createDescriptors(struct vulkan_compute_state *s)
 {
@@ -256,13 +248,16 @@ static int runExportSHMBuffers(struct vulkan_compute_state *s) {
 		if (p->direction == SPA_DIRECTION_INPUT)
 			continue;
 
+		struct pixel_format_info pixel_info;
+		CHECK(get_pixel_format_info(p->format, &pixel_info));
+
 		if (p->spa_buffers[p->current_buffer_id]->datas[0].type == SPA_DATA_MemPtr) {
 			struct spa_buffer *spa_buf = p->spa_buffers[p->current_buffer_id];
 			struct vulkan_read_pixels_info readInfo = {
 				.data = spa_buf->datas[0].data,
 				.offset = spa_buf->datas[0].chunk->offset,
 				.stride = spa_buf->datas[0].chunk->stride,
-				.bytes_per_pixel = 16,
+				.bytes_per_pixel = pixel_info.bpp,
 				.size.width = s->constants.width,
 				.size.height = s->constants.height,
 			};
@@ -460,7 +455,7 @@ static void clear_streams(struct vulkan_compute_state *s)
 	}
 }
 
-int spa_vulkan_fixate_modifier(struct vulkan_compute_state *s, struct vulkan_stream *p, struct spa_video_info_dsp *dsp_info,
+int spa_vulkan_compute_fixate_modifier(struct vulkan_compute_state *s, struct vulkan_stream *p, struct spa_video_info_dsp *dsp_info,
 		uint32_t modifierCount, uint64_t *modifiers, uint64_t *modifier)
 {
 	VkFormat format = vulkan_id_to_vkformat(dsp_info->format);
@@ -479,7 +474,7 @@ int spa_vulkan_fixate_modifier(struct vulkan_compute_state *s, struct vulkan_str
 	return vulkan_fixate_modifier(&s->base, &fixation_info, modifier);
 }
 
-int spa_vulkan_use_buffers(struct vulkan_compute_state *s, struct vulkan_stream *p, uint32_t flags,
+int spa_vulkan_compute_use_buffers(struct vulkan_compute_state *s, struct vulkan_stream *p, uint32_t flags,
 		struct spa_video_info_dsp *dsp_info, uint32_t n_buffers, struct spa_buffer **buffers)
 {
 	VkFormat format = vulkan_id_to_vkformat(dsp_info->format);
@@ -488,6 +483,7 @@ int spa_vulkan_use_buffers(struct vulkan_compute_state *s, struct vulkan_stream 
 
 	vulkan_wait_idle(&s->base);
 	clear_buffers(s, p);
+	p->format = SPA_VIDEO_FORMAT_UNKNOWN;
 
 	bool alloc = flags & SPA_NODE_BUFFERS_FLAG_ALLOC;
 	int ret;
@@ -505,6 +501,8 @@ int spa_vulkan_use_buffers(struct vulkan_compute_state *s, struct vulkan_stream 
 						: VK_IMAGE_USAGE_SAMPLED_BIT,
 					.spa_buf = buffers[i],
 				};
+				struct vulkan_modifier_info *modifierInfo = vulkan_modifierInfo_find(&s->formatInfos, format, dsp_info->modifier);
+				CHECK(vulkan_validate_dmabuf_properties(modifierInfo, &dmabufInfo.spa_buf->n_datas, &dmabufInfo.size));
 				ret = vulkan_create_dmabuf(&s->base, &dmabufInfo, &p->buffers[i]);
 			} else {
 				spa_log_error(s->log, "Unsupported buffer type mask %d", buffers[i]->datas[0].type);
@@ -523,6 +521,8 @@ int spa_vulkan_use_buffers(struct vulkan_compute_state *s, struct vulkan_stream 
 						: VK_IMAGE_USAGE_SAMPLED_BIT,
 					.spa_buf = buffers[i],
 				};
+				struct vulkan_modifier_info *modifierInfo = vulkan_modifierInfo_find(&s->formatInfos, format, dsp_info->modifier);
+				CHECK(vulkan_validate_dmabuf_properties(modifierInfo, &dmabufInfo.spa_buf->n_datas, &dmabufInfo.size));
 				ret = vulkan_import_dmabuf(&s->base, &dmabufInfo, &p->buffers[i]);
 				break;
 			case SPA_DATA_MemPtr:;
@@ -549,20 +549,43 @@ int spa_vulkan_use_buffers(struct vulkan_compute_state *s, struct vulkan_stream 
 		p->spa_buffers[i] = buffers[i];
 		p->n_buffers++;
 	}
+	p->format = dsp_info->format;
 
 	return 0;
 }
 
-int spa_vulkan_init_stream(struct vulkan_compute_state *s, struct vulkan_stream *stream,
+int spa_vulkan_compute_enumerate_formats(struct vulkan_compute_state *s, uint32_t index, uint32_t caps,
+		struct spa_pod **param, struct spa_pod_builder *builder)
+{
+	uint32_t fmt_idx;
+	bool has_modifier;
+	if (!find_EnumFormatInfo(&s->formatInfos, index, caps, &fmt_idx, &has_modifier))
+			return 0;
+	*param = build_dsp_EnumFormat(&s->formatInfos.infos[fmt_idx], has_modifier, builder);
+	return 1;
+}
+
+static int vulkan_stream_init(struct vulkan_stream *stream, enum spa_direction direction,
+		struct spa_dict *props)
+{
+	spa_zero(*stream);
+	stream->direction = direction;
+	stream->current_buffer_id = SPA_ID_INVALID;
+	stream->busy_buffer_id = SPA_ID_INVALID;
+	stream->ready_buffer_id = SPA_ID_INVALID;
+	return 0;
+}
+
+int spa_vulkan_compute_init_stream(struct vulkan_compute_state *s, struct vulkan_stream *stream,
 		enum spa_direction direction, struct spa_dict *props)
 {
 	return vulkan_stream_init(stream, direction, props);
 }
 
-int spa_vulkan_prepare(struct vulkan_compute_state *s)
+int spa_vulkan_compute_prepare(struct vulkan_compute_state *s)
 {
 	if (!s->prepared) {
-		CHECK(createFence(s));
+		CHECK(vulkan_fence_create(&s->base, &s->fence));
 		CHECK(createDescriptors(s));
 		CHECK(createComputePipeline(s, s->shaderName));
 		CHECK(createCommandBuffer(s));
@@ -571,7 +594,7 @@ int spa_vulkan_prepare(struct vulkan_compute_state *s)
 	return 0;
 }
 
-int spa_vulkan_unprepare(struct vulkan_compute_state *s)
+int spa_vulkan_compute_unprepare(struct vulkan_compute_state *s)
 {
 	if (s->prepared) {
 		vkDestroyShaderModule(s->base.device, s->computeShaderModule, NULL);
@@ -587,7 +610,7 @@ int spa_vulkan_unprepare(struct vulkan_compute_state *s)
 	return 0;
 }
 
-int spa_vulkan_start(struct vulkan_compute_state *s)
+int spa_vulkan_compute_start(struct vulkan_compute_state *s)
 {
 	uint32_t i;
 
@@ -600,7 +623,7 @@ int spa_vulkan_start(struct vulkan_compute_state *s)
 	return 0;
 }
 
-int spa_vulkan_stop(struct vulkan_compute_state *s)
+int spa_vulkan_compute_stop(struct vulkan_compute_state *s)
 {
         VK_CHECK_RESULT(vkDeviceWaitIdle(s->base.device));
 	clear_streams(s);
@@ -608,7 +631,7 @@ int spa_vulkan_stop(struct vulkan_compute_state *s)
 	return 0;
 }
 
-int spa_vulkan_ready(struct vulkan_compute_state *s)
+int spa_vulkan_compute_ready(struct vulkan_compute_state *s)
 {
 	uint32_t i;
 	VkResult result;
@@ -631,7 +654,7 @@ int spa_vulkan_ready(struct vulkan_compute_state *s)
 	return 0;
 }
 
-int spa_vulkan_process(struct vulkan_compute_state *s)
+int spa_vulkan_compute_process(struct vulkan_compute_state *s)
 {
 	CHECK(updateDescriptors(s));
 	CHECK(runCommandBuffer(s));
@@ -641,7 +664,7 @@ int spa_vulkan_process(struct vulkan_compute_state *s)
 	return 0;
 }
 
-int spa_vulkan_get_buffer_caps(struct vulkan_compute_state *s, enum spa_direction direction)
+int spa_vulkan_compute_get_buffer_caps(struct vulkan_compute_state *s, enum spa_direction direction)
 {
 	switch (direction) {
 	case SPA_DIRECTION_INPUT:
@@ -652,24 +675,29 @@ int spa_vulkan_get_buffer_caps(struct vulkan_compute_state *s, enum spa_directio
 	return 0;
 }
 
-struct vulkan_modifier_info *spa_vulkan_get_modifier_info(struct vulkan_compute_state *s, struct spa_video_info_dsp *info) {
+struct vulkan_modifier_info *spa_vulkan_compute_get_modifier_info(struct vulkan_compute_state *s, struct spa_video_info_dsp *info) {
 	VkFormat vk_format = vulkan_id_to_vkformat(info->format);
-	return vulkan_modifierInfo_find(&s->base, vk_format, info->modifier);
+	return vulkan_modifierInfo_find(&s->formatInfos, vk_format, info->modifier);
 }
 
-int spa_vulkan_init(struct vulkan_compute_state *s)
+int spa_vulkan_compute_init(struct vulkan_compute_state *s)
 {
+	int ret;
 	s->base.log = s->log;
-	uint32_t dsp_format = SPA_VIDEO_FORMAT_DSP_F32;
+	uint32_t dsp_formats[] = {
+		SPA_VIDEO_FORMAT_DSP_F32
+	};
 	struct vulkan_base_info baseInfo = {
 		.queueFlags = VK_QUEUE_COMPUTE_BIT,
-		.formatInfo.formatCount = 1,
-		.formatInfo.formats = &dsp_format,
 	};
-	return vulkan_base_init(&s->base, &baseInfo);
+	if ((ret = vulkan_base_init(&s->base, &baseInfo)) < 0)
+			return ret;
+	return vulkan_format_infos_init(&s->base, SPA_N_ELEMENTS(dsp_formats), dsp_formats, &s->formatInfos);
+
 }
 
-void spa_vulkan_deinit(struct vulkan_compute_state *s)
+void spa_vulkan_compute_deinit(struct vulkan_compute_state *s)
 {
+	vulkan_format_infos_deinit(&s->formatInfos);
 	vulkan_base_deinit(&s->base);
 }
