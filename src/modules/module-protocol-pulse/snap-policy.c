@@ -65,7 +65,13 @@ pw_sandbox_access_t pw_snap_get_audio_permissions(struct client *client, int fd,
 			// if apparmor isn't enabled, we can safely assume that there are no SNAPs in the system
 			return PW_SANDBOX_ACCESS_NOT_A_SANDBOX;
 		}
-		pw_log_warn("snap_get_audio_permissions: failed to get the AppArmor info.");
+		if  (errno == ENOPROTOOPT) {
+			// if fine grained unix mediation isn't available, we can't know if this is a snap or
+			// not, so we have no choice but give full access
+			pw_log_warn("snap_get_audio_permissions: kernel lacks 'fine grained unix mediation'; snap audio permissions won't be honored.");
+			return PW_SANDBOX_ACCESS_NOT_A_SANDBOX;
+		}
+ 		pw_log_warn("snap_get_audio_permissions: failed to get the AppArmor info: %s.", strerror(errno));
 		return PW_SANDBOX_ACCESS_NONE;
 	}
 	if (!g_str_has_prefix(aa_label, SNAP_LABEL_PREFIX)) {
@@ -77,6 +83,7 @@ pw_sandbox_access_t pw_snap_get_audio_permissions(struct client *client, int fd,
 	snap_id = g_strdup(aa_label + strlen(SNAP_LABEL_PREFIX));
 	separator = strchr(snap_id, '.');
 	if (separator == NULL) {
+		g_free(snap_id);
 		pw_log_info("snap_get_audio_permissions: aa_label has only one dot; not a valid ID.");
 		return PW_SANDBOX_ACCESS_NONE;
 	}
@@ -179,8 +186,9 @@ pw_sandbox_access_t pw_snap_get_audio_permissions(struct client *client, int fd,
 		for (guint q = 0; q < slots->len; q++, slot++) {
 			const gchar *slot_name = snapd_slot_ref_get_slot(*slot);
 			const gchar *snap_name = snapd_slot_ref_get_snap(*slot);
-			if (g_str_equal(snap_name, "snapd") &&
-			    g_str_equal(slot_name, plug_name))
+			if ((g_str_equal(snap_name, "snapd") ||
+			     g_str_equal(snap_name, "core")) &&
+			     g_str_equal(slot_name, plug_name))
 				permissions |= add_permission;
 		}
 	}

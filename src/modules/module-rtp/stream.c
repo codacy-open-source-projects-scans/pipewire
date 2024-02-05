@@ -85,7 +85,11 @@ struct impl {
 	unsigned receiving:1;
 	unsigned first:1;
 
+	struct pw_loop *data_loop;
+	struct spa_source *timer;
+
 	int (*receive_rtp)(struct impl *impl, uint8_t *buffer, ssize_t len);
+	void (*flush_timeout)(struct impl *impl, uint64_t expirations);
 };
 
 #include "module-rtp/audio.c"
@@ -271,6 +275,12 @@ static float samples_to_msec(struct impl *impl, uint32_t samples)
 	return samples * 1000.0f / impl->rate;
 }
 
+static void on_flush_timeout(void *d, uint64_t expirations)
+{
+	struct impl *impl = d;
+	impl->flush_timeout(d, expirations);
+}
+
 struct rtp_stream *rtp_stream_new(struct pw_core *core,
 		enum pw_direction direction, struct pw_properties *props,
 		const struct rtp_stream_events *events, void *data)
@@ -286,16 +296,26 @@ struct rtp_stream *rtp_stream_new(struct pw_core *core,
 	enum pw_stream_flags flags;
 	float latency_msec;
 	int res;
+	struct pw_data_loop *data_loop;
+	struct pw_context *context;
 
 	impl = calloc(1, sizeof(*impl));
 	if (impl == NULL) {
 		res = -errno;
 		goto out;
-		return NULL;
 	}
 	impl->first = true;
 	spa_hook_list_init(&impl->listener_list);
 	impl->stream_events = stream_events;
+	context = pw_core_get_context(core);
+	data_loop = pw_context_get_data_loop(context);
+	impl->data_loop = pw_data_loop_get_loop(data_loop);
+	impl->timer = pw_loop_add_timer(impl->data_loop, on_flush_timeout, impl);
+	if (impl->timer == NULL) {
+		res = -errno;
+		pw_log_error("can't create timer");
+		goto out;
+	}
 
 	if ((str = pw_properties_get(props, "sess.media")) == NULL)
 		str = "audio";
@@ -450,6 +470,9 @@ struct rtp_stream *rtp_stream_new(struct pw_core *core,
 			pw_properties_setf(props, "rtp.framecount", "%u", impl->psamples);
 		}
 	}
+
+	ptime = samples_to_msec(impl, impl->psamples);
+
 	/* For senders, the default latency is ptime and for a receiver it is
 	 * DEFAULT_SESS_LATENCY. Setting the sess.latency.msec for a sender to
 	 * something smaller/bigger will influence the quantum and the amount
@@ -457,11 +480,22 @@ struct rtp_stream *rtp_stream_new(struct pw_core *core,
 	str = pw_properties_get(props, "sess.latency.msec");
 	if (!spa_atof(str, &latency_msec)) {
 		latency_msec = direction == PW_DIRECTION_INPUT ?
-			samples_to_msec(impl, impl->psamples) :
+			ptime :
 			DEFAULT_SESS_LATENCY;
 	}
 	impl->target_buffer = msec_to_samples(impl, latency_msec);
 	impl->max_error = msec_to_samples(impl, ERROR_MSEC);
+
+	if (impl->target_buffer < ptime) {
+		pw_log_warn("sess.latency.msec cannot be lower than rtp.ptime");
+		impl->target_buffer = impl->psamples;
+	}
+
+	/* We're not expecting odd ptimes, so this modulo should be 0 */
+	if (fmodf(impl->target_buffer, ptime != 0)) {
+		pw_log_warn("sess.latency.msec should be an integer multiple of rtp.ptime");
+		impl->target_buffer = (impl->target_buffer / ptime) * impl->psamples;
+	}
 
 	pw_properties_setf(props, PW_KEY_NODE_RATE, "1/%d", impl->rate);
 	if (direction == PW_DIRECTION_INPUT) {
@@ -560,6 +594,9 @@ void rtp_stream_destroy(struct rtp_stream *s)
 
 	if (impl->stream)
 		pw_stream_destroy(impl->stream);
+
+	if (impl->timer)
+		pw_loop_destroy_source(impl->data_loop, impl->timer);
 
 	spa_hook_list_clean(&impl->listener_list);
 	free(impl);

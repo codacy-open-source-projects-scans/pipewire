@@ -103,6 +103,12 @@ static struct {
 	uint32_t id;
 } vk_video_format_convs[] = {
 	{ VK_FORMAT_R32G32B32A32_SFLOAT, SPA_VIDEO_FORMAT_RGBA_F32 },
+	{ VK_FORMAT_B8G8R8A8_SRGB, SPA_VIDEO_FORMAT_BGRA },
+	{ VK_FORMAT_R8G8B8A8_SRGB, SPA_VIDEO_FORMAT_RGBA },
+	{ VK_FORMAT_B8G8R8A8_SRGB, SPA_VIDEO_FORMAT_BGRx },
+	{ VK_FORMAT_R8G8B8A8_SRGB, SPA_VIDEO_FORMAT_RGBx },
+	{ VK_FORMAT_B8G8R8_SRGB, SPA_VIDEO_FORMAT_BGR },
+	{ VK_FORMAT_R8G8B8_SRGB, SPA_VIDEO_FORMAT_RGB },
 };
 
 static int createInstance(struct vulkan_base *s)
@@ -229,6 +235,38 @@ static int createDevice(struct vulkan_base *s, struct vulkan_base_info *info)
 	VK_CHECK_RESULT(vkCreateDevice(s->physicalDevice, &deviceCreateInfo, NULL, &s->device));
 
 	vkGetDeviceQueue(s->device, s->queueFamilyIndex, 0, &s->queue);
+
+	return 0;
+}
+
+int vulkan_write_pixels(struct vulkan_base *s, struct vulkan_write_pixels_info *info, struct vulkan_staging_buffer *vk_sbuf)
+{
+	void *vmap;
+	VK_CHECK_RESULT(vkMapMemory(s->device, vk_sbuf->memory, 0, VK_WHOLE_SIZE, 0, &vmap));
+
+	char *map = (char *)vmap;
+
+	// upload data
+	const char *pdata = info->data;
+	memcpy(map, pdata, info->stride * info->size.height);
+
+	info->copies[0] = (VkBufferImageCopy) {
+		.imageExtent.width = info->size.width,
+		.imageExtent.height = info->size.height,
+		.imageExtent.depth = 1,
+		.imageOffset.x = 0,
+		.imageOffset.y = 0,
+		.imageOffset.z = 0,
+		.bufferOffset = 0,
+		.bufferRowLength = info->size.width,
+		.bufferImageHeight = info->size.height,
+		.imageSubresource.mipLevel = 0,
+		.imageSubresource.baseArrayLayer = 0,
+		.imageSubresource.layerCount = 1,
+		.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+	};
+
+	vkUnmapMemory(s->device, vk_sbuf->memory);
 
 	return 0;
 }
@@ -410,6 +448,40 @@ static VkImageAspectFlagBits mem_plane_aspect(uint32_t i)
 	case 3: return VK_IMAGE_ASPECT_MEMORY_PLANE_3_BIT_EXT;
 	default: abort(); // unreachable
 	}
+}
+
+int vulkan_staging_buffer_create(struct vulkan_base *s, uint32_t size, struct vulkan_staging_buffer *s_buf) {
+	VkBufferCreateInfo buf_info = {
+		.sType = VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO,
+		.size = size,
+		.usage = VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+			VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
+		.sharingMode = VK_SHARING_MODE_EXCLUSIVE,
+	};
+	VK_CHECK_RESULT(vkCreateBuffer(s->device, &buf_info, NULL, &s_buf->buffer));
+
+	VkMemoryRequirements memoryRequirements;
+	vkGetBufferMemoryRequirements(s->device, s_buf->buffer, &memoryRequirements);
+
+	VkMemoryAllocateInfo mem_info = {
+		.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO,
+		.allocationSize = memoryRequirements.size,
+		.memoryTypeIndex = vulkan_memoryType_find(s,
+					  memoryRequirements.memoryTypeBits,
+					  VK_MEMORY_PROPERTY_HOST_COHERENT_BIT |
+					  VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT),
+	};
+	VK_CHECK_RESULT(vkAllocateMemory(s->device, &mem_info, NULL, &s_buf->memory));
+	VK_CHECK_RESULT(vkBindBufferMemory(s->device, s_buf->buffer, s_buf->memory, 0));
+
+	return 0;
+}
+
+void vulkan_staging_buffer_destroy(struct vulkan_base *s, struct vulkan_staging_buffer *s_buf) {
+	if (s_buf->buffer == VK_NULL_HANDLE)
+		return;
+	vkFreeMemory(s->device, s_buf->memory, NULL);
+	vkDestroyBuffer(s->device, s_buf->buffer, NULL);
 }
 
 static int allocate_dmabuf(struct vulkan_base *s, VkFormat format, uint32_t modifierCount, uint64_t *modifiers, VkImageUsageFlags usage, struct spa_rectangle *size, struct vulkan_buffer *vk_buf)

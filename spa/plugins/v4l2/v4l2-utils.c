@@ -867,6 +867,48 @@ do_enum_fmt:
 	return res;
 }
 
+static int probe_expbuf(struct impl *this)
+{
+	struct port *port = &this->out_ports[0];
+	struct spa_v4l2_device *dev = &port->dev;
+	struct v4l2_requestbuffers reqbuf;
+	struct v4l2_exportbuffer expbuf;
+
+	if (port->probed_expbuf)
+		return 0;
+	port->probed_expbuf = true;
+
+	spa_zero(reqbuf);
+	reqbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	reqbuf.memory = V4L2_MEMORY_MMAP;
+	reqbuf.count = 2;
+
+	if (xioctl(dev->fd, VIDIOC_REQBUFS, &reqbuf) < 0) {
+		spa_log_error(this->log, "'%s' VIDIOC_REQBUFS: %m", this->props.device);
+		return -errno;
+	}
+
+	spa_zero(expbuf);
+	expbuf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
+	expbuf.index = 0;
+	expbuf.flags = O_CLOEXEC | O_RDONLY;
+	if (xioctl(dev->fd, VIDIOC_EXPBUF, &expbuf) < 0) {
+		spa_log_info(this->log, "'%s' EXPBUF not supported: %m", this->props.device);
+		port->have_expbuf = false;
+		port->alloc_buffers = false;
+	} else {
+		port->have_expbuf = true;
+		port->alloc_buffers = true;
+	}
+
+	reqbuf.count = 0;
+	if (xioctl(dev->fd, VIDIOC_REQBUFS, &reqbuf) < 0) {
+		spa_log_error(this->log, "'%s' VIDIOC_REQBUFS: %m", this->props.device);
+		return -errno;
+	}
+	return 0;
+}
+
 static int spa_v4l2_set_format(struct impl *this, struct spa_video_info *format, uint32_t flags)
 {
 	struct port *port = &this->out_ports[0];
@@ -972,6 +1014,8 @@ static int spa_v4l2_set_format(struct impl *this, struct spa_video_info *format,
 	size->height = fmt.fmt.pix.height;
 	port->rate.denom = framerate->num = streamparm.parm.capture.timeperframe.denominator;
 	port->rate.num = framerate->denom = streamparm.parm.capture.timeperframe.numerator;
+
+	probe_expbuf(this);
 
 	port->fmt = fmt;
 	port->info.change_mask |= SPA_PORT_CHANGE_MASK_FLAGS | SPA_PORT_CHANGE_MASK_RATE;
@@ -1584,6 +1628,7 @@ mmap_init(struct impl *this,
 
 		spa_log_debug(this->log, "data types %08x", d[0].type);
 
+again:
 		if (port->have_expbuf &&
 		    d[0].type != SPA_ID_INVALID &&
 		    (d[0].type & ((1u << SPA_DATA_DmaBuf)|(1u<<SPA_DATA_MemFd)))) {
@@ -1598,7 +1643,7 @@ mmap_init(struct impl *this,
 					spa_log_debug(this->log, "'%s' VIDIOC_EXPBUF not supported: %m",
 							this->props.device);
 					port->have_expbuf = false;
-					goto fallback;
+					goto again;
 				}
 				spa_log_error(this->log, "'%s' VIDIOC_EXPBUF: %m", this->props.device);
 				return -errno;
@@ -1614,7 +1659,6 @@ mmap_init(struct impl *this,
 			spa_log_debug(this->log, "EXPBUF fd:%d", expbuf.fd);
 			use_expbuf = true;
 		} else if (d[0].type & (1u << SPA_DATA_MemPtr)) {
-fallback:
 			d[0].type = SPA_DATA_MemPtr;
 			d[0].flags = SPA_DATA_FLAG_READABLE;
 			d[0].fd = -1;
@@ -1634,6 +1678,7 @@ fallback:
 			use_expbuf = false;
 		} else {
 			spa_log_error(this->log, "unsupported data type:%08x", d[0].type);
+			port->alloc_buffers = false;
 			return -ENOTSUP;
 		}
 		spa_v4l2_buffer_recycle(this, i);

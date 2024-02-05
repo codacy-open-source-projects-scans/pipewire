@@ -29,6 +29,15 @@ struct object {
 	uint32_t extra[2];
 };
 
+struct target_link {
+	struct spa_list link;
+	struct data *data;
+	struct pw_proxy *proxy;
+	struct spa_hook listener, link_listener;
+	enum pw_link_state state;
+	int result;
+};
+
 struct data {
 	struct pw_main_loop *loop;
 
@@ -43,6 +52,7 @@ struct data {
 	uint32_t opt_mode;
 	bool opt_id;
 	bool opt_verbose;
+	bool opt_wait;
 	const char *opt_output;
 	const char *opt_input;
 	struct pw_properties *props;
@@ -56,9 +66,11 @@ struct data {
 	struct spa_hook registry_listener;
 
 	struct spa_list objects;
+	struct spa_list target_links;
 
 	int sync;
-	int link_res;
+	int nb_links;
+	bool new_object;
 	bool monitoring;
 	bool list_inputs;
 	bool list_outputs;
@@ -68,48 +80,83 @@ struct data {
 	regex_t in_port_regex, *in_regex;
 };
 
+static void link_event(struct target_link *tl, enum pw_link_state state, int result)
+{
+	/* Ignore non definitive states (negociating, allocating, etc). */
+	if (state != PW_LINK_STATE_ERROR &&
+	    state != PW_LINK_STATE_PAUSED &&
+	    state != PW_LINK_STATE_ACTIVE)
+		return;
+
+	/* Keep the first definitive state. For example, once a link is marked
+	 * as paused, we start ignoring all errors. */
+	if (tl->state == PW_LINK_STATE_INIT) {
+		tl->state = state;
+		tl->result = result;
+	}
+
+	/* End if all links have a definitive state. */
+	struct target_link *m;
+	spa_list_for_each(m, &tl->data->target_links, link) {
+		if (m->state == PW_LINK_STATE_INIT)
+			return;
+	}
+	pw_main_loop_quit(tl->data->loop);
+}
+
+static void link_proxy_destroy(void *data)
+{
+	struct target_link *tl = data;
+
+	spa_hook_remove(&tl->listener);
+	spa_hook_remove(&tl->link_listener);
+	tl->proxy = NULL;
+
+	link_event(tl, PW_LINK_STATE_ERROR, -EINVAL);
+}
+
+static void link_proxy_removed(void *data)
+{
+	struct target_link *tl = data;
+	pw_proxy_destroy(tl->proxy);
+}
+
 static void link_proxy_error(void *data, int seq, int res, const char *message)
 {
-	struct data *d = data;
-	d->link_res = res;
+	struct target_link *tl = data;
+	link_event(tl, PW_LINK_STATE_ERROR, res);
 }
 
 static const struct pw_proxy_events link_proxy_events = {
 	PW_VERSION_PROXY_EVENTS,
+	.destroy = link_proxy_destroy,
+	.removed = link_proxy_removed,
 	.error = link_proxy_error,
+};
+
+static void link_event_info(void *data, const struct pw_link_info *info)
+{
+	struct target_link *tl = data;
+	int result = 0;
+
+	/*
+	 * Invent an error code to always have one if state == error. That does
+	 * not occur currently; on link error a proxy error is raised first.
+	 */
+	if (tl->state == PW_LINK_STATE_ERROR)
+		result = -EINVAL;
+
+	link_event(tl, info->state, result);
+}
+
+static const struct pw_link_events link_events = {
+	PW_VERSION_LINK_EVENTS,
+	.info = link_event_info,
 };
 
 static void core_sync(struct data *data)
 {
 	data->sync = pw_core_sync(data->core, PW_ID_CORE, data->sync);
-}
-
-static int create_link(struct data *data)
-{
-	struct pw_proxy *proxy;
-	struct spa_hook listener;
-
-	data->link_res = 0;
-
-	proxy = pw_core_create_object(data->core,
-			"link-factory",
-			PW_TYPE_INTERFACE_Link,
-			PW_VERSION_LINK,
-			&data->props->dict, 0);
-	if (proxy == NULL)
-		return -errno;
-
-	spa_zero(listener);
-	pw_proxy_add_listener(proxy, &listener, &link_proxy_events, data);
-
-	core_sync(data);
-	pw_main_loop_run(data->loop);
-
-        spa_hook_remove(&listener);
-
-        pw_proxy_destroy(proxy);
-
-	return data->link_res;
 }
 
 static struct object *find_object(struct data *data, uint32_t type, uint32_t id)
@@ -338,7 +385,37 @@ static void do_list(struct data *data)
 	}
 }
 
-static int do_link_ports(struct data *data)
+static int create_link_target(struct data *data)
+{
+	struct target_link *tl = calloc(1, sizeof(*tl));
+	if (!tl)
+		return -ENOMEM;
+
+	tl->proxy = pw_core_create_object(data->core,
+			"link-factory", PW_TYPE_INTERFACE_Link,
+			PW_VERSION_LINK, &data->props->dict, 0);
+	if (tl->proxy == NULL)
+		return -errno;
+
+	tl->data = data;
+	tl->state = PW_LINK_STATE_INIT;
+	pw_proxy_add_listener(tl->proxy, &tl->listener, &link_proxy_events, tl);
+	pw_proxy_add_object_listener(tl->proxy, &tl->link_listener, &link_events, tl);
+	spa_list_append(&data->target_links, &tl->link);
+	return 0;
+}
+
+/*
+ * create_link_proxies() looks at the current objects and tries to find the
+ * matching output and input nodes (multiple links) or the matching output and
+ * input ports.
+ *
+ * If successful, it fills data->target_links with proxies for all links and
+ * returns the number of links. This can be zero (two nodes with no ports). It
+ * might return (negative) errors. -ENOENT means no matching nodes or ports
+ * were found.
+ */
+static int create_link_proxies(struct data *data)
 {
 	uint32_t in_port = 0, out_port = 0;
 	struct object *n, *p;
@@ -372,9 +449,8 @@ static int do_link_ports(struct data *data)
 	}
 
 	if (in_node && out_node) {
-		int i, ret;
+		int i;
 		char port_id[32];
-		bool all_links_exist = true;
 
 		for (i=0;; i++) {
 			snprintf(port_id, sizeof(port_id), "%d", i);
@@ -382,27 +458,17 @@ static int do_link_ports(struct data *data)
 			struct object *port_out = find_node_port(data, out_node, PW_DIRECTION_OUTPUT, port_id);
 			struct object *port_in = find_node_port(data, in_node, PW_DIRECTION_INPUT, port_id);
 
-			if (!port_out && !port_in) {
-				fprintf(stderr, "Input & output port do not exist\n");
-				goto no_port;
-			} else if (!port_in) {
-				fprintf(stderr, "Input port does not exist\n");
-				goto no_port;
-			} else if (!port_out) {
-				fprintf(stderr, "Output port does not exist\n");
-				goto no_port;
-			}
+			if (!port_out || !port_in)
+				return i;
 
 			pw_properties_setf(data->props, PW_KEY_LINK_OUTPUT_PORT, "%u", port_out->id);
 			pw_properties_setf(data->props, PW_KEY_LINK_INPUT_PORT, "%u", port_in->id);
 
-			if ((ret = create_link(data)) < 0 && ret != -EEXIST)
+			int ret = create_link_target(data);
+			if (ret)
 				return ret;
-
-			if (ret >= 0)
-				all_links_exist = false;
 		}
-		return (all_links_exist ? -EEXIST : 0);
+		return i;
 	}
 
 	if (in_port == 0 || out_port == 0)
@@ -411,10 +477,12 @@ static int do_link_ports(struct data *data)
 	pw_properties_setf(data->props, PW_KEY_LINK_OUTPUT_PORT, "%u", out_port);
 	pw_properties_setf(data->props, PW_KEY_LINK_INPUT_PORT, "%u", in_port);
 
-	return create_link(data);
-
-no_port:
-	return -ENOENT;
+	/*
+	 * create_link_target() returns zero on success. We return the number of
+	 * links on success, meaning 1.
+	 */
+	int ret = create_link_target(data);
+	return !ret ? 1 : ret;
 }
 
 static int do_unlink_ports(struct data *data)
@@ -564,6 +632,11 @@ static void registry_event_global(void *data, uint32_t id, uint32_t permissions,
 	if (spa_streq(type, PW_TYPE_INTERFACE_Node)) {
 		t = OBJECT_NODE;
 	} else if (spa_streq(type, PW_TYPE_INTERFACE_Port)) {
+		if (!d->new_object && d->opt_wait && spa_list_is_empty(&d->target_links)) {
+			d->new_object = true;
+			core_sync(d);
+		}
+
 		t = OBJECT_PORT;
 		if ((str = spa_dict_lookup(props, PW_KEY_PORT_DIRECTION)) == NULL)
 			return;
@@ -641,8 +714,22 @@ static const struct pw_registry_events registry_events = {
 static void on_core_done(void *data, uint32_t id, int seq)
 {
 	struct data *d = data;
-	if (d->sync == seq)
-		pw_main_loop_quit(d->loop);
+
+	if (d->sync != seq)
+		return;
+
+	/* Connect mode, look for our targets. */
+	if ((d->opt_mode & (MODE_LIST|MODE_DISCONNECT)) == 0) {
+		d->nb_links = create_link_proxies(d);
+		/* In wait mode, if none exist, keep running. */
+		if (d->opt_wait && d->nb_links == -ENOENT) {
+			d->new_object = false;
+			return;
+		}
+	}
+
+	pw_main_loop_quit(d->loop);
+
 }
 
 static void on_core_error(void *data, uint32_t id, int seq, int res, const char *message)
@@ -686,6 +773,7 @@ static void show_help(struct data *data, const char *name, bool error)
 		"  -L, --linger                          Linger (default, unless -m is used)\n"
 		"  -P, --passive                         Passive link\n"
 		"  -p, --props=PROPS                     Properties as JSON object\n"
+		"  -w, --wait                            Wait until link creation attempt\n"
 		"Disconnect: %1$s -d [options] output input\n"
 		"            %1$s -d [options] link-id\n"
 		"  -d, --disconnect                      Disconnect ports\n",
@@ -711,6 +799,7 @@ int main(int argc, char *argv[])
 		{ "linger",	no_argument,		NULL, 'L' },
 		{ "passive",	no_argument,		NULL, 'P' },
 		{ "props",	required_argument,	NULL, 'p' },
+		{ "wait",	no_argument,		NULL, 'w' },
 		{ "disconnect",	no_argument,		NULL, 'd' },
 		{ NULL,	0, NULL, 0}
 	};
@@ -718,6 +807,7 @@ int main(int argc, char *argv[])
 	setlocale(LC_ALL, "");
 	pw_init(&argc, &argv);
 	spa_list_init(&data.objects);
+	spa_list_init(&data.target_links);
 
 	setlinebuf(stdout);
 
@@ -727,7 +817,7 @@ int main(int argc, char *argv[])
 		return -1;
 	}
 
-	while ((c = getopt_long(argc, argv, "hVr:oilmIvLPp:d", long_options, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "hVr:oilmIvLPp:wd", long_options, NULL)) != -1) {
 		switch (c) {
 		case 'h':
 			show_help(&data, argv[0], NULL);
@@ -773,6 +863,9 @@ int main(int argc, char *argv[])
 		case 'd':
 			data.opt_mode |= MODE_DISCONNECT;
 			break;
+		case 'w':
+			data.opt_wait = true;
+			break;
 		default:
 			show_help(&data, argv[0], true);
 			return -1;
@@ -793,6 +886,12 @@ int main(int argc, char *argv[])
 		data.opt_output = argv[optind++];
 	if (optind < argc)
 		data.opt_input = argv[optind++];
+
+	if ((data.opt_mode & (MODE_LIST|MODE_DISCONNECT)) == 0 &&
+	    (data.opt_output == NULL || data.opt_input == NULL)) {
+		fprintf(stderr, "missing output and input port names to connect\n");
+		return -1;
+	}
 
 	data.loop = pw_main_loop_new(NULL);
 	if (data.loop == NULL) {
@@ -861,14 +960,22 @@ int main(int argc, char *argv[])
 			return -1;
 		}
 	} else {
-		if (data.opt_output == NULL ||
-		    data.opt_input == NULL) {
-			fprintf(stderr, "missing output and input port names to connect\n");
+		if (data.nb_links < 0) {
+			fprintf(stderr, "failed to link ports: %s\n", spa_strerror(data.nb_links));
 			return -1;
 		}
-		if ((res = do_link_ports(&data)) < 0) {
-			fprintf(stderr, "failed to link ports: %s\n", spa_strerror(res));
-			return -1;
+
+		if (data.nb_links > 0) {
+			pw_main_loop_run(data.loop);
+
+			struct target_link *tl;
+			spa_list_for_each(tl, &data.target_links, link) {
+				if (tl->state == PW_LINK_STATE_ERROR) {
+					fprintf(stderr, "failed to link ports: %s\n",
+						spa_strerror(tl->result));
+					return -1;
+				}
+			}
 		}
 	}
 
@@ -876,6 +983,12 @@ int main(int argc, char *argv[])
 		data.monitoring = true;
 		pw_main_loop_run(data.loop);
 		data.monitoring = false;
+	}
+
+	struct target_link *tl;
+	spa_list_for_each(tl, &data.target_links, link) {
+		spa_hook_remove(&tl->listener);
+		pw_proxy_destroy(tl->proxy);
 	}
 
 	if (data.out_regex)
