@@ -30,6 +30,7 @@
 
 #ifdef __FreeBSD__
 #define ifr_ifindex ifr_index
+#define SO_PASSCRED LOCAL_CREDS_PERSISTENT
 #endif
 
 /** \page page_module_rtp_sap SAP Announce and create RTP streams
@@ -148,6 +149,7 @@ PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
 #define DEFAULT_SAP_PORT	9875
 
 #define DEFAULT_SOURCE_IP	"0.0.0.0"
+#define DEFAULT_SOURCE_IP6	"::"
 #define DEFAULT_TTL		1
 #define DEFAULT_LOOP		false
 
@@ -412,6 +414,21 @@ static int make_unix_socket(const char *path) {
 	return spa_steal_fd(fd);
 }
 
+static int get_ip(const struct sockaddr_storage *sa, char *ip, size_t len, bool *ip4)
+{
+	if (sa->ss_family == AF_INET) {
+		struct sockaddr_in *in = (struct sockaddr_in*)sa;
+		inet_ntop(sa->ss_family, &in->sin_addr, ip, len);
+	} else if (sa->ss_family == AF_INET6) {
+		struct sockaddr_in6 *in = (struct sockaddr_in6*)sa;
+		inet_ntop(sa->ss_family, &in->sin6_addr, ip, len);
+	} else
+		return -EIO;
+	if (ip4)
+		*ip4 = sa->ss_family == AF_INET;
+	return 0;
+}
+
 static int make_send_socket(
 		struct sockaddr_storage *src, socklen_t src_len,
 		struct sockaddr_storage *sa, socklen_t salen,
@@ -419,7 +436,7 @@ static int make_send_socket(
 {
 	int af, fd, val, res;
 
-	af = sa->ss_family;
+	af = src->ss_family;
 	if ((fd = socket(af, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0)) < 0) {
 		pw_log_error("socket failed: %m");
 		return -errno;
@@ -435,13 +452,23 @@ static int make_send_socket(
 		goto error;
 	}
 	if (is_multicast((struct sockaddr*)sa, salen)) {
-		val = loop;
-		if (setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &val, sizeof(val)) < 0)
-			pw_log_warn("setsockopt(IP_MULTICAST_LOOP) failed: %m");
+		if (sa->ss_family == AF_INET) {
+			val = loop;
+			if (setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &val, sizeof(val)) < 0)
+				pw_log_warn("setsockopt(IP_MULTICAST_LOOP) failed: %m");
 
-		val = ttl;
-		if (setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &val, sizeof(val)) < 0)
-			pw_log_warn("setsockopt(IP_MULTICAST_TTL) failed: %m");
+			val = ttl;
+			if (setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &val, sizeof(val)) < 0)
+				pw_log_warn("setsockopt(IP_MULTICAST_TTL) failed: %m");
+		} else {
+			val = loop;
+			if (setsockopt(fd, IPPROTO_IPV6, IPV6_MULTICAST_LOOP, &val, sizeof(val)) < 0)
+				pw_log_warn("setsockopt(IPV6_MULTICAST_LOOP) failed: %m");
+
+			val = ttl;
+			if (setsockopt(fd, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, &val, sizeof(val)) < 0)
+				pw_log_warn("setsockopt(IPV6_MULTICAST_HOPS) failed: %m");
+		}
 	}
 	return fd;
 error:
@@ -454,6 +481,7 @@ static int make_recv_socket(struct sockaddr_storage *sa, socklen_t salen,
 {
 	int af, fd, val, res;
 	struct ifreq req;
+	char addr[128];
 
 	af = sa->ss_family;
 	if ((fd = socket(af, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, 0)) < 0) {
@@ -482,6 +510,8 @@ static int make_recv_socket(struct sockaddr_storage *sa, socklen_t salen,
 			memset(&mr4, 0, sizeof(mr4));
 			mr4.imr_multiaddr = sa4->sin_addr;
 			mr4.imr_ifindex = req.ifr_ifindex;
+			get_ip(sa, addr, sizeof(addr), NULL);
+			pw_log_info("join IPv4 group: %s iface:%d", addr, req.ifr_ifindex);
 			res = setsockopt(fd, IPPROTO_IP, IP_ADD_MEMBERSHIP, &mr4, sizeof(mr4));
 		} else {
 			sa4->sin_addr.s_addr = INADDR_ANY;
@@ -493,6 +523,8 @@ static int make_recv_socket(struct sockaddr_storage *sa, socklen_t salen,
 			memset(&mr6, 0, sizeof(mr6));
 			mr6.ipv6mr_multiaddr = sa6->sin6_addr;
 			mr6.ipv6mr_interface = req.ifr_ifindex;
+			get_ip(sa, addr, sizeof(addr), NULL);
+			pw_log_info("join IPv6 group: %s iface:%d", addr, req.ifr_ifindex);
 			res = setsockopt(fd, IPPROTO_IPV6, IPV6_JOIN_GROUP, &mr6, sizeof(mr6));
 		} else {
 		        sa6->sin6_addr = in6addr_any;
@@ -517,22 +549,6 @@ static int make_recv_socket(struct sockaddr_storage *sa, socklen_t salen,
 error:
 	close(fd);
 	return res;
-}
-
-static int get_ip(const struct sockaddr_storage *sa, char *ip, size_t len, bool *ip4)
-{
-	if (sa->ss_family == AF_INET) {
-		struct sockaddr_in *in = (struct sockaddr_in*)sa;
-		inet_ntop(sa->ss_family, &in->sin_addr, ip, len);
-	} else if (sa->ss_family == AF_INET6) {
-		struct sockaddr_in6 *in = (struct sockaddr_in6*)sa;
-		inet_ntop(sa->ss_family, &in->sin6_addr, ip, len);
-		*ip4 = false;
-	} else
-		return -EIO;
-	if (ip4)
-		*ip4 = sa->ss_family == AF_INET;
-	return 0;
 }
 
 static void update_ts_refclk(struct impl *impl)
@@ -1407,7 +1423,7 @@ static int parse_sap(struct impl *impl, void *data, size_t len)
 	if (header->c)
 		return -ENOTSUP;
 
-	offs = header->a ? 12 : 8;
+	offs = header->a ? 20 : 8;
 	offs += header->auth_len * 4;
 	if (len <= offs)
 		return -EINVAL;
@@ -1447,6 +1463,7 @@ static void
 on_sap_io(void *data, int fd, uint32_t mask)
 {
 	struct impl *impl = data;
+	int res;
 
 	if (mask & SPA_IO_IN) {
 		uint8_t buffer[2048];
@@ -1460,7 +1477,8 @@ on_sap_io(void *data, int fd, uint32_t mask)
 			return;
 
 		buffer[len] = 0;
-		parse_sap(impl, buffer, len);
+		if ((res = parse_sap(impl, buffer, len)) < 0)
+			pw_log_warn("error parsing SAP: %s", spa_strerror(res));
 	}
 }
 
@@ -1468,6 +1486,7 @@ static int start_sap(struct impl *impl)
 {
 	int fd, res;
 	struct timespec value, interval;
+	char addr[128] = "invalid";
 
 	if ((fd = make_send_socket(&impl->src_addr, impl->src_len,
 					&impl->sap_addr, impl->sap_len,
@@ -1492,7 +1511,8 @@ static int start_sap(struct impl *impl)
 	if ((fd = make_recv_socket(&impl->sap_addr, impl->sap_len, impl->ifname)) < 0)
 		return fd;
 
-	pw_log_info("starting SAP listener");
+	get_ip(&impl->sap_addr, addr, sizeof(addr), NULL);
+	pw_log_info("starting SAP listener on %s", addr);
 	impl->sap_source = pw_loop_add_io(impl->loop, fd,
 				SPA_IO_IN, true, on_sap_io, impl);
 	if (impl->sap_source == NULL) {
@@ -1731,13 +1751,12 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 			"sap.cleanup.sec", DEFAULT_CLEANUP_SEC);
 
 	if ((str = pw_properties_get(props, "source.ip")) == NULL) {
-		str = DEFAULT_SOURCE_IP;
 		if (impl->ifname) {
-			int fd = socket(AF_INET, SOCK_DGRAM, 0);
+			int fd = socket(impl->sap_addr.ss_family, SOCK_DGRAM, 0);
 			if (fd >= 0) {
 				struct ifreq req;
 				spa_zero(req);
-				req.ifr_addr.sa_family = AF_INET;
+				req.ifr_addr.sa_family = impl->sap_addr.ss_family;
 				snprintf(req.ifr_name, sizeof(req.ifr_name), "%s", impl->ifname);
 				res = ioctl(fd, SIOCGIFADDR, &req);
 				if (res < 0)
@@ -1747,13 +1766,15 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 						addr, sizeof(addr));
 				if (str == NULL) {
 					pw_log_warn("can't parse interface ip: %m");
-					str = DEFAULT_SOURCE_IP;
 				} else {
 					pw_log_info("interface %s IP: %s", impl->ifname, str);
 				}
 				close(fd);
 			}
 		}
+		if (str == NULL)
+			str = impl->sap_addr.ss_family == AF_INET ?
+				DEFAULT_SOURCE_IP : DEFAULT_SOURCE_IP6;
 	}
 	if ((res = parse_address(str, 0, &impl->src_addr, &impl->src_len)) < 0) {
 		pw_log_error("invalid source.ip %s: %s", str, spa_strerror(res));

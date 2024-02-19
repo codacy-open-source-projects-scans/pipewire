@@ -120,6 +120,7 @@ PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
 
 #define DEFAULT_PORT		46000
 #define DEFAULT_SOURCE_IP	"0.0.0.0"
+#define DEFAULT_SOURCE_IP6	"::"
 #define DEFAULT_DESTINATION_IP	"224.0.0.56"
 #define DEFAULT_TTL		1
 #define DEFAULT_LOOP		false
@@ -248,14 +249,26 @@ static int make_socket(struct sockaddr_storage *src, socklen_t src_len,
 		goto error;
 	}
 	if (is_multicast((struct sockaddr*)dst, dst_len)) {
-		val = loop;
-		if (setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &val, sizeof(val)) < 0)
-			pw_log_warn("setsockopt(IP_MULTICAST_LOOP) failed: %m");
+		if (dst->ss_family == AF_INET) {
+			val = loop;
+			if (setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &val, sizeof(val)) < 0)
+				pw_log_warn("setsockopt(IP_MULTICAST_LOOP) failed: %m");
 
-		val = ttl;
-		if (setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &val, sizeof(val)) < 0)
-			pw_log_warn("setsockopt(IP_MULTICAST_TTL) failed: %m");
+			val = ttl;
+			if (setsockopt(fd, IPPROTO_IP, IP_MULTICAST_TTL, &val, sizeof(val)) < 0)
+				pw_log_warn("setsockopt(IP_MULTICAST_TTL) failed: %m");
+		} else {
+			val = loop;
+			if (setsockopt(fd, IPPROTO_IPV6, IPV6_MULTICAST_LOOP, &val, sizeof(val)) < 0)
+				pw_log_warn("setsockopt(IPV6_MULTICAST_LOOP) failed: %m");
+
+			val = ttl;
+			if (setsockopt(fd, IPPROTO_IPV6, IPV6_MULTICAST_HOPS, &val, sizeof(val)) < 0)
+				pw_log_warn("setsockopt(IPV6_MULTICAST_HOPS) failed: %m");
+		}
 	}
+
+
 #ifdef SO_PRIORITY
 	val = 6;
 	if (setsockopt(fd, SOL_SOCKET, SO_PRIORITY, &val, sizeof(val)) < 0)
@@ -551,19 +564,19 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	str = pw_properties_get(props, "local.ifname");
 	impl->ifname = str ? strdup(str) : NULL;
 
-	if ((str = pw_properties_get(props, "source.ip")) == NULL)
-		str = DEFAULT_SOURCE_IP;
-	if ((res = parse_address(str, 0, &impl->src_addr, &impl->src_len)) < 0) {
-		pw_log_error("invalid source.ip %s: %s", str, spa_strerror(res));
-		goto out;
-	}
-
 	impl->dst_port = DEFAULT_PORT + ((uint32_t) (pw_rand32() % 512) << 1);
 	impl->dst_port = pw_properties_get_uint32(props, "destination.port", impl->dst_port);
 	if ((str = pw_properties_get(props, "destination.ip")) == NULL)
 		str = DEFAULT_DESTINATION_IP;
 	if ((res = parse_address(str, impl->dst_port, &impl->dst_addr, &impl->dst_len)) < 0) {
 		pw_log_error("invalid destination.ip %s: %s", str, spa_strerror(res));
+		goto out;
+	}
+	if ((str = pw_properties_get(props, "source.ip")) == NULL)
+		str = impl->dst_addr.ss_family == AF_INET ?
+			DEFAULT_SOURCE_IP : DEFAULT_SOURCE_IP6;
+	if ((res = parse_address(str, 0, &impl->src_addr, &impl->src_len)) < 0) {
+		pw_log_error("invalid source.ip %s: %s", str, spa_strerror(res));
 		goto out;
 	}
 
