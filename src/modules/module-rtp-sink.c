@@ -26,6 +26,7 @@
 #include <pipewire/impl.h>
 
 #include <module-rtp/stream.h>
+#include "network-utils.h"
 
 #ifndef IPTOS_DSCP
 #define IPTOS_DSCP_MASK 0xfc
@@ -186,26 +187,6 @@ struct impl {
 
 	int rtp_fd;
 };
-
-static int parse_address(const char *address, uint16_t port,
-		struct sockaddr_storage *addr, socklen_t *len)
-{
-	struct sockaddr_in *sa4 = (struct sockaddr_in*)addr;
-	struct sockaddr_in6 *sa6 = (struct sockaddr_in6*)addr;
-
-	if (inet_pton(AF_INET, address, &sa4->sin_addr) > 0) {
-		sa4->sin_family = AF_INET;
-		sa4->sin_port = htons(port);
-		*len = sizeof(*sa4);
-	} else if (inet_pton(AF_INET6, address, &sa6->sin6_addr) > 0) {
-		sa6->sin6_family = AF_INET6;
-		sa6->sin6_port = htons(port);
-		*len = sizeof(*sa6);
-	} else
-		return -EINVAL;
-
-	return 0;
-}
 
 static bool is_multicast(struct sockaddr *sa, socklen_t salen)
 {
@@ -369,7 +350,7 @@ static void stream_props_changed(struct impl *impl, uint32_t id, const struct sp
 				pw_log_info("key '%s', value '%s'", key, value);
 				if (!spa_streq(key, "destination.ip"))
 					continue;
-				if (parse_address(value, impl->dst_port, &impl->dst_addr,
+				if (pw_net_parse_address(value, impl->dst_port, &impl->dst_addr,
 						&impl->dst_len) < 0) {
 					pw_log_error("invalid destination.ip: '%s'", value);
 					break;
@@ -403,19 +384,6 @@ static const struct rtp_stream_events stream_events = {
 	.param_changed = stream_param_changed,
 	.send_packet = stream_send_packet,
 };
-
-static int get_ip(const struct sockaddr_storage *sa, char *ip, size_t len)
-{
-	if (sa->ss_family == AF_INET) {
-		struct sockaddr_in *in = (struct sockaddr_in*)sa;
-		inet_ntop(sa->ss_family, &in->sin_addr, ip, len);
-	} else if (sa->ss_family == AF_INET6) {
-		struct sockaddr_in6 *in = (struct sockaddr_in6*)sa;
-		inet_ntop(sa->ss_family, &in->sin6_addr, ip, len);
-	} else
-		return -EIO;
-	return 0;
-}
 
 static void core_destroy(void *d)
 {
@@ -568,14 +536,14 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	impl->dst_port = pw_properties_get_uint32(props, "destination.port", impl->dst_port);
 	if ((str = pw_properties_get(props, "destination.ip")) == NULL)
 		str = DEFAULT_DESTINATION_IP;
-	if ((res = parse_address(str, impl->dst_port, &impl->dst_addr, &impl->dst_len)) < 0) {
+	if ((res = pw_net_parse_address(str, impl->dst_port, &impl->dst_addr, &impl->dst_len)) < 0) {
 		pw_log_error("invalid destination.ip %s: %s", str, spa_strerror(res));
 		goto out;
 	}
 	if ((str = pw_properties_get(props, "source.ip")) == NULL)
 		str = impl->dst_addr.ss_family == AF_INET ?
 			DEFAULT_SOURCE_IP : DEFAULT_SOURCE_IP6;
-	if ((res = parse_address(str, 0, &impl->src_addr, &impl->src_len)) < 0) {
+	if ((res = pw_net_parse_address(str, 0, &impl->src_addr, &impl->src_len)) < 0) {
 		pw_log_error("invalid source.ip %s: %s", str, spa_strerror(res));
 		goto out;
 	}
@@ -589,9 +557,9 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 		ts_offset = pw_rand32();
 	pw_properties_setf(stream_props, "rtp.sender-ts-offset", "%u", (uint32_t)ts_offset);
 
-	get_ip(&impl->src_addr, addr, sizeof(addr));
+	pw_net_get_ip(&impl->src_addr, addr, sizeof(addr), NULL, NULL);
 	pw_properties_set(stream_props, "rtp.source.ip", addr);
-	get_ip(&impl->dst_addr, addr, sizeof(addr));
+	pw_net_get_ip(&impl->dst_addr, addr, sizeof(addr), NULL, NULL);
 	pw_properties_set(stream_props, "rtp.destination.ip", addr);
 	pw_properties_setf(stream_props, "rtp.destination.port", "%u", impl->dst_port);
 	pw_properties_setf(stream_props, "rtp.ttl", "%u", impl->ttl);

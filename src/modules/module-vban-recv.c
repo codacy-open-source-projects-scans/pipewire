@@ -30,6 +30,7 @@
 #include <pipewire/impl.h>
 
 #include <module-vban/stream.h>
+#include "network-utils.h"
 
 #ifdef __FreeBSD__
 #define ifr_ifindex ifr_index
@@ -187,26 +188,6 @@ receive_error:
 short_packet:
 	pw_log_warn("short packet received");
 	return;
-}
-
-static int parse_address(const char *address, uint16_t port,
-		struct sockaddr_storage *addr, socklen_t *len)
-{
-	struct sockaddr_in *sa4 = (struct sockaddr_in*)addr;
-	struct sockaddr_in6 *sa6 = (struct sockaddr_in6*)addr;
-
-	if (inet_pton(AF_INET, address, &sa4->sin_addr) > 0) {
-		sa4->sin_family = AF_INET;
-		sa4->sin_port = htons(port);
-		*len = sizeof(*sa4);
-	} else if (inet_pton(AF_INET6, address, &sa6->sin6_addr) > 0) {
-		sa6->sin6_family = AF_INET6;
-		sa6->sin6_port = htons(port);
-		*len = sizeof(*sa6);
-	} else
-		return -EINVAL;
-
-	return 0;
 }
 
 static int make_socket(const struct sockaddr* sa, socklen_t salen, char *ifname)
@@ -508,7 +489,7 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	}
 	if ((str = pw_properties_get(props, "source.ip")) == NULL)
 		str = DEFAULT_SOURCE_IP;
-	if ((res = parse_address(str, impl->src_port, &impl->src_addr, &impl->src_len)) < 0) {
+	if ((res = pw_net_parse_address(str, impl->src_port, &impl->src_addr, &impl->src_len)) < 0) {
 		pw_log_error("invalid source.ip %s: %s", str, spa_strerror(res));
 		goto out;
 	}

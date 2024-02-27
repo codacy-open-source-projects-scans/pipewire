@@ -65,15 +65,16 @@ extra_docs = [
 ]
 
 manpage_docs = [
-  'dox/programs/libpipewire-modules.7.md',
-  'dox/programs/pipewire-pulse-modules.7.md',
+  'dox/config/pipewire-pulse.conf.5.md',
+  'dox/config/pipewire.conf.5.md',
+  'dox/config/pipewire-client.conf.5.md',
+  'dox/config/pipewire-jack.conf.5.md',
+  'dox/config/pipewire-devices.7.md',
+  'dox/config/pipewire-filter-chain.conf.5.md',
+  'dox/config/pipewire-pulse-modules.7.md',
+  'dox/config/libpipewire-modules.7.md',
   'dox/programs/pipewire-pulse.1.md',
-  'dox/programs/pipewire-pulse.conf.5.md',
   'dox/programs/pipewire.1.md',
-  'dox/programs/pipewire.conf.5.md',
-  'dox/programs/pipewire-client.conf.5.md',
-  'dox/programs/pipewire-jack.conf.5.md',
-  'dox/programs/pipewire-devices.7.md',
   'dox/programs/pw-cat.1.md',
   'dox/programs/pw-cli.1.md',
   'dox/programs/pw-config.1.md',
@@ -149,11 +150,17 @@ example_files = [
   'tutorial5.c',
   'tutorial6.c',
 ]
+example_dep_files = []
+foreach h : example_files
+  example_dep_files += ['examples/' + h]
+endforeach
 foreach h : examples
   example_files += [h + '.c']
+  example_dep_files += ['../src/examples/' + h + '.c']
 endforeach
 foreach h : spa_examples
   example_files += ['spa/examples/' + h + '.c']
+  example_dep_files += ['../spa/examples/' + h + '.c']
 endforeach
 
 example_doxygen = []
@@ -227,7 +234,8 @@ index_json = custom_target('index.json',
 )
 
 html_target = custom_target('pipewire-docs',
-                            input: [ doxyfile, doxygen_layout, examples_dox, doxygen_filter_c, doxygen_filter_h, index_json ] + inputs + cssfiles,
+                            input: [ doxyfile, doxygen_layout, example_dep_files, examples_dox,
+                                     doxygen_filter_c, doxygen_filter_h, index_json ] + inputs + cssfiles,
                             output: [ 'html' ],
                             command: [ doxygen, doxyfile ],
                             env: doxygen_env,

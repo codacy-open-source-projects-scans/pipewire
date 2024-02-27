@@ -570,7 +570,15 @@ do_mix_set_io(struct spa_loop *loop, bool async, uint32_t seq,
 		const void *data, size_t size, void *user_data)
 {
 	const struct io_info *info = data;
+	struct port *port = info->mix->port;
 	info->mix->io = info->data;
+	if (info->mix->io) {
+		if (port->n_mix++ == 0 && port->global_mix != NULL)
+			port->global_mix->io = &port->io;
+	} else {
+		if (--port->n_mix == 0 && port->global_mix != NULL)
+			port->global_mix->io = NULL;
+	}
 	return 0;
 }
 
@@ -591,10 +599,11 @@ static void init_mix(struct mix *mix, uint32_t mix_id, struct port *port, uint32
 	mix->io = NULL;
 	mix->n_buffers = 0;
 	spa_list_init(&mix->queue);
-	if (mix_id == SPA_ID_INVALID)
+	if (mix_id == SPA_ID_INVALID) {
 		port->global_mix = mix;
-	else if (port->n_mix++ == 0 && port->global_mix != NULL)
-		mix_set_io(port->global_mix, &port->io);
+		if (port->n_mix > 0)
+			mix_set_io(port->global_mix, &port->io);
+	}
 }
 static struct mix *find_mix_peer(struct client *c, uint32_t peer_id)
 {
@@ -681,8 +690,6 @@ static void free_mix(struct client *c, struct mix *mix)
 	spa_list_remove(&mix->port_link);
 	if (mix->id == SPA_ID_INVALID)
 		port->global_mix = NULL;
-	else if (--port->n_mix == 0 && port->global_mix != NULL)
-		mix_set_io(port->global_mix, NULL);
 	spa_list_remove(&mix->link);
 	spa_list_append(&c->free_mix, &mix->link);
 }
@@ -2760,9 +2767,11 @@ static int
 do_memmap_free(struct spa_loop *loop,
                 bool async, uint32_t seq, const void *data, size_t size, void *user_data)
 {
-	struct pw_memmap *mm = user_data;
+	struct client *c = user_data;
+	struct pw_memmap *mm = *((struct pw_memmap **)data);
 	pw_log_trace("memmap %p free", mm);
 	pw_memmap_free(mm);
+	pw_core_set_paused(c->core, false);
 	return 0;
 }
 
@@ -2771,8 +2780,7 @@ do_queue_memmap_free(struct spa_loop *loop,
                 bool async, uint32_t seq, const void *data, size_t size, void *user_data)
 {
 	struct client *c = user_data;
-	struct pw_memmap *mm = *((struct pw_memmap **)data);
-	pw_loop_invoke(c->context.l, do_memmap_free, 0, NULL, 0, false, mm);
+	pw_loop_invoke(c->context.l, do_memmap_free, 0, data, size, false, c);
 	return 0;
 }
 
@@ -2827,6 +2835,7 @@ static int client_node_port_set_io(void *data,
 		mix_set_io(mix, ptr);
 		if (old != NULL) {
 			old->tag[0] = SPA_ID_INVALID;
+			pw_core_set_paused(c->core, true);
 			pw_data_loop_invoke(c->loop,
 				do_queue_memmap_free, SPA_ID_INVALID, &old, sizeof(&old), false, c);
 			old = NULL;
@@ -3950,7 +3959,7 @@ jack_client_t * jack_client_open (const char *client_name,
 		struct spa_fraction q;
 		if (sscanf(str, "%u/%u", &q.num, &q.denom) == 2 && q.denom != 0) {
 			pw_properties_setf(client->props, PW_KEY_NODE_FORCE_RATE,
-					"1/%u", q.denom);
+					"%u", q.denom);
 			pw_properties_setf(client->props, PW_KEY_NODE_FORCE_QUANTUM,
 					"%u", q.num);
 		} else {

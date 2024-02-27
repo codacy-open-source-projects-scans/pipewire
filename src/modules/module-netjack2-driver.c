@@ -34,6 +34,7 @@
 
 #include "module-netjack2/packets.h"
 #include "module-netjack2/peer.c"
+#include "network-utils.h"
 
 #ifndef IPTOS_DSCP
 #define IPTOS_DSCP_MASK 0xfc
@@ -689,26 +690,6 @@ on_data_io(void *data, int fd, uint32_t mask)
 	}
 }
 
-static int parse_address(const char *address, uint16_t port,
-		struct sockaddr_storage *addr, socklen_t *len)
-{
-	struct sockaddr_in *sa4 = (struct sockaddr_in*)addr;
-	struct sockaddr_in6 *sa6 = (struct sockaddr_in6*)addr;
-
-	if (inet_pton(AF_INET, address, &sa4->sin_addr) > 0) {
-		sa4->sin_family = AF_INET;
-		sa4->sin_port = htons(port);
-		*len = sizeof(*sa4);
-	} else if (inet_pton(AF_INET6, address, &sa6->sin6_addr) > 0) {
-		sa6->sin6_family = AF_INET6;
-		sa6->sin6_port = htons(port);
-		*len = sizeof(*sa6);
-	} else
-		return -EINVAL;
-
-	return 0;
-}
-
 static bool is_multicast(struct sockaddr *sa, socklen_t salen)
 {
 	if (sa->sa_family == AF_INET) {
@@ -775,19 +756,6 @@ static int make_socket(struct sockaddr_storage *src, socklen_t src_len,
 error:
 	close(fd);
 	return res;
-}
-
-static const char *get_ip(const struct sockaddr_storage *sa, char *ip, size_t len)
-{
-	if (sa->ss_family == AF_INET) {
-		struct sockaddr_in *in = (struct sockaddr_in*)sa;
-		inet_ntop(sa->ss_family, &in->sin_addr, ip, len);
-	} else if (sa->ss_family == AF_INET6) {
-		struct sockaddr_in6 *in = (struct sockaddr_in6*)sa;
-		inet_ntop(sa->ss_family, &in->sin6_addr, ip, len);
-	} else
-		snprintf(ip, len, "invalid ip");
-	return ip;
 }
 
 static void update_timer(struct impl *impl, uint64_t timeout)
@@ -959,7 +927,7 @@ static int send_follower_available(struct impl *impl)
 
 	pw_loop_update_io(impl->main_loop, impl->setup_socket, SPA_IO_IN);
 
-	pw_log_info("sending AVAILABLE to %s", get_ip(&impl->dst_addr, buffer, sizeof(buffer)));
+	pw_log_info("sending AVAILABLE to %s", pw_net_get_ip_fmt(&impl->dst_addr, buffer, sizeof(buffer)));
 
 	client_name = pw_properties_get(impl->props, "netjack2.client-name");
 	if (client_name == NULL)
@@ -996,11 +964,11 @@ static int create_netjack2_socket(struct impl *impl)
 		port = DEFAULT_NET_PORT;
 	if ((str = pw_properties_get(impl->props, "net.ip")) == NULL)
 		str = DEFAULT_NET_IP;
-	if ((res = parse_address(str, port, &impl->dst_addr, &impl->dst_len)) < 0) {
+	if ((res = pw_net_parse_address(str, port, &impl->dst_addr, &impl->dst_len)) < 0) {
 		pw_log_error("invalid net.ip %s: %s", str, spa_strerror(res));
 		goto out;
 	}
-	if ((res = parse_address("0.0.0.0", 0, &impl->src_addr, &impl->src_len)) < 0) {
+	if ((res = pw_net_parse_address("0.0.0.0", 0, &impl->src_addr, &impl->src_len)) < 0) {
 		pw_log_error("invalid source.ip: %s", spa_strerror(res));
 		goto out;
 	}

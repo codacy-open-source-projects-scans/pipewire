@@ -455,7 +455,7 @@ do_call_process(struct spa_loop *loop,
 
 static inline void call_process(struct stream *impl)
 {
-	pw_log_trace_fp("%p: call process rt:%u", impl, impl->process_rt);
+	pw_log_trace_fp("%p: call process rt:%u buffers:%d", impl, impl->process_rt, impl->n_buffers);
 	if (impl->n_buffers == 0 ||
 	    (impl->direction == SPA_DIRECTION_OUTPUT && update_requested(impl) <= 0))
 		return;
@@ -2059,7 +2059,7 @@ pw_stream_connect(struct pw_stream *stream,
 		struct spa_fraction q;
 		if (sscanf(str, "%u/%u", &q.num, &q.denom) == 2 && q.denom != 0) {
 			pw_properties_setf(stream->properties, PW_KEY_NODE_FORCE_RATE,
-					"1/%u", q.denom);
+					"%u", q.denom);
 			pw_properties_setf(stream->properties, PW_KEY_NODE_FORCE_QUANTUM,
 					"%u", q.num);
 		}

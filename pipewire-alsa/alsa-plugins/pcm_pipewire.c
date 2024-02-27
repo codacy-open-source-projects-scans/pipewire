@@ -535,8 +535,10 @@ static int snd_pcm_pipewire_prepare(snd_pcm_ioplug_t *io)
 	params[0] = spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat, &pw->format);
 
 	if (pw->stream != NULL) {
+		pw_stream_set_active(pw->stream, false);
 		pw_stream_update_properties(pw->stream, &pw->props->dict);
 		pw_stream_update_params(pw->stream, params, 1);
+		pw_stream_set_active(pw->stream, true);
 		goto done;
 	}
 
@@ -1258,6 +1260,10 @@ static int snd_pcm_pipewire_open(snd_pcm_t **pcmp,
 	pw_thread_loop_unlock(pw->main_loop);
 
 	pw->fd = spa_system_eventfd_create(pw->system, SPA_FD_CLOEXEC | SPA_FD_NONBLOCK);
+	if (pw->fd < 0) {
+		err = pw->fd;
+		goto error;
+	}
 
 	pw->io.version = SND_PCM_IOPLUG_VERSION;
 	pw->io.name = "ALSA <-> PipeWire PCM I/O Plugin";
