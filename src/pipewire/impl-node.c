@@ -47,6 +47,7 @@ struct impl {
 
 	char *group;
 	char *link_group;
+	char *sync_group;
 };
 
 #define pw_node_resource(r,m,v,...)	pw_resource_call(r,struct pw_node_events,m,v,__VA_ARGS__)
@@ -480,6 +481,7 @@ clear_info(struct pw_impl_node *this)
 {
 	pw_free_strv(this->groups);
 	pw_free_strv(this->link_groups);
+	pw_free_strv(this->sync_groups);
 	free(this->name);
 	free((char*)this->info.error);
 }
@@ -938,7 +940,7 @@ static void check_properties(struct pw_impl_node *node)
 	const char *str, *recalc_reason = NULL;
 	struct spa_fraction frac;
 	uint32_t value;
-	bool driver, trigger;
+	bool driver, trigger, transport, sync;
 	struct match match;
 
 	match = MATCH_INIT(node);
@@ -1019,6 +1021,33 @@ static void check_properties(struct pw_impl_node *node)
 		node->link_groups = impl->link_group ?
 			pw_strv_parse(impl->link_group, strlen(impl->link_group), INT_MAX, NULL) : NULL;
 		recalc_reason = "link group changed";
+	}
+
+	/* sync group defines what nodes are part of the same sync */
+	str = pw_properties_get(node->properties, PW_KEY_NODE_SYNC_GROUP);
+	if (str == NULL)
+		str = "group.sync.0";
+	if (!spa_streq(str, impl->sync_group)) {
+		pw_log_info("%p: sync group '%s'->'%s'", node, impl->sync_group, str);
+		free(impl->sync_group);
+		impl->sync_group = str ? strdup(str) : NULL;
+		pw_free_strv(node->sync_groups);
+		node->sync_groups = impl->sync_group ?
+			pw_strv_parse(impl->sync_group, strlen(impl->sync_group), INT_MAX, NULL) : NULL;
+		recalc_reason = "sync group changed";
+	}
+	sync = pw_properties_get_bool(node->properties, PW_KEY_NODE_SYNC, false);
+	if (sync != node->sync) {
+		pw_log_info("%p: sync %d -> %d", node, node->sync, sync);
+		node->sync = sync;
+		recalc_reason = "sync changed";
+	}
+
+	transport = pw_properties_get_bool(node->properties, PW_KEY_NODE_TRANSPORT, false);
+	if (transport != node->transport) {
+		pw_log_info("%p: transport %d -> %d", node, node->transport, transport);
+		node->transport = transport;
+		recalc_reason = "transport changed";
 	}
 
 	if ((str = pw_properties_get(node->properties, PW_KEY_MEDIA_CLASS)) != NULL &&
@@ -1847,6 +1876,7 @@ again:
 			uint32_t id = t->id;
 
 			ta->status = PW_NODE_ACTIVATION_NOT_TRIGGERED;
+			ta->driver_id = driver->info.id;
 			pw_node_activation_state_reset(&ta->state[0]);
 
 			/* this is the node with reposition info */
@@ -2167,6 +2197,7 @@ void pw_impl_node_destroy(struct pw_impl_node *node)
 	spa_system_close(node->data_system, node->source.fd);
 	free(impl->group);
 	free(impl->link_group);
+	free(impl->sync_group);
 	free(impl);
 
 #ifdef HAVE_MALLOC_TRIM

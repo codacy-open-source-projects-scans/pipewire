@@ -4786,12 +4786,29 @@ SPA_EXPORT
 int jack_set_freewheel(jack_client_t* client, int onoff)
 {
 	struct client *c = (struct client *) client;
+	const char *str;
 
 	pw_log_info("%p: freewheel %d", client, onoff);
 
 	pw_thread_loop_lock(c->context.loop);
-	pw_properties_set(c->props, "node.group",
-			onoff ? "pipewire.freewheel" : "");
+	str = pw_properties_get(c->props, PW_KEY_NODE_GROUP);
+	if (str != NULL) {
+		char *p = strstr(str, ",pipewire.freewheel");
+		if (p == NULL)
+			p = strstr(str, "pipewire.freewheel");
+		if (p == NULL && onoff)
+			pw_properties_setf(c->props, PW_KEY_NODE_GROUP,
+					"%s,pipewire.freewheel", str);
+		else if (p != NULL && !onoff) {
+			pw_log_info("%s %d %s %.*s", p, (int)(p - str),
+					str, (int)(p - str), str);
+			pw_properties_setf(c->props, PW_KEY_NODE_GROUP,
+					"%.*s", (int)(p - str), str);
+		}
+	} else {
+		pw_properties_set(c->props, PW_KEY_NODE_GROUP,
+				onoff ? "pipewire.freewheel" : "");
+	}
 
 	c->info.change_mask |= SPA_NODE_CHANGE_MASK_PROPS;
 	c->info.props = &c->props->dict;
@@ -6781,12 +6798,25 @@ int  jack_transport_reposition (jack_client_t *client,
 	return 0;
 }
 
-static void update_command(struct client *c, uint32_t command)
+static int transport_update(struct client* c, int active)
 {
-	struct pw_node_activation *a = c->rt.driver_activation;
-	if (!a)
-		return;
-	SPA_ATOMIC_STORE(a->command, command);
+	pw_log_info("%p: transport %d", c, active);
+
+	pw_thread_loop_lock(c->context.loop);
+	pw_properties_set(c->props, PW_KEY_NODE_SYNC, "true");
+	pw_properties_set(c->props, PW_KEY_NODE_TRANSPORT,
+			active ? "true" : "false");
+
+	c->info.change_mask |= SPA_NODE_CHANGE_MASK_PROPS;
+	c->info.props = &c->props->dict;
+
+	pw_client_node_update(c->node,
+                                    PW_CLIENT_NODE_UPDATE_INFO,
+				    0, NULL, &c->info);
+	c->info.change_mask = 0;
+	pw_thread_loop_unlock(c->context.loop);
+
+	return 0;
 }
 
 SPA_EXPORT
@@ -6794,7 +6824,7 @@ void jack_transport_start (jack_client_t *client)
 {
 	struct client *c = (struct client *) client;
 	return_if_fail(c != NULL);
-	update_command(c, PW_NODE_ACTIVATION_COMMAND_START);
+	transport_update(c, true);
 }
 
 SPA_EXPORT
@@ -6802,7 +6832,7 @@ void jack_transport_stop (jack_client_t *client)
 {
 	struct client *c = (struct client *) client;
 	return_if_fail(c != NULL);
-	update_command(c, PW_NODE_ACTIVATION_COMMAND_STOP);
+	transport_update(c, false);
 }
 
 SPA_EXPORT

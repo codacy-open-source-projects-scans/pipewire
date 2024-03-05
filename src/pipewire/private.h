@@ -578,7 +578,8 @@ struct pw_node_activation {
 	uint32_t segment_owner[16];			/* id of owners for each segment info struct.
 							 * nodes that want to update segment info need to
 							 * CAS their node id in this array. */
-	uint32_t padding[15];
+	uint32_t padding[14];
+	uint32_t driver_id;				/* the current node driver id */
 #define PW_NODE_ACTIVATION_FLAG_NONE		0
 #define PW_NODE_ACTIVATION_FLAG_PROFILER	(1<<0)	/* the profiler is running */
 	uint32_t flags;					/* extra flags */
@@ -649,6 +650,7 @@ struct pw_impl_node {
 	uint32_t priority_driver;	/** priority for being driver */
 	char **groups;			/** groups to schedule this node in */
 	char **link_groups;		/** groups this node is linked to */
+	char **sync_groups;		/** sync groups this node is in */
 	uint64_t spa_flags;
 
 	unsigned int registered:1;
@@ -682,6 +684,8 @@ struct pw_impl_node {
 					  *  trigger to start processing. */
 	unsigned int can_suspend:1;
 	unsigned int checked;		/**< for sorting */
+	unsigned int sync:1;		/**< the sync-groups are active */
+	unsigned int transport:1;	/**< the transport is active */
 
 	uint32_t port_user_data_size;	/**< extra size for port user data */
 
