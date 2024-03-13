@@ -29,6 +29,7 @@
 
 #include <gst/video/video.h>
 
+#include "gstpipewireclock.h"
 #include "gstpipewireformat.h"
 
 GST_DEBUG_CATEGORY_STATIC (pipewire_sink_debug);
@@ -98,6 +99,33 @@ static GstFlowReturn gst_pipewire_sink_render (GstBaseSink * psink,
 static gboolean gst_pipewire_sink_start (GstBaseSink * basesink);
 static gboolean gst_pipewire_sink_stop (GstBaseSink * basesink);
 
+static GstClock *
+gst_pipewire_sink_provide_clock (GstElement * elem)
+{
+  GstPipeWireSink *pwsink = GST_PIPEWIRE_SINK (elem);
+  GstClock *clock;
+
+  GST_OBJECT_LOCK (pwsink);
+  if (!GST_OBJECT_FLAG_IS_SET (pwsink, GST_ELEMENT_FLAG_PROVIDE_CLOCK))
+    goto clock_disabled;
+
+  if (pwsink->clock)
+    clock = GST_CLOCK_CAST (gst_object_ref (pwsink->clock));
+  else
+    clock = NULL;
+  GST_OBJECT_UNLOCK (pwsink);
+
+  return clock;
+
+  /* ERRORS */
+clock_disabled:
+  {
+    GST_DEBUG_OBJECT (pwsink, "clock provide disabled");
+    GST_OBJECT_UNLOCK (pwsink);
+    return NULL;
+  }
+}
+
 static void
 gst_pipewire_sink_finalize (GObject * object)
 {
@@ -109,6 +137,8 @@ gst_pipewire_sink_finalize (GObject * object)
     gst_structure_free (pwsink->stream_properties);
   if (pwsink->client_properties)
     gst_structure_free (pwsink->client_properties);
+  if (pwsink->clock)
+    gst_object_unref (pwsink->clock);
   g_free (pwsink->path);
   g_free (pwsink->target_object);
   g_free (pwsink->client_name);
@@ -206,11 +236,12 @@ gst_pipewire_sink_class_init (GstPipeWireSinkClass * klass)
                                                       G_PARAM_READWRITE |
                                                       G_PARAM_STATIC_STRINGS));
 
+  gstelement_class->provide_clock = gst_pipewire_sink_provide_clock;
   gstelement_class->change_state = gst_pipewire_sink_change_state;
 
   gst_element_class_set_static_metadata (gstelement_class,
-      "PipeWire sink", "Sink/Video",
-      "Send video to PipeWire", "Wim Taymans <wim.taymans@gmail.com>");
+      "PipeWire sink", "Sink/Audio/Video",
+      "Send audio/video to PipeWire", "Wim Taymans <wim.taymans@gmail.com>");
 
   gst_element_class_add_pad_template (gstelement_class,
       gst_static_pad_template_get (&gst_pipewire_sink_template));
@@ -282,6 +313,8 @@ gst_pipewire_sink_init (GstPipeWireSink * sink)
   sink->client_name = g_strdup(pw_get_client_name());
   sink->mode = DEFAULT_PROP_MODE;
   sink->fd = -1;
+
+  GST_OBJECT_FLAG_SET (sink, GST_ELEMENT_FLAG_PROVIDE_CLOCK);
 
   g_signal_connect (sink->pool, "activated", G_CALLBACK (pool_activated), sink);
 }
@@ -570,7 +603,7 @@ gst_pipewire_sink_setcaps (GstBaseSink * bsink, GstCaps * caps)
 
   pwsink = GST_PIPEWIRE_SINK (bsink);
 
-  possible = gst_caps_to_format_all (caps, SPA_PARAM_EnumFormat);
+  possible = gst_caps_to_format_all (caps);
 
   pw_thread_loop_lock (pwsink->core->loop);
   state = pw_stream_get_state (pwsink->stream, &error);
@@ -637,6 +670,8 @@ gst_pipewire_sink_setcaps (GstBaseSink * bsink, GstCaps * caps)
     }
   }
   res = TRUE;
+
+  gst_pipewire_clock_reset (GST_PIPEWIRE_CLOCK (pwsink->clock), 0);
 
   config = gst_buffer_pool_get_config (GST_BUFFER_POOL_CAST (pwsink->pool));
   gst_buffer_pool_config_get_params (config, NULL, &size, &min_buffers, &max_buffers);
@@ -796,6 +831,7 @@ gst_pipewire_sink_start (GstBaseSink * basesink)
                          &stream_events,
                          pwsink);
 
+  pwsink->clock = gst_pipewire_clock_new (pwsink->stream, pwsink->last_time);
   pw_thread_loop_unlock (pwsink->core->loop);
 
   return TRUE;
@@ -861,6 +897,18 @@ connect_error:
 static gboolean
 gst_pipewire_sink_close (GstPipeWireSink * pwsink)
 {
+  pwsink->last_time = gst_clock_get_time (pwsink->clock);
+
+  GST_DEBUG_OBJECT (pwsink, "close");
+
+  gst_element_post_message (GST_ELEMENT (pwsink),
+    gst_message_new_clock_lost (GST_OBJECT_CAST (pwsink), pwsink->clock));
+
+  GST_OBJECT_LOCK (pwsink);
+  GST_PIPEWIRE_CLOCK (pwsink->clock)->stream = NULL;
+  g_clear_object (&pwsink->clock);
+  GST_OBJECT_UNLOCK (pwsink);
+
   pw_thread_loop_lock (pwsink->core->loop);
   if (pwsink->stream) {
     pw_stream_destroy (pwsink->stream);
