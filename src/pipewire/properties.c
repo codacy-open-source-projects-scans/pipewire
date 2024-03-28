@@ -8,6 +8,8 @@
 #include <spa/utils/ansi.h>
 #include <spa/utils/json.h>
 #include <spa/utils/string.h>
+#include <spa/utils/cleanup.h>
+#include <spa/debug/log.h>
 
 #include "pipewire/array.h"
 #include "pipewire/log.h"
@@ -128,6 +130,60 @@ struct pw_properties *pw_properties_new_dict(const struct spa_dict *dict)
 	return &impl->this;
 }
 
+static int update_string(struct pw_properties *props, const char *str, size_t size,
+		int *count, struct spa_error_location *loc)
+{
+	struct spa_json it[2];
+	char key[1024];
+	struct spa_error_location el;
+	bool err;
+	int cnt = 0;
+
+	spa_json_init(&it[0], str, size);
+	if (spa_json_enter_object(&it[0], &it[1]) <= 0)
+		spa_json_init(&it[1], str, size);
+
+	while (spa_json_get_string(&it[1], key, sizeof(key)) > 0) {
+		int len;
+		const char *value;
+		spa_autofree char *val = NULL;
+
+		if ((len = spa_json_next(&it[1], &value)) <= 0)
+			break;
+
+		if (spa_json_is_null(value, len))
+			val = NULL;
+		else {
+			if (spa_json_is_container(value, len))
+				len = spa_json_container_len(&it[1], value, len);
+			if (len <= 0)
+				break;
+
+			if (props) {
+				if ((val = malloc(len+1)) == NULL) {
+					errno = ENOMEM;
+					it[1].state = SPA_JSON_ERROR_FLAG;
+					break;
+				}
+				spa_json_parse_stringn(value, len, val, len+1);
+			}
+		}
+		if (props)
+			cnt += pw_properties_set(props, key, val);
+	}
+	if ((err = spa_json_get_error(&it[1], str, &el))) {
+		if (loc == NULL)
+			spa_debug_log_error_location(pw_log_get(), SPA_LOG_LEVEL_WARN,
+					&el, "error parsing more than %d properties: %s",
+					cnt, el.reason);
+		else
+			*loc = el;
+	}
+	if (count)
+		*count = cnt;
+	return !err;
+}
+
 /** Update the properties from the given string, overwriting any
  * existing keys with the new values from \a str.
  *
@@ -139,34 +195,38 @@ struct pw_properties *pw_properties_new_dict(const struct spa_dict *dict)
 SPA_EXPORT
 int pw_properties_update_string(struct pw_properties *props, const char *str, size_t size)
 {
-	struct properties *impl = SPA_CONTAINER_OF(props, struct properties, this);
-	struct spa_json it[2];
-	char key[1024], *val;
 	int count = 0;
+	update_string(props, str, size, &count, NULL);
+	return count;
+}
 
-	spa_json_init(&it[0], str, size);
-	if (spa_json_enter_object(&it[0], &it[1]) <= 0)
-		spa_json_init(&it[1], str, size);
-
-	while (spa_json_get_string(&it[1], key, sizeof(key)) > 0) {
-		int len;
-		const char *value;
-
-		if ((len = spa_json_next(&it[1], &value)) <= 0)
-			break;
-
-		if (spa_json_is_null(value, len))
-			val = NULL;
-		else {
-			if (spa_json_is_container(value, len))
-				len = spa_json_container_len(&it[1], value, len);
-
-			if ((val = malloc(len+1)) != NULL)
-				spa_json_parse_stringn(value, len, val, len+1);
-		}
-		count += pw_properties_set(&impl->this, key, val);
-		free(val);
-	}
+/** Check \a str is a well-formed properties JSON string and update
+ * the properties on success.
+ *
+ * \a str should be a whitespace separated list of key=value
+ * strings or a json object, see pw_properties_new_string().
+ *
+ * When the check fails, this function will not update \a props.
+ *
+ * \param props  The properties to attempt to update, maybe be NULL
+ *            to simply check the JSON string.
+ * \param str  The JSON object with new values
+ * \param size  The length of the JSON string.
+ * \param loc  Return value for parse error location
+ * \return a negative value when string is not valid and \a loc contains
+ *         the error location or the number of updated properties in
+ *         \a props.
+ * \since 1.1.0
+ */
+SPA_EXPORT
+int pw_properties_update_string_checked(struct pw_properties *props,
+		const char *str, size_t size, struct spa_error_location *loc)
+{
+	int count = 0;
+	if (!update_string(NULL, str, size, NULL, loc))
+		return -EINVAL;
+	if (props)
+		update_string(props, str, size, &count, NULL);
 	return count;
 }
 
@@ -190,6 +250,27 @@ pw_properties_new_string(const char *object)
 		return NULL;
 
 	if ((res = pw_properties_update_string(&impl->this, object, strlen(object))) < 0)
+		goto error;
+
+	return &impl->this;
+error:
+	pw_properties_free(&impl->this);
+	errno = -res;
+	return NULL;
+}
+
+SPA_EXPORT
+struct pw_properties *
+pw_properties_new_string_checked(const char *object, size_t size, struct spa_error_location *loc)
+{
+	struct properties *impl;
+	int res;
+
+	impl = properties_new(16);
+	if (impl == NULL)
+		return NULL;
+
+	if ((res = pw_properties_update_string_checked(&impl->this, object, size, loc)) < 0)
 		goto error;
 
 	return &impl->this;

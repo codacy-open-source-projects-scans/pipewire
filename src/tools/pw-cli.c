@@ -1402,6 +1402,19 @@ static bool do_info(struct data *data, const char *cmd, char *args, char **error
 	return true;
 }
 
+static struct pw_properties *properties_new_checked(const char *str, char **error)
+{
+	struct pw_properties *props;
+	struct spa_error_location loc;
+
+	props = pw_properties_new_string_checked(str, strlen(str), &loc);
+	if (!props) {
+		*error = spa_aprintf("syntax error in properties, line:%d col:%d: %s",
+				loc.line, loc.col, loc.reason);
+	}
+	return props;
+}
+
 static bool do_create_device(struct data *data, const char *cmd, char *args, char **error)
 {
 	struct remote_data *rd = data->current;
@@ -1417,8 +1430,10 @@ static bool do_create_device(struct data *data, const char *cmd, char *args, cha
 		*error = spa_aprintf("%s <factory-name> [<properties>]", cmd);
 		return false;
 	}
-	if (n == 2)
-		props = pw_properties_new_string(a[1]);
+	if (n == 2) {
+		if ((props = properties_new_checked(a[1], error)) == NULL)
+			return false;
+	}
 
 	proxy = pw_core_create_object(rd->core, a[0],
 					    PW_TYPE_INTERFACE_Device,
@@ -1457,8 +1472,10 @@ static bool do_create_node(struct data *data, const char *cmd, char *args, char 
 		*error = spa_aprintf("%s <factory-name> [<properties>]", cmd);
 		return false;
 	}
-	if (n == 2)
-		props = pw_properties_new_string(a[1]);
+	if (n == 2) {
+		if ((props = properties_new_checked(a[1], error)) == NULL)
+			return false;
+	}
 
 	proxy = pw_core_create_object(rd->core, a[0],
 					    PW_TYPE_INTERFACE_Node,
@@ -1574,10 +1591,12 @@ static bool do_create_link(struct data *data, const char *cmd, char *args, char 
 		*error = spa_aprintf("%s <node-id> <port> <node-id> <port> [<properties>]", cmd);
 		return false;
 	}
-	if (n == 5)
-		props = pw_properties_new_string(a[4]);
-	else
+	if (n == 5) {
+		if ((props = properties_new_checked(a[4], error)) == NULL)
+			return false;
+	} else {
 		props = pw_properties_new(NULL, NULL);
+	}
 
 	if (!spa_streq(a[0], "-"))
 		pw_properties_set(props, PW_KEY_LINK_OUTPUT_NODE, a[0]);

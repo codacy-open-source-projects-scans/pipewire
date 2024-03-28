@@ -26,6 +26,7 @@
 #include <spa/utils/string.h>
 #include <spa/utils/json.h>
 #include <spa/debug/types.h>
+#include <spa/debug/file.h>
 
 #include <pipewire/cleanup.h>
 #include <pipewire/pipewire.h>
@@ -1608,6 +1609,7 @@ int main(int argc, char *argv[])
 	const char *prog;
 	int exit_code = EXIT_FAILURE, c, ret;
 	enum pw_stream_flags flags = 0;
+	struct spa_error_location loc;
 
 	setlocale(LC_ALL, "");
 	pw_init(&argc, &argv);
@@ -1729,7 +1731,12 @@ int main(int argc, char *argv[])
 			break;
 
 		case 'P':
-			pw_properties_update_string(data.props, optarg, strlen(optarg));
+			if (pw_properties_update_string_checked(data.props, optarg, strlen(optarg), &loc) < 0) {
+				spa_debug_file_error_location(stderr, &loc,
+						"error: syntax error in --properties: %s",
+						loc.reason);
+				goto error_usage;
+			}
 			break;
 
 		case OPT_TARGET:
