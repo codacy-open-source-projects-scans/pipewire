@@ -33,33 +33,14 @@
 #define VULKAN_INSTANCE_FUNCTION(name)						\
 	PFN_##name name = (PFN_##name)vkGetInstanceProcAddr(s->base.instance, #name)
 
-static int updateBuffers(struct vulkan_blit_state *s)
-{
-	uint32_t i;
+#define GET_BUFFER_ID_FROM_STREAM(s, pass)	\
+	(s->direction == SPA_DIRECTION_INPUT ? pass->in_buffer_id : pass->out_buffer_id)
 
-	for (i = 0; i < s->n_streams; i++) {
-		struct vulkan_stream *p = &s->streams[i];
+static int runImportSHMBuffers(struct vulkan_blit_state *s, struct vulkan_pass *pass) {
+	struct vulkan_stream *p = &s->streams[pass->in_stream_id];
 
-		if (p->current_buffer_id == p->pending_buffer_id ||
-		    p->pending_buffer_id == SPA_ID_INVALID)
-			continue;
-
-		p->current_buffer_id = p->pending_buffer_id;
-		p->busy_buffer_id = p->current_buffer_id;
-		p->pending_buffer_id = SPA_ID_INVALID;
-
-	}
-
-	return 0;
-}
-
-static int runImportSHMBuffers(struct vulkan_blit_state *s) {
-	struct vulkan_stream *p = &s->streams[SPA_DIRECTION_INPUT];
-
-	if (p->spa_buffers[p->current_buffer_id]->datas[0].type == SPA_DATA_MemPtr) {
-		struct vulkan_buffer *vk_buf = &p->buffers[p->current_buffer_id];
-		struct spa_buffer *spa_buf = p->spa_buffers[p->current_buffer_id];
-		VkBufferImageCopy copy;
+	if (p->buffer_type == SPA_DATA_MemPtr) {
+		struct spa_buffer *spa_buf = p->spa_buffers[pass->in_buffer_id];
 		struct vulkan_write_pixels_info writeInfo = {
 			.data = spa_buf->datas[0].data,
 			.offset = 0,
@@ -67,22 +48,19 @@ static int runImportSHMBuffers(struct vulkan_blit_state *s) {
 			.bytes_per_pixel = p->bpp,
 			.size.width = p->dim.width,
 			.size.height = p->dim.height,
-			.copies = &copy,
+			.copies = &pass->in_copy,
 		};
-		CHECK(vulkan_write_pixels(&s->base, &writeInfo, &s->staging_buffer));
-
-		vkCmdCopyBufferToImage(s->commandBuffer, s->staging_buffer.buffer, vk_buf->image,
-				VK_IMAGE_LAYOUT_GENERAL, 1, &copy);
+		CHECK(vulkan_write_pixels(&s->base, &writeInfo, &pass->in_staging_buffer));
 	}
 
 	return 0;
 }
 
-static int runExportSHMBuffers(struct vulkan_blit_state *s) {
-	struct vulkan_stream *p = &s->streams[SPA_DIRECTION_OUTPUT];
+static int runExportSHMBuffers(struct vulkan_blit_state *s, struct vulkan_pass *pass) {
+	struct vulkan_stream *p = &s->streams[pass->out_stream_id];
 
-	if (p->spa_buffers[p->current_buffer_id]->datas[0].type == SPA_DATA_MemPtr) {
-		struct spa_buffer *spa_buf = p->spa_buffers[p->current_buffer_id];
+	if (p->buffer_type == SPA_DATA_MemPtr) {
+		struct spa_buffer *spa_buf = p->spa_buffers[pass->out_buffer_id];
 		struct vulkan_read_pixels_info readInfo = {
 			.data = spa_buf->datas[0].data,
 			.offset = 0,
@@ -91,19 +69,51 @@ static int runExportSHMBuffers(struct vulkan_blit_state *s) {
 			.size.width = p->dim.width,
 			.size.height = p->dim.height,
 		};
-		CHECK(vulkan_read_pixels(&s->base, &readInfo, &p->buffers[p->current_buffer_id]));
+		CHECK(vulkan_read_pixels(&s->base, &readInfo, &p->buffers[pass->out_buffer_id]));
 	}
 
 	return 0;
 }
 
-/** runCommandBuffer
- *  The return value of this functions means the following:
- *  ret < 0: Error
- *  ret = 0: queueSubmit was succsessful, but manual synchronization is required
- *  ret = 1: queueSubmit was succsessful and buffers can be released without synchronization
- */
-static int runCommandBuffer(struct vulkan_blit_state *s)
+static int runImportSync(struct vulkan_blit_state *s, struct vulkan_pass *pass)
+{
+	int ret = 0;
+	for (uint32_t i = 0; i < s->n_streams; i++) {
+		struct vulkan_stream *p = &s->streams[i];
+		uint32_t current_buffer_id = GET_BUFFER_ID_FROM_STREAM(p, pass);
+		struct vulkan_buffer *current_buffer = &p->buffers[current_buffer_id];
+
+		if (p->buffer_type != SPA_DATA_DmaBuf)
+			continue;
+
+		if (vulkan_buffer_import_implicit_syncfd(&s->base, current_buffer) >= 0)
+			continue;
+		if (vulkan_buffer_wait_dmabuf_fence(&s->base, current_buffer) < 0) {
+			spa_log_warn(s->log, "Failed to wait for foreign buffer DMA-BUF fence");
+			ret = -1;
+		}
+	}
+	return ret;
+}
+
+static int runExportSync(struct vulkan_blit_state *s, struct vulkan_pass *pass)
+{
+	int ret = 0;
+	for (uint32_t i = 0; i < s->n_streams; i++) {
+		struct vulkan_stream *p = &s->streams[i];
+
+		if (p->buffer_type != SPA_DATA_DmaBuf)
+			continue;
+
+		if (!vulkan_sync_export_dmabuf(&s->base, &p->buffers[GET_BUFFER_ID_FROM_STREAM(p, pass)], pass->sync_fd)) {
+			ret = -1;
+		}
+	}
+
+	return ret;
+}
+
+static int runCommandBuffer(struct vulkan_blit_state *s, struct vulkan_pass *pass)
 {
 	VULKAN_INSTANCE_FUNCTION(vkQueueSubmit2KHR);
 	VULKAN_INSTANCE_FUNCTION(vkGetSemaphoreFdKHR);
@@ -112,16 +122,39 @@ static int runCommandBuffer(struct vulkan_blit_state *s)
 		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO,
 		.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT,
 	};
-	VK_CHECK_RESULT(vkBeginCommandBuffer(s->commandBuffer, &beginInfo));
-
-	CHECK(runImportSHMBuffers(s));
+	VK_CHECK_RESULT(vkBeginCommandBuffer(pass->commandBuffer, &beginInfo));
 
 	uint32_t i;
-	struct vulkan_stream *stream_input = &s->streams[SPA_DIRECTION_INPUT];
-	struct vulkan_stream *stream_output = &s->streams[SPA_DIRECTION_OUTPUT];
+	struct vulkan_stream *stream_input = &s->streams[pass->in_stream_id];
+	struct vulkan_stream *stream_output = &s->streams[pass->out_stream_id];
 
-	VkImage src_image = stream_input->buffers[stream_input->current_buffer_id].image;
-	VkImage dst_image = stream_output->buffers[stream_output->current_buffer_id].image;
+	VkImage src_image = stream_input->buffers[pass->in_buffer_id].image;
+	VkImage dst_image = stream_output->buffers[pass->out_buffer_id].image;
+
+	if (stream_input->buffer_type == SPA_DATA_MemPtr) {
+		vkCmdCopyBufferToImage(pass->commandBuffer, pass->in_staging_buffer.buffer, src_image,
+				VK_IMAGE_LAYOUT_GENERAL, 1, &pass->in_copy);
+
+		VkImageMemoryBarrier copy_barrier = {
+			.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER,
+			.srcQueueFamilyIndex = s->base.queueFamilyIndex,
+			.dstQueueFamilyIndex = s->base.queueFamilyIndex,
+			.image = src_image,
+			.oldLayout = VK_IMAGE_LAYOUT_GENERAL,
+			.newLayout = VK_IMAGE_LAYOUT_GENERAL,
+			.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT,
+			.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT,
+			.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
+			.subresourceRange.levelCount = 1,
+			.subresourceRange.layerCount = 1,
+		};
+
+		vkCmdPipelineBarrier(pass->commandBuffer,
+					VK_PIPELINE_STAGE_TRANSFER_BIT,
+					VK_PIPELINE_STAGE_TRANSFER_BIT,
+					0, 0, NULL, 0, NULL,
+					1, &copy_barrier);
+	}
 
 	VkImageBlit imageBlitRegion = {
 		.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
@@ -145,9 +178,9 @@ static int runCommandBuffer(struct vulkan_blit_state *s)
 		}
 	};
 	spa_log_trace_fp(s->log, "Blitting from (%p, %d, %d) %d,%dx%d,%d to (%p, %d, %d) %d,%dx%d,%d",
-			stream_input, stream_input->current_buffer_id, stream_input->direction, 0, 0, stream_input->dim.width, stream_input->dim.height,
-			stream_output, stream_output->current_buffer_id, stream_output->direction, 0, 0, stream_output->dim.width, stream_output->dim.height);
-	vkCmdBlitImage(s->commandBuffer, src_image, VK_IMAGE_LAYOUT_GENERAL,
+			stream_input, pass->in_buffer_id, stream_input->direction, 0, 0, stream_input->dim.width, stream_input->dim.height,
+			stream_output, pass->out_buffer_id, stream_output->direction, 0, 0, stream_output->dim.width, stream_output->dim.height);
+	vkCmdBlitImage(pass->commandBuffer, src_image, VK_IMAGE_LAYOUT_GENERAL,
 			dst_image, VK_IMAGE_LAYOUT_GENERAL,
 			1, &imageBlitRegion, VK_FILTER_NEAREST);
 
@@ -160,14 +193,18 @@ static int runCommandBuffer(struct vulkan_blit_state *s)
 
 	for (i = 0; i < s->n_streams; i++) {
 		struct vulkan_stream *p = &s->streams[i];
-		struct vulkan_buffer *current_buffer = &p->buffers[p->current_buffer_id];
-		struct spa_buffer *current_spa_buffer = p->spa_buffers[p->current_buffer_id];
+		struct vulkan_buffer *current_buffer = &p->buffers[GET_BUFFER_ID_FROM_STREAM(p, pass)];
 
 		VkAccessFlags access_flags;
+		VkAccessFlags release_flags;
 		if (p->direction == SPA_DIRECTION_INPUT) {
-			access_flags = VK_ACCESS_TRANSFER_READ_BIT;
+			access_flags = p->buffer_type == SPA_DATA_DmaBuf
+				? VK_ACCESS_TRANSFER_READ_BIT
+				: VK_ACCESS_TRANSFER_WRITE_BIT;
+			release_flags = VK_ACCESS_TRANSFER_READ_BIT;
 		} else {
 			access_flags = VK_ACCESS_TRANSFER_WRITE_BIT;
+			release_flags = VK_ACCESS_TRANSFER_WRITE_BIT;
 		}
 
 		acquire_barrier[i]= (VkImageMemoryBarrier) {
@@ -191,65 +228,46 @@ static int runCommandBuffer(struct vulkan_blit_state *s)
 			.image = current_buffer->image,
 			.oldLayout = VK_IMAGE_LAYOUT_GENERAL,
 			.newLayout = VK_IMAGE_LAYOUT_GENERAL,
-			.srcAccessMask = access_flags,
+			.srcAccessMask = release_flags,
 			.dstAccessMask = 0,
 			.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT,
 			.subresourceRange.levelCount = 1,
 			.subresourceRange.layerCount = 1,
 		};
 
-		if (current_spa_buffer->datas[0].type != SPA_DATA_DmaBuf)
-			continue;
-
-		if (vulkan_sync_foreign_dmabuf(&s->base, current_buffer) < 0) {
-			spa_log_warn(s->log, "Failed to wait for foreign buffer DMA-BUF fence");
-		} else {
-			if (current_buffer->foreign_semaphore != VK_NULL_HANDLE) {
-				semaphore_wait_info[semaphore_wait_info_len++] = (VkSemaphoreSubmitInfo) {
-					.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-					.semaphore = current_buffer->foreign_semaphore,
-					.stageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
-				};
-			}
+		if (current_buffer->foreign_semaphore != VK_NULL_HANDLE) {
+			semaphore_wait_info[semaphore_wait_info_len++] = (VkSemaphoreSubmitInfo) {
+				.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
+				.semaphore = current_buffer->foreign_semaphore,
+				.stageMask = VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
+			};
 		}
 	}
 
-        vkCmdPipelineBarrier(s->commandBuffer,
+        vkCmdPipelineBarrier(pass->commandBuffer,
 				VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
 				VK_PIPELINE_STAGE_2_TRANSFER_BIT,
 				0, 0, NULL, 0, NULL,
 				s->n_streams, acquire_barrier);
 
-        vkCmdPipelineBarrier(s->commandBuffer,
+        vkCmdPipelineBarrier(pass->commandBuffer,
 				VK_PIPELINE_STAGE_ALL_COMMANDS_BIT,
 				VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
 				0, 0, NULL, 0, NULL,
 				s->n_streams, release_barrier);
 
-	VK_CHECK_RESULT(vkEndCommandBuffer(s->commandBuffer));
+	VK_CHECK_RESULT(vkEndCommandBuffer(pass->commandBuffer));
 
-	VK_CHECK_RESULT(vkResetFences(s->base.device, 1, &s->fence));
-
-	if (s->pipelineSemaphore == VK_NULL_HANDLE) {
-		VkExportSemaphoreCreateInfo export_info = {
-			.sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
-			.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
-		};
-		VkSemaphoreCreateInfo semaphore_info = {
-			.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
-			.pNext = &export_info,
-		};
-		VK_CHECK_RESULT(vkCreateSemaphore(s->base.device, &semaphore_info, NULL, &s->pipelineSemaphore));
-	}
+	VK_CHECK_RESULT(vkResetFences(s->base.device, 1, &pass->fence));
 
 	semaphore_signal_info[semaphore_signal_info_len++] = (VkSemaphoreSubmitInfo) {
 		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SUBMIT_INFO,
-		.semaphore = s->pipelineSemaphore,
+		.semaphore = pass->pipelineSemaphore,
 	};
 
 	VkCommandBufferSubmitInfoKHR commandBufferInfo = {
 		.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_SUBMIT_INFO,
-		.commandBuffer = s->commandBuffer,
+		.commandBuffer = pass->commandBuffer,
 	};
 
 	const VkSubmitInfo2KHR submitInfo = {
@@ -261,32 +279,17 @@ static int runCommandBuffer(struct vulkan_blit_state *s)
 		.signalSemaphoreInfoCount = semaphore_signal_info_len,
 		.pSignalSemaphoreInfos = semaphore_signal_info,
 	};
-        VK_CHECK_RESULT(vkQueueSubmit2KHR(s->base.queue, 1, &submitInfo, s->fence));
+        VK_CHECK_RESULT(vkQueueSubmit2KHR(s->base.queue, 1, &submitInfo, pass->fence));
 	s->started = true;
 
 	VkSemaphoreGetFdInfoKHR get_fence_fd_info = {
 		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR,
-		.semaphore = s->pipelineSemaphore,
+		.semaphore = pass->pipelineSemaphore,
 		.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
 	};
-	int sync_file_fd = -1;
-	VK_CHECK_RESULT(vkGetSemaphoreFdKHR(s->base.device, &get_fence_fd_info, &sync_file_fd));
+	VK_CHECK_RESULT(vkGetSemaphoreFdKHR(s->base.device, &get_fence_fd_info, &pass->sync_fd));
 
-	int ret = 1;
-	for (uint32_t i = 0; i < s->n_streams; i++) {
-		struct vulkan_stream *p = &s->streams[i];
-		struct spa_buffer *current_spa_buffer = p->spa_buffers[p->current_buffer_id];
-
-		if (current_spa_buffer->datas[0].type != SPA_DATA_DmaBuf)
-			continue;
-
-		if (!vulkan_sync_export_dmabuf(&s->base, &p->buffers[p->current_buffer_id], sync_file_fd)) {
-			ret = 0;
-		}
-	}
-	close(sync_file_fd);
-
-	return ret;
+	return 0;
 }
 
 static void clear_buffers(struct vulkan_blit_state *s, struct vulkan_stream *p)
@@ -298,10 +301,8 @@ static void clear_buffers(struct vulkan_blit_state *s, struct vulkan_stream *p)
 		p->spa_buffers[i] = NULL;
 	}
 	p->n_buffers = 0;
-	if (p->direction == SPA_DIRECTION_INPUT) {
-		vulkan_staging_buffer_destroy(&s->base, &s->staging_buffer);
-		s->staging_buffer.buffer = VK_NULL_HANDLE;
-	}
+	p->buffer_type = SPA_DATA_Invalid;
+	p->maxsize = 0;
 }
 
 static void clear_streams(struct vulkan_blit_state *s)
@@ -382,6 +383,15 @@ int spa_vulkan_blit_use_buffers(struct vulkan_blit_state *s, struct vulkan_strea
 	bool alloc = flags & SPA_NODE_BUFFERS_FLAG_ALLOC;
 	int ret;
 	for (uint32_t i = 0; i < n_buffers; i++) {
+		if (p->buffer_type == SPA_DATA_Invalid) {
+			p->buffer_type = buffers[i]->datas->type;
+		} else {
+			if (p->buffer_type != buffers[i]->datas->type) {
+				spa_log_error(s->log, "Buffers are of different type %d:%d", p->buffer_type, buffers[i]->datas[0].type);
+				return -1;
+			}
+		}
+		p->maxsize = SPA_MAX(p->maxsize, buffers[i]->datas[0].maxsize);
 		externalBufferInfo.usage = p->direction == SPA_DIRECTION_OUTPUT
 			? VK_IMAGE_USAGE_TRANSFER_DST_BIT
 			: VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
@@ -417,13 +427,6 @@ int spa_vulkan_blit_use_buffers(struct vulkan_blit_state *s, struct vulkan_strea
 		}
 		p->spa_buffers[i] = buffers[i];
 		p->n_buffers++;
-	}
-	if (p->direction == SPA_DIRECTION_INPUT && buffers[0]->datas[0].type == SPA_DATA_MemPtr) {
-		ret = vulkan_staging_buffer_create(&s->base, buffers[0]->datas[0].maxsize, &s->staging_buffer);
-		if (ret < 0) {
-			spa_log_error(s->log, "Failed to create staging buffer");
-			return ret;
-		}
 	}
 
 	return 0;
@@ -480,9 +483,79 @@ static int vulkan_stream_init(struct vulkan_stream *stream, enum spa_direction d
 {
 	spa_zero(*stream);
 	stream->direction = direction;
-	stream->current_buffer_id = SPA_ID_INVALID;
-	stream->busy_buffer_id = SPA_ID_INVALID;
-	stream->ready_buffer_id = SPA_ID_INVALID;
+	stream->maxsize = 0;
+	return 0;
+}
+
+int spa_vulkan_blit_init_pass(struct vulkan_blit_state *s, struct vulkan_pass *pass)
+{
+	pass->in_buffer_id = SPA_ID_INVALID;
+	pass->in_stream_id = SPA_ID_INVALID;
+	pass->out_buffer_id = SPA_ID_INVALID;
+	pass->out_stream_id = SPA_ID_INVALID;
+
+	pass->sync_fd = -1;
+
+	CHECK(vulkan_fence_create(&s->base, &pass->fence));
+	CHECK(vulkan_commandBuffer_create(&s->base, s->commandPool, &pass->commandBuffer));
+
+	VkExportSemaphoreCreateInfo export_info = {
+		.sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO,
+		.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT,
+	};
+	VkSemaphoreCreateInfo semaphore_info = {
+		.sType = VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO,
+		.pNext = &export_info,
+	};
+	VK_CHECK_RESULT(vkCreateSemaphore(s->base.device, &semaphore_info, NULL, &pass->pipelineSemaphore));
+
+	for (uint32_t i = 0; i < s->n_streams; i++) {
+		struct vulkan_stream *p = &s->streams[i];
+
+		if (p->direction == SPA_DIRECTION_OUTPUT || p->buffer_type != SPA_DATA_MemPtr)
+			continue;
+		vulkan_staging_buffer_create(&s->base, p->maxsize, &pass->in_staging_buffer);
+	}
+
+	return 0;
+}
+
+int spa_vulkan_blit_reset_pass(struct vulkan_blit_state *s, struct vulkan_pass *pass)
+{
+	pass->in_buffer_id = SPA_ID_INVALID;
+	pass->in_stream_id = SPA_ID_INVALID;
+	pass->out_buffer_id = SPA_ID_INVALID;
+	pass->out_stream_id = SPA_ID_INVALID;
+
+	if (pass->sync_fd != -1) {
+		close(pass->sync_fd);
+		pass->sync_fd = -1;
+	}
+
+	return 0;
+}
+
+int spa_vulkan_blit_clear_pass(struct vulkan_blit_state *s, struct vulkan_pass *pass)
+{
+	pass->in_buffer_id = SPA_ID_INVALID;
+	pass->in_stream_id = SPA_ID_INVALID;
+	pass->out_buffer_id = SPA_ID_INVALID;
+	pass->out_stream_id = SPA_ID_INVALID;
+
+	if (pass->sync_fd != -1) {
+		close(pass->sync_fd);
+		pass->sync_fd = -1;
+	}
+
+	vkDestroyFence(s->base.device, pass->fence, NULL);
+	pass->fence = VK_NULL_HANDLE;
+	vkFreeCommandBuffers(s->base.device, s->commandPool, 1, &pass->commandBuffer);
+	pass->commandBuffer = VK_NULL_HANDLE;
+	vkDestroySemaphore(s->base.device, pass->pipelineSemaphore, NULL);
+	pass->pipelineSemaphore = VK_NULL_HANDLE;
+	vulkan_staging_buffer_destroy(&s->base, &pass->in_staging_buffer);
+	pass->in_staging_buffer.buffer = VK_NULL_HANDLE;
+
 	return 0;
 }
 
@@ -495,9 +568,7 @@ int spa_vulkan_blit_init_stream(struct vulkan_blit_state *s, struct vulkan_strea
 int spa_vulkan_blit_prepare(struct vulkan_blit_state *s)
 {
 	if (!s->prepared) {
-		CHECK(vulkan_fence_create(&s->base, &s->fence));
 		CHECK(vulkan_commandPool_create(&s->base, &s->commandPool));
-		CHECK(vulkan_commandBuffer_create(&s->base, s->commandPool, &s->commandBuffer));
 		s->prepared = true;
 	}
 	return 0;
@@ -507,7 +578,6 @@ int spa_vulkan_blit_unprepare(struct vulkan_blit_state *s)
 {
 	if (s->prepared) {
 		vkDestroyCommandPool(s->base.device, s->commandPool, NULL);
-		vkDestroyFence(s->base.device, s->fence, NULL);
 		s->prepared = false;
 	}
 	return 0;
@@ -515,14 +585,6 @@ int spa_vulkan_blit_unprepare(struct vulkan_blit_state *s)
 
 int spa_vulkan_blit_start(struct vulkan_blit_state *s)
 {
-	uint32_t i;
-
-	for (i = 0; i < s->n_streams; i++) {
-		struct vulkan_stream *p = &s->streams[i];
-		p->current_buffer_id = SPA_ID_INVALID;
-		p->busy_buffer_id = SPA_ID_INVALID;
-		p->ready_buffer_id = SPA_ID_INVALID;
-	}
 	return 0;
 }
 
@@ -534,30 +596,7 @@ int spa_vulkan_blit_stop(struct vulkan_blit_state *s)
 	return 0;
 }
 
-int spa_vulkan_blit_ready(struct vulkan_blit_state *s)
-{
-	uint32_t i;
-	VkResult result;
-
-	if (!s->started)
-		return 0;
-
-	result = vkGetFenceStatus(s->base.device, s->fence);
-	if (result == VK_NOT_READY)
-		return -EBUSY;
-	VK_CHECK_RESULT(result);
-
-	s->started = false;
-
-	for (i = 0; i < s->n_streams; i++) {
-		struct vulkan_stream *p = &s->streams[i];
-		p->ready_buffer_id = p->busy_buffer_id;
-		p->busy_buffer_id = SPA_ID_INVALID;
-	}
-	return 0;
-}
-
-int spa_vulkan_blit_process(struct vulkan_blit_state *s)
+int spa_vulkan_blit_process(struct vulkan_blit_state *s, struct vulkan_pass *pass)
 {
 	if (!s->initialized) {
 		spa_log_warn(s->log, "Renderer not initialized");
@@ -567,10 +606,14 @@ int spa_vulkan_blit_process(struct vulkan_blit_state *s)
 		spa_log_warn(s->log, "Renderer not prepared");
 		return -1;
 	}
-	CHECK(updateBuffers(s));
-	CHECK(runCommandBuffer(s));
+	CHECK(runImportSync(s, pass));
+	CHECK(runImportSHMBuffers(s, pass));
+	CHECK(runCommandBuffer(s, pass));
+	if (pass->sync_fd != -1) {
+		runExportSync(s, pass);
+	}
 	CHECK(vulkan_wait_idle(&s->base));
-	CHECK(runExportSHMBuffers(s));
+	CHECK(runExportSHMBuffers(s, pass));
 
 	return 0;
 }

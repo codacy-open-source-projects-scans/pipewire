@@ -692,14 +692,18 @@ static int do_port_set_io(struct impl *impl,
 			direction == SPA_DIRECTION_INPUT ? "input" : "output",
 			port_id, mix_id, data, size);
 
-	port = GET_PORT(impl, direction, port_id);
-	if (port == NULL)
-		return data == NULL ? 0 : -EINVAL;
-
-	if ((mix = find_mix(port, mix_id)) == NULL)
-		return -EINVAL;
-
 	old = pw_mempool_find_tag(impl->client_pool, tag, sizeof(tag));
+
+	port = GET_PORT(impl, direction, port_id);
+	if (port == NULL) {
+		pw_memmap_free(old);
+		return data == NULL ? 0 : -EINVAL;
+	}
+
+	if ((mix = find_mix(port, mix_id)) == NULL) {
+		pw_memmap_free(old);
+		return -EINVAL;
+	}
 
 	if (data) {
 		mm = pw_mempool_import_map(impl->client_pool,
@@ -851,9 +855,12 @@ do_port_use_buffers(struct impl *impl,
 			switch (d->type) {
 			case SPA_DATA_DmaBuf:
 			case SPA_DATA_MemFd:
+			case SPA_DATA_GenericFd:
 			{
 				uint32_t flags = PW_MEMBLOCK_FLAG_DONT_CLOSE;
 
+				if (!(d->flags & SPA_DATA_FLAG_MAPPABLE))
+					flags |= PW_MEMBLOCK_FLAG_UNMAPPABLE;
 				if (d->flags & SPA_DATA_FLAG_READABLE)
 					flags |= PW_MEMBLOCK_FLAG_READABLE;
 				if (d->flags & SPA_DATA_FLAG_WRITABLE)
@@ -1080,16 +1087,27 @@ static int client_node_port_buffers(void *data,
 		for (j = 0; j < b->buffer.n_datas; j++) {
 			struct spa_chunk *oldchunk = oldbuf->datas[j].chunk;
 			struct spa_data *d = &newbuf->datas[j];
+			uint32_t flags = d->flags;
+
+			if (d->type == SPA_DATA_MemFd &&
+			    !SPA_FLAG_IS_SET(flags, SPA_DATA_FLAG_MAPPABLE)) {
+				spa_log_debug(impl->log, "buffer:%d data:%d has non mappable MemFd, "
+						"fixing to ensure backwards compatibility.",
+						i, j);
+				flags |= SPA_DATA_FLAG_MAPPABLE;
+			}
 
 			/* overwrite everything except the chunk */
 			oldbuf->datas[j] = *d;
+			oldbuf->datas[j].flags = flags;
 			oldbuf->datas[j].chunk = oldchunk;
 
 			b->datas[j].type = d->type;
+			b->datas[j].flags = flags;
 			b->datas[j].fd = d->fd;
 
 			spa_log_debug(impl->log, " data %d type:%d fl:%08x fd:%d, offs:%d max:%d",
-					j, d->type, d->flags, (int) d->fd, d->mapoffset,
+					j, d->type, flags, (int) d->fd, d->mapoffset,
 					d->maxsize);
 		}
 	}
@@ -1338,8 +1356,8 @@ static int add_area(struct impl *impl)
 
 	area = pw_mempool_alloc(impl->context_pool,
 			PW_MEMBLOCK_FLAG_READWRITE |
-			PW_MEMBLOCK_FLAG_MAP |
-			PW_MEMBLOCK_FLAG_SEAL,
+			PW_MEMBLOCK_FLAG_SEAL |
+			PW_MEMBLOCK_FLAG_MAP,
 			SPA_DATA_MemFd, size);
 	if (area == NULL)
                 return -errno;
@@ -1511,7 +1529,7 @@ impl_mix_port_enum_params(void *object, int seq,
 	if (port->direction != direction)
 		return -ENOTSUP;
 
-	return impl_node_port_enum_params(&port->impl->node, seq, direction, port->id,
+	return impl_node_port_enum_params(port->impl, seq, direction, port->id,
 			id, start, num, filter);
 }
 
@@ -1583,7 +1601,7 @@ static int
 impl_mix_port_reuse_buffer(void *object, uint32_t port_id, uint32_t buffer_id)
 {
 	struct port *p = object;
-	return impl_node_port_reuse_buffer(&p->impl->node, p->id, buffer_id);
+	return impl_node_port_reuse_buffer(p->impl, p->id, buffer_id);
 }
 
 static int impl_mix_process(void *object)

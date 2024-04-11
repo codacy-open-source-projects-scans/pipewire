@@ -790,7 +790,7 @@ static void fetch_bind_ctls(struct state *state)
 	for (unsigned int i = 0; i < state->num_bind_ctls; i++) {
 		unsigned int numid = 0;
 
-		for (unsigned int j = 0; i < elem_count; j++) {
+		for (unsigned int j = 0; j < elem_count; j++) {
 			const char* element_name = snd_ctl_elem_list_get_name(element_list, j);
 
 			if (!strcmp(element_name, state->bound_ctls[i].name)) {
@@ -1939,7 +1939,10 @@ static void recalc_headroom(struct state *state)
 		if (state->stream == SND_PCM_STREAM_CAPTURE)
 			state->headroom = SPA_MAX(state->headroom, 32u);
 	}
-	state->headroom = SPA_MIN(state->headroom, state->buffer_frames);
+	if (SPA_LIKELY(state->buffer_frames >= state->threshold))
+		state->headroom = SPA_MIN(state->headroom, state->buffer_frames - state->threshold);
+	else
+		state->headroom = 0;
 
 	latency = SPA_MAX(state->min_delay, SPA_MIN(state->max_delay, state->headroom));
 	if (rate != 0 && state->rate != 0)
@@ -2333,14 +2336,15 @@ static int set_swparams(struct state *state)
 	CHECK(snd_pcm_sw_params_set_start_threshold(hndl, params, LONG_MAX), "set_start_threshold");
 
 	if (state->disable_tsched) {
-		snd_pcm_uframes_t avail_min;
+		snd_pcm_uframes_t avail_min = 0;
 
 		if (state->stream == SND_PCM_STREAM_PLAYBACK) {
 			/* wake up when buffer has target frames or less data (will underrun soon) */
-			avail_min = state->buffer_frames - state->threshold;
+			if (state->buffer_frames >= (state->threshold + state->headroom))
+				avail_min = state->buffer_frames - (state->threshold + state->headroom);
 		} else {
 			/* wake up when there's target frames or more (enough for us to read and push a buffer) */
-			avail_min = state->threshold;
+			avail_min = SPA_MIN(state->threshold + state->headroom, state->buffer_frames);
 		}
 
 		CHECK(snd_pcm_sw_params_set_avail_min(hndl, params, avail_min), "set_avail_min");
@@ -2493,7 +2497,7 @@ static inline int do_start(struct state *state)
 	return 0;
 }
 
-static inline int check_position_config(struct state *state);
+static inline int check_position_config(struct state *state, bool starting);
 
 static int alsa_recover(struct state *state)
 {
@@ -2560,7 +2564,7 @@ recover:
 	spa_list_for_each(follower, &driver->rt.followers, rt.driver_link) {
 		if (follower != driver && follower->linked) {
 			do_drop(follower);
-			check_position_config(follower);
+			check_position_config(follower, false);
 		}
 	}
 	do_prepare(driver);
@@ -2805,7 +2809,7 @@ static void update_sources(struct state *state, bool active)
 	}
 }
 
-static inline int check_position_config(struct state *state)
+static inline int check_position_config(struct state *state, bool starting)
 {
 	uint64_t target_duration;
 	struct spa_fraction target_rate;
@@ -2815,7 +2819,7 @@ static inline int check_position_config(struct state *state)
 		return 0;
 
 	if (state->force_position ||
-	    (state->disable_tsched && state->started && !state->following)) {
+	    (state->disable_tsched && (starting || state->started) && !state->following)) {
 		target_duration = state->period_frames;
 		target_rate = SPA_FRACTION(1, state->rate);
 		pos->clock.target_duration = target_duration;
@@ -2851,7 +2855,7 @@ static int alsa_write_sync(struct state *state, uint64_t current_time)
 	snd_pcm_uframes_t avail, delay, target;
 	bool following = state->following;
 
-	if (SPA_UNLIKELY((res = check_position_config(state)) < 0))
+	if (SPA_UNLIKELY((res = check_position_config(state, false)) < 0))
 		return res;
 
 	if (SPA_UNLIKELY((res = get_status(state, current_time, &avail, &delay, &target)) < 0)) {
@@ -3112,7 +3116,7 @@ static int alsa_read_sync(struct state *state, uint64_t current_time)
 	if (SPA_UNLIKELY(!state->alsa_started))
 		return 0;
 
-	if (SPA_UNLIKELY((res = check_position_config(state)) < 0))
+	if (SPA_UNLIKELY((res = check_position_config(state, false)) < 0))
 		return res;
 
 	if (SPA_UNLIKELY((res = get_status(state, current_time, &avail, &delay, &target)) < 0)) {
@@ -3516,7 +3520,7 @@ int spa_alsa_prepare(struct state *state)
 	if (state->prepared)
 		return 0;
 
-	if (check_position_config(state) < 0) {
+	if (check_position_config(state, true) < 0) {
 		spa_log_error(state->log, "%s: invalid position config", state->name);
 		return -EIO;
 	}
@@ -3599,16 +3603,17 @@ int spa_alsa_start(struct state *state)
 			return err;
 	}
 
-	state->started = true;
-	spa_loop_invoke(state->data_loop, do_state_sync, 0, NULL, 0, true, state);
-
 	/* playback will start after first write. Without tsched, we start
 	 * right away so that the fds become active in poll right away. */
 	if (state->stream == SND_PCM_STREAM_PLAYBACK) {
-		if (state->disable_tsched)
+		if (state->disable_tsched || state->start_delay > 0)
 			if ((err = do_start(state)) < 0)
 				return err;
 	}
+
+	state->started = true;
+	spa_loop_invoke(state->data_loop, do_state_sync, 0, NULL, 0, true, state);
+
 	return 0;
 }
 

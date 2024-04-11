@@ -229,6 +229,8 @@ void pw_settings_init(struct pw_context *this)
 	d->check_quantum = get_default_bool(p, "settings.check-quantum", DEFAULT_CHECK_QUANTUM);
 	d->check_rate = get_default_bool(p, "settings.check-rate", DEFAULT_CHECK_RATE);
 
+	d->link_max_buffers = SPA_MAX(d->link_max_buffers, 1u);
+
 	d->clock_quantum_limit = SPA_CLAMP(d->clock_quantum_limit,
 			CLOCK_QUANTUM_FLOOR, CLOCK_QUANTUM_LIMIT);
 	d->clock_quantum_floor = SPA_CLAMP(d->clock_quantum_floor,

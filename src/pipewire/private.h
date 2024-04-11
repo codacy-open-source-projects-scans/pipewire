@@ -526,6 +526,7 @@ static inline void pw_node_activation_state_reset(struct pw_node_activation_stat
 }
 
 #define pw_node_activation_state_dec(s) (SPA_ATOMIC_DEC(s->pending) == 0)
+#define pw_node_activation_state_xchg(s) SPA_ATOMIC_XCHG(s->pending, 0)
 
 struct pw_node_target {
 	struct spa_list link;
@@ -1248,6 +1249,8 @@ int pw_impl_node_update_ports(struct pw_impl_node *node);
 int pw_impl_node_set_driver(struct pw_impl_node *node, struct pw_impl_node *driver);
 
 int pw_impl_node_trigger(struct pw_impl_node *node);
+
+int pw_impl_node_set_io(struct pw_impl_node *node, uint32_t id, void *data, size_t size);
 
 /** Prepare a link
   * Starts the negotiation of formats and buffers on \a link */

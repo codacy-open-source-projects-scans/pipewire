@@ -29,7 +29,6 @@ struct impl {
 	lc3_encoder_t enc[LC3_MAX_CHANNELS];
 	lc3_decoder_t dec[LC3_MAX_CHANNELS];
 
-	int mtu;
 	int samplerate;
 	int channels;
 	int frame_dus;
@@ -466,7 +465,10 @@ static bool select_config(bap_lc3_t *conf, const struct pac_data *pac,	struct sp
 	}
 
 	/*
-	 * Select supported rate + frame length combination
+	 * Select supported rate + frame length combination.
+	 *
+	 * Frame length is not limited by ISO MTU, as kernel will fragment
+	 * and reassemble SDUs as needed.
 	 */
 	if (pac->sink && pac->duplex) {
 		/* 16KHz input is mandatory in BAP v1.0.1 Table 3.5, so prefer
@@ -920,7 +922,6 @@ static void *codec_init(const struct media_codec *codec, uint32_t flags,
 		goto error;
 	}
 
-	this->mtu = mtu;
 	this->samplerate = config_info.info.raw.rate;
 	this->channels = config_info.info.raw.channels;
 	this->framelen = conf.framelen;
@@ -939,13 +940,6 @@ static void *codec_init(const struct media_codec *codec, uint32_t flags,
 
 	spa_log_info(log, "LC3 rate:%d frame_duration:%d channels:%d framelen:%d nblks:%d",
 			this->samplerate, this->frame_dus, this->channels, this->framelen, conf.n_blks);
-
-	if (this->framelen * this->channels * conf.n_blks > this->mtu) {
-		spa_log_error(log, "too big LC3 frame length %u*%u*%u > %u",
-				this->framelen, this->channels, conf.n_blks, this->mtu);
-		res = -EINVAL;
-		goto error;
-	}
 
 	res = lc3_frame_samples(this->frame_dus, this->samplerate);
 	if (res < 0) {
@@ -1014,6 +1008,13 @@ static int codec_get_block_size(void *data)
 	return this->codesize;
 }
 
+static uint64_t codec_get_interval(void *data)
+{
+	struct impl *this = data;
+
+	return (uint64_t)this->frame_dus * 1000;
+}
+
 static int codec_abr_process (void *data, size_t unsent)
 {
 	return -ENOTSUP;
@@ -1054,7 +1055,6 @@ static int codec_encode(void *data,
 
 	processed += this->codesize;
 
-	spa_assert(size <= this->mtu);
 	*need_flush = NEED_FLUSH_ALL;
 
 	return processed;
@@ -1127,6 +1127,7 @@ const struct media_codec bap_codec_lc3 = {
 	.init = codec_init,
 	.deinit = codec_deinit,
 	.get_block_size = codec_get_block_size,
+	.get_interval = codec_get_interval,
 	.abr_process = codec_abr_process,
 	.start_encode = codec_start_encode,
 	.encode = codec_encode,

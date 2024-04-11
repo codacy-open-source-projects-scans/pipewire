@@ -436,6 +436,7 @@ add_video_format (gpointer format_ptr,
   ConvertData *d = user_data;
   struct spa_pod_dynamic_builder b;
   struct spa_pod_frame f;
+  int n_mods;
 
   spa_pod_dynamic_builder_init (&b, NULL, 0, 1024);
 
@@ -450,29 +451,35 @@ add_video_format (gpointer format_ptr,
   spa_pod_builder_prop (&b.b, SPA_FORMAT_VIDEO_format, 0);
   spa_pod_builder_id (&b.b, format);
 
-  if (g_hash_table_size (modifiers) > 0) {
+  n_mods = g_hash_table_size (modifiers);
+  if (n_mods > 0) {
+    struct spa_pod_frame f2;
     GHashTableIter iter;
     gpointer key, value;
+    uint32_t flags, choice_type;
+
+    flags = SPA_POD_PROP_FLAG_MANDATORY;
+    if (n_mods > 1) {
+      choice_type = SPA_CHOICE_Enum;
+      flags |= SPA_POD_PROP_FLAG_DONT_FIXATE;
+    } else {
+      choice_type = SPA_CHOICE_None;
+    }
+
+    spa_pod_builder_prop (&b.b, SPA_FORMAT_VIDEO_modifier, flags);
+    spa_pod_builder_push_choice (&b.b, &f2, choice_type, 0);
 
     g_hash_table_iter_init (&iter, modifiers);
-    if (g_hash_table_size (modifiers) > 1) {
-      struct spa_pod_frame f2;
+    g_hash_table_iter_next (&iter, &key, &value);
+    spa_pod_builder_long (&b.b, (uint64_t) key);
 
-      spa_pod_builder_prop (&b.b, SPA_FORMAT_VIDEO_modifier,
-                            (SPA_POD_PROP_FLAG_MANDATORY | SPA_POD_PROP_FLAG_DONT_FIXATE));
-      spa_pod_builder_push_choice (&b.b, &f2, SPA_CHOICE_Enum, 0);
-      g_hash_table_iter_next (&iter, &key, &value);
-      spa_pod_builder_long (&b.b, (uint64_t) key);
+    if (n_mods > 1) {
       do {
         spa_pod_builder_long (&b.b, (uint64_t) key);
       } while (g_hash_table_iter_next (&iter, &key, &value));
-      spa_pod_builder_pop (&b.b, &f2);
-    } else {
-      g_hash_table_iter_next (&iter, &key, &value);
-      spa_pod_builder_prop (&b.b, SPA_FORMAT_VIDEO_modifier,
-                            SPA_POD_PROP_FLAG_MANDATORY);
-      spa_pod_builder_long (&b.b, (uint64_t) key);
     }
+
+    spa_pod_builder_pop (&b.b, &f2);
   }
 
   add_limits (&b, d);
@@ -835,7 +842,7 @@ handle_id_prop (const struct spa_pod_prop *prop, const char *key, id_to_string_f
   uint32_t i, n_items, choice;
 
   val = spa_pod_get_values(&prop->value, &n_items, &choice);
-  if (val->type != SPA_TYPE_Id)
+  if (val->type != SPA_TYPE_Id || n_items == 0)
           return;
 
   id = SPA_POD_BODY(val);
@@ -879,9 +886,10 @@ handle_dmabuf_prop (const struct spa_pod_prop *prop,
   uint32_t *id, n_fmts, n_mods, choice, i, j;
   uint64_t *mods;
 
-
   val = spa_pod_get_values (&prop->value, &n_fmts, &choice);
-  if (val->type != SPA_TYPE_Id)
+  if (val->type != SPA_TYPE_Id || n_fmts == 0)
+    return;
+  if (choice != SPA_CHOICE_None && choice != SPA_CHOICE_Enum)
     return;
 
   id = SPA_POD_BODY (val);
@@ -890,9 +898,13 @@ handle_dmabuf_prop (const struct spa_pod_prop *prop,
     id++;
   }
 
-  pod_modifier = &prop_modifier->value;
-  mods = SPA_POD_CHOICE_VALUES (pod_modifier);
-  n_mods = SPA_POD_CHOICE_N_VALUES (pod_modifier);
+  pod_modifier = spa_pod_get_values (&prop_modifier->value, &n_mods, &choice);
+  if (pod_modifier->type != SPA_TYPE_Long || n_mods == 0)
+    return;
+  if (choice != SPA_CHOICE_None && choice != SPA_CHOICE_Enum)
+    return;
+
+  mods = SPA_POD_BODY (pod_modifier);
   if (n_mods > 1) {
     n_mods--;
     mods++;
@@ -979,7 +991,7 @@ handle_int_prop (const struct spa_pod_prop *prop, const char *key, GstCaps *res)
   uint32_t i, n_items, choice;
 
   val = spa_pod_get_values(&prop->value, &n_items, &choice);
-  if (val->type != SPA_TYPE_Int)
+  if (val->type != SPA_TYPE_Int || n_items == 0)
           return;
 
   ints = SPA_POD_BODY(val);
@@ -1023,7 +1035,7 @@ handle_rect_prop (const struct spa_pod_prop *prop, const char *width, const char
   uint32_t i, n_items, choice;
 
   val = spa_pod_get_values(&prop->value, &n_items, &choice);
-  if (val->type != SPA_TYPE_Rectangle)
+  if (val->type != SPA_TYPE_Rectangle || n_items == 0)
           return;
 
   rect = SPA_POD_BODY(val);
@@ -1076,7 +1088,7 @@ handle_fraction_prop (const struct spa_pod_prop *prop, const char *key, GstCaps 
   uint32_t i, n_items, choice;
 
   val = spa_pod_get_values(&prop->value, &n_items, &choice);
-  if (val->type != SPA_TYPE_Fraction)
+  if (val->type != SPA_TYPE_Fraction || n_items == 0)
           return;
 
   fract = SPA_POD_BODY(val);

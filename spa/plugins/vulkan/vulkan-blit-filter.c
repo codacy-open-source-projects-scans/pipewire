@@ -8,6 +8,8 @@
 #include <unistd.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdatomic.h>
+#include <pthread.h>
 
 #include <spa/support/plugin.h>
 #include <spa/support/log.h>
@@ -45,7 +47,13 @@ struct port {
 	struct spa_port_info info;
 
 	enum spa_direction direction;
-	struct spa_param_info params[5];
+#define IDX_EnumFormat	0
+#define IDX_Meta	1
+#define IDX_IO		2
+#define IDX_Format	3
+#define IDX_Buffer	4
+#define N_PORT_PARAMS	5
+	struct spa_param_info params[N_PORT_PARAMS];
 
 	struct spa_io_buffers *io;
 
@@ -70,18 +78,46 @@ struct impl {
 
 	uint64_t info_all;
 	struct spa_node_info info;
-	struct spa_param_info params[2];
+#define IDX_PropInfo	0
+#define IDX_Props	1
+#define N_NODE_PARAMS	2
+	struct spa_param_info params[N_NODE_PARAMS];
 
 	struct spa_hook_list hooks;
 	struct spa_callbacks callbacks;
 
-	bool started;
+	// Synchronization between main and data thread
+	atomic_bool started;
+	pthread_rwlock_t renderlock;
 
 	struct vulkan_blit_state state;
+	struct vulkan_pass pass;
 	struct port port[2];
 };
 
 #define CHECK_PORT(this,d,p)  ((p) < 1)
+
+static int lock_init(struct impl *this)
+{
+	return pthread_rwlock_init(&this->renderlock, NULL);
+}
+
+static void lock_destroy(struct impl *this)
+{
+	pthread_rwlock_destroy(&this->renderlock);
+}
+
+static int lock_renderer(struct impl *this)
+{
+	spa_log_info(this->log, "Lock renderer");
+	return pthread_rwlock_wrlock(&this->renderlock);
+}
+
+static int unlock_renderer(struct impl *this)
+{
+	spa_log_info(this->log, "Unlock renderer");
+	return pthread_rwlock_unlock(&this->renderlock);
+}
 
 static int impl_node_enum_params(void *object, int seq,
 				 uint32_t id, uint32_t start, uint32_t num,
@@ -177,6 +213,7 @@ static int impl_node_send_command(void *object, const struct spa_command *comman
 
 		this->started = true;
 		spa_vulkan_blit_start(&this->state);
+		// The main thread needs to lock the renderer before changing its state
 		break;
 
 	case SPA_NODE_COMMAND_Suspend:
@@ -184,8 +221,11 @@ static int impl_node_send_command(void *object, const struct spa_command *comman
 		if (!this->started)
 			return 0;
 
-		this->started = false;
+		lock_renderer(this);
 		spa_vulkan_blit_stop(&this->state);
+		this->started = false;
+		unlock_renderer(this);
+		// Locking the renderer from the renderer is no longer required
 		break;
 	default:
 		return -ENOTSUP;
@@ -482,12 +522,13 @@ static int clear_buffers(struct impl *this, struct port *port)
 {
 	if (port->n_buffers > 0) {
 		spa_log_debug(this->log, "%p: clear buffers", this);
-		spa_vulkan_blit_stop(&this->state);
+		lock_renderer(this);
 		spa_vulkan_blit_use_buffers(&this->state, &this->state.streams[port->stream_id], 0, &port->current_format, 0, NULL);
+		spa_vulkan_blit_clear_pass(&this->state, &this->pass);
+		unlock_renderer(this);
 		port->n_buffers = 0;
 		spa_list_init(&port->empty);
 		spa_list_init(&port->ready);
-		this->started = false;
 	}
 	return 0;
 }
@@ -592,7 +633,6 @@ static int port_set_format(struct impl *this, struct port *port,
 	if (format == NULL) {
 		port->have_format = false;
 		clear_buffers(this, port);
-		spa_vulkan_blit_unprepare(&this->state);
 	} else {
 		struct spa_video_info info = { 0 };
 
@@ -626,7 +666,7 @@ static int port_set_format(struct impl *this, struct port *port,
 
 		if (modifier_fixed) {
 			port->info.change_mask |= SPA_PORT_CHANGE_MASK_PARAMS;
-			port->params[0].flags ^= SPA_PARAM_INFO_SERIAL;
+			port->params[IDX_EnumFormat].flags ^= SPA_PARAM_INFO_SERIAL;
 			emit_port_info(this, port, false);
 			return 0;
 		}
@@ -634,11 +674,11 @@ static int port_set_format(struct impl *this, struct port *port,
 
 	port->info.change_mask |= SPA_PORT_CHANGE_MASK_PARAMS;
 	if (port->have_format) {
-		port->params[3] = SPA_PARAM_INFO(SPA_PARAM_Format, SPA_PARAM_INFO_READWRITE);
-		port->params[4] = SPA_PARAM_INFO(SPA_PARAM_Buffers, SPA_PARAM_INFO_READ);
+		port->params[IDX_Format] = SPA_PARAM_INFO(SPA_PARAM_Format, SPA_PARAM_INFO_READWRITE);
+		port->params[IDX_Buffer] = SPA_PARAM_INFO(SPA_PARAM_Buffers, SPA_PARAM_INFO_READ);
 	} else {
-		port->params[3] = SPA_PARAM_INFO(SPA_PARAM_Format, SPA_PARAM_INFO_WRITE);
-		port->params[4] = SPA_PARAM_INFO(SPA_PARAM_Buffers, 0);
+		port->params[IDX_Format] = SPA_PARAM_INFO(SPA_PARAM_Format, SPA_PARAM_INFO_WRITE);
+		port->params[IDX_Buffer] = SPA_PARAM_INFO(SPA_PARAM_Buffers, 0);
 	}
 	emit_port_info(this, port, false);
 
@@ -692,6 +732,7 @@ impl_node_port_use_buffers(void *object,
 	if (n_buffers > MAX_BUFFERS)
 		return -ENOSPC;
 
+	lock_renderer(this);
 	for (i = 0; i < n_buffers; i++) {
 		struct buffer *b;
 
@@ -706,6 +747,9 @@ impl_node_port_use_buffers(void *object,
 	}
 	spa_vulkan_blit_use_buffers(&this->state, &this->state.streams[port->stream_id], flags, &port->current_format, n_buffers, buffers);
 	port->n_buffers = n_buffers;
+	if (n_buffers > 0)
+		spa_vulkan_blit_init_pass(&this->state, &this->pass);
+	unlock_renderer(this);
 
 	return 0;
 }
@@ -758,6 +802,7 @@ static int impl_node_process(void *object)
 	struct buffer *b;
 
 	spa_return_val_if_fail(this != NULL, -EINVAL);
+	spa_return_val_if_fail(this->started, -EINVAL);
 
 	inport = &this->port[SPA_DIRECTION_INPUT];
 	if ((inio = inport->io) == NULL)
@@ -787,18 +832,26 @@ static int impl_node_process(void *object)
 		spa_log_debug(this->log, "%p: out of buffers", this);
 		return -EPIPE;
 	}
+
+	if (pthread_rwlock_tryrdlock(&this->renderlock) < 0) {
+		return -EBUSY;
+	}
+
 	b = &inport->buffers[inio->buffer_id];
-	this->state.streams[inport->stream_id].pending_buffer_id = b->id;
+	this->pass.in_stream_id = SPA_DIRECTION_INPUT;
+	this->pass.in_buffer_id = b->id;
 	inio->status = SPA_STATUS_NEED_DATA;
 
 	b = spa_list_first(&outport->empty, struct buffer, link);
 	spa_list_remove(&b->link);
 	SPA_FLAG_SET(b->flags, BUFFER_FLAG_OUT);
-	this->state.streams[outport->stream_id].pending_buffer_id = b->id;
+	this->pass.out_stream_id = SPA_DIRECTION_OUTPUT;
+	this->pass.out_buffer_id = b->id;
 
 	spa_log_debug(this->log, "filter into %d", b->id);
 
-	spa_vulkan_blit_process(&this->state);
+	spa_vulkan_blit_process(&this->state, &this->pass);
+	spa_vulkan_blit_reset_pass(&this->state, &this->pass);
 
 	b->outbuf->datas[0].chunk->offset = 0;
 	b->outbuf->datas[0].chunk->size = b->outbuf->datas[0].maxsize;
@@ -811,6 +864,8 @@ static int impl_node_process(void *object)
 
 	outio->buffer_id = b->id;
 	outio->status = SPA_STATUS_HAVE_DATA;
+
+	pthread_rwlock_unlock(&this->renderlock);
 
 	return SPA_STATUS_NEED_DATA | SPA_STATUS_HAVE_DATA;
 }
@@ -858,7 +913,9 @@ static int impl_clear(struct spa_handle *handle)
 
 	this = (struct impl *) handle;
 
+	spa_vulkan_blit_unprepare(&this->state);
 	spa_vulkan_blit_deinit(&this->state);
+	lock_destroy(this);
 	return 0;
 }
 
@@ -904,10 +961,12 @@ impl_init(const struct spa_handle_factory *factory,
 	this->info.max_output_ports = 1;
 	this->info.max_input_ports = 1;
 	this->info.flags = SPA_NODE_FLAG_RT;
-	this->params[0] = SPA_PARAM_INFO(SPA_PARAM_PropInfo, SPA_PARAM_INFO_READ);
-	this->params[1] = SPA_PARAM_INFO(SPA_PARAM_Props, SPA_PARAM_INFO_READWRITE);
+	this->params[IDX_PropInfo] = SPA_PARAM_INFO(SPA_PARAM_PropInfo, SPA_PARAM_INFO_READ);
+	this->params[IDX_Props] = SPA_PARAM_INFO(SPA_PARAM_Props, SPA_PARAM_INFO_READWRITE);
 	this->info.params = this->params;
-	this->info.n_params = 2;
+	this->info.n_params = N_NODE_PARAMS;
+
+	lock_init(this);
 
 	port = &this->port[SPA_DIRECTION_INPUT];
 	port->stream_id = SPA_DIRECTION_INPUT;
@@ -917,13 +976,13 @@ impl_init(const struct spa_handle_factory *factory,
 			SPA_PORT_CHANGE_MASK_PROPS;
 	port->info = SPA_PORT_INFO_INIT();
 	port->info.flags = SPA_PORT_FLAG_NO_REF;
-	port->params[0] = SPA_PARAM_INFO(SPA_PARAM_EnumFormat, SPA_PARAM_INFO_READ);
-	port->params[1] = SPA_PARAM_INFO(SPA_PARAM_Meta, SPA_PARAM_INFO_READ);
-	port->params[2] = SPA_PARAM_INFO(SPA_PARAM_IO, SPA_PARAM_INFO_READ);
-	port->params[3] = SPA_PARAM_INFO(SPA_PARAM_Format, SPA_PARAM_INFO_WRITE);
-	port->params[4] = SPA_PARAM_INFO(SPA_PARAM_Buffers, 0);
+	port->params[IDX_EnumFormat] = SPA_PARAM_INFO(SPA_PARAM_EnumFormat, SPA_PARAM_INFO_READ);
+	port->params[IDX_Meta] = SPA_PARAM_INFO(SPA_PARAM_Meta, SPA_PARAM_INFO_READ);
+	port->params[IDX_IO] = SPA_PARAM_INFO(SPA_PARAM_IO, SPA_PARAM_INFO_READ);
+	port->params[IDX_Format] = SPA_PARAM_INFO(SPA_PARAM_Format, SPA_PARAM_INFO_WRITE);
+	port->params[IDX_Buffer] = SPA_PARAM_INFO(SPA_PARAM_Buffers, 0);
 	port->info.params = port->params;
-	port->info.n_params = 5;
+	port->info.n_params = N_PORT_PARAMS;
 	spa_vulkan_blit_init_stream(&this->state, &this->state.streams[port->stream_id],
 			SPA_DIRECTION_INPUT, NULL);
 	spa_list_init(&port->empty);
@@ -937,13 +996,13 @@ impl_init(const struct spa_handle_factory *factory,
 			SPA_PORT_CHANGE_MASK_PROPS;
 	port->info = SPA_PORT_INFO_INIT();
 	port->info.flags = SPA_PORT_FLAG_NO_REF | SPA_PORT_FLAG_CAN_ALLOC_BUFFERS;
-	port->params[0] = SPA_PARAM_INFO(SPA_PARAM_EnumFormat, SPA_PARAM_INFO_READ);
-	port->params[1] = SPA_PARAM_INFO(SPA_PARAM_Meta, SPA_PARAM_INFO_READ);
-	port->params[2] = SPA_PARAM_INFO(SPA_PARAM_IO, SPA_PARAM_INFO_READ);
-	port->params[3] = SPA_PARAM_INFO(SPA_PARAM_Format, SPA_PARAM_INFO_WRITE);
-	port->params[4] = SPA_PARAM_INFO(SPA_PARAM_Buffers, 0);
+	port->params[IDX_EnumFormat] = SPA_PARAM_INFO(SPA_PARAM_EnumFormat, SPA_PARAM_INFO_READ);
+	port->params[IDX_Meta] = SPA_PARAM_INFO(SPA_PARAM_Meta, SPA_PARAM_INFO_READ);
+	port->params[IDX_IO] = SPA_PARAM_INFO(SPA_PARAM_IO, SPA_PARAM_INFO_READ);
+	port->params[IDX_Format] = SPA_PARAM_INFO(SPA_PARAM_Format, SPA_PARAM_INFO_WRITE);
+	port->params[IDX_Buffer] = SPA_PARAM_INFO(SPA_PARAM_Buffers, 0);
 	port->info.params = port->params;
-	port->info.n_params = 5;
+	port->info.n_params = N_PORT_PARAMS;
 	spa_list_init(&port->empty);
 	spa_list_init(&port->ready);
 	spa_vulkan_blit_init_stream(&this->state, &this->state.streams[port->stream_id],

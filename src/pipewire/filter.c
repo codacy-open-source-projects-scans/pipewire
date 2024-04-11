@@ -32,8 +32,6 @@ PW_LOG_TOPIC_EXTERN(log_filter);
 
 static bool mlock_warned = false;
 
-static uint32_t mappable_dataTypes = (1<<SPA_DATA_MemFd);
-
 struct buffer {
 	struct pw_buffer this;
 	uint32_t id;
@@ -116,12 +114,6 @@ struct filter {
 	struct spa_node impl_node;
 	struct spa_hook_list hooks;
 	struct spa_callbacks callbacks;
-	struct spa_io_clock *clock;
-	struct spa_io_position *position;
-
-	struct {
-		struct spa_io_position *position;
-	} rt;
 
 	struct spa_list port_list;
 	struct pw_map ports[2];
@@ -153,7 +145,6 @@ struct filter {
 	unsigned int allow_mlock:1;
 	unsigned int warn_mlock:1;
 	unsigned int process_rt:1;
-	unsigned int driving:1;
 	unsigned int trigger:1;
 	int in_emit_param_changed;
 };
@@ -218,7 +209,7 @@ static void fix_datatype(struct spa_pod *param)
 	pw_log_debug("dataType: %u", dataType);
 	if (dataType & (1u << SPA_DATA_MemPtr)) {
 		SPA_POD_VALUE(struct spa_pod_int, &vals[0]) =
-			dataType | mappable_dataTypes;
+			dataType | (1<<SPA_DATA_MemFd);
 		pw_log_debug("Change dataType: %u -> %u", dataType,
 				SPA_POD_VALUE(struct spa_pod_int, &vals[0]));
 	}
@@ -493,38 +484,12 @@ static int impl_set_param(void *object, uint32_t id, uint32_t flags, const struc
 	return 0;
 }
 
-static int
-do_set_position(struct spa_loop *loop,
-		bool async, uint32_t seq, const void *data, size_t size, void *user_data)
-{
-	struct filter *impl = user_data;
-	impl->rt.position = impl->position;
-	return 0;
-}
-
 static int impl_set_io(void *object, uint32_t id, void *data, size_t size)
 {
 	struct filter *impl = object;
 
 	pw_log_debug("%p: io %d %p/%zd", impl, id, data, size);
 
-	switch(id) {
-	case SPA_IO_Clock:
-		if (data && size >= sizeof(struct spa_io_clock))
-			impl->clock = data;
-		else
-			impl->clock = NULL;
-		break;
-	case SPA_IO_Position:
-		if (data && size >= sizeof(struct spa_io_position))
-			impl->position = data;
-		else
-			impl->position = NULL;
-		pw_loop_invoke(impl->data_loop,
-			do_set_position, 1, NULL, 0, true, impl);
-		break;
-	}
-	impl->driving = impl->clock && impl->position && impl->position->clock.id == impl->clock->id;
 	pw_filter_emit_io_changed(&impl->this, NULL, id, data, size);
 
 	return 0;
@@ -780,9 +745,11 @@ static void clear_buffers(struct port *port)
 		if (SPA_FLAG_IS_SET(b->flags, BUFFER_FLAG_MAPPED)) {
 			for (j = 0; j < b->this.buffer->n_datas; j++) {
 				struct spa_data *d = &b->this.buffer->datas[j];
-				pw_log_debug("%p: clear buffer %d mem",
-						impl, b->id);
-				unmap_data(impl, d);
+				if (SPA_FLAG_IS_SET(d->flags, SPA_DATA_FLAG_MAPPABLE)) {
+					pw_log_debug("%p: clear buffer %d mem",
+							impl, b->id);
+					unmap_data(impl, d);
+				}
 			}
 		}
 	}
@@ -945,7 +912,7 @@ static int impl_port_use_buffers(void *object,
 		if (SPA_FLAG_IS_SET(impl_flags, PW_FILTER_PORT_FLAG_MAP_BUFFERS)) {
 			for (j = 0; j < buffers[i]->n_datas; j++) {
 				struct spa_data *d = &buffers[i]->datas[j];
-				if ((mappable_dataTypes & (1<<d->type)) > 0) {
+				if (SPA_FLAG_IS_SET(d->flags, SPA_DATA_FLAG_MAPPABLE)) {
 					if ((res = map_data(impl, d, prot)) < 0)
 						return res;
 					SPA_FLAG_SET(b->flags, BUFFER_FLAG_MAPPED);
@@ -955,6 +922,8 @@ static int impl_port_use_buffers(void *object,
 					return -EINVAL;
 				}
 				buf_size += d->maxsize;
+				pw_log_debug("%p:  data:%d type:%d flags:%08x size:%d", filter, j,
+						d->type, d->flags, d->maxsize);
 			}
 
 			if (size > 0 && buf_size != size) {
@@ -963,7 +932,7 @@ static int impl_port_use_buffers(void *object,
 			} else
 				size = buf_size;
 		}
-		pw_log_debug("%p: got buffer %d %d datas, mapped size %d", filter, i,
+		pw_log_debug("%p: got buffer id:%d datas:%d mapped size %d", filter, i,
 				buffers[i]->n_datas, size);
 	}
 
@@ -1008,7 +977,7 @@ do_call_process(struct spa_loop *loop,
 	struct filter *impl = user_data;
 	struct pw_filter *filter = &impl->this;
 	pw_log_trace("%p: do process", filter);
-	pw_filter_emit_process(filter, impl->position);
+	pw_filter_emit_process(filter, filter->node->rt.position);
 	return 0;
 }
 
@@ -1018,7 +987,7 @@ static void call_process(struct filter *impl)
 	if (SPA_FLAG_IS_SET(impl->flags, PW_FILTER_FLAG_RT_PROCESS)) {
 		if (impl->rt_callbacks.funcs)
 			spa_callbacks_call_fast(&impl->rt_callbacks, struct pw_filter_events,
-					process, 0, impl->rt.position);
+					process, 0, impl->this.node->rt.position);
 	} else {
 		pw_loop_invoke(impl->main_loop,
 			do_call_process, 1, NULL, 0, false, impl);
@@ -1050,7 +1019,7 @@ static int impl_node_process(void *object)
 	bool drained = true;
 	int res = 0;
 
-	pw_log_trace_fp("%p: do process %p", impl, impl->rt.position);
+	pw_log_trace_fp("%p: do process %p", impl, impl->this.node->rt.position);
 
 	/** first dequeue and recycle buffers */
 	spa_list_for_each(p, &impl->port_list, link) {
@@ -1255,10 +1224,12 @@ filter_new(struct pw_context *context, const char *name,
 	spa_hook_list_init(&impl->hooks);
 	this->properties = props;
 
-	if (pw_properties_get(props, PW_KEY_NODE_NAME) == NULL && extra) {
-		str = pw_properties_get(extra, PW_KEY_APP_NAME);
-		if (str == NULL)
-			str = pw_properties_get(extra, PW_KEY_APP_PROCESS_BINARY);
+	if ((str = pw_properties_get(props, PW_KEY_NODE_NAME)) == NULL) {
+		if (extra) {
+			str = pw_properties_get(extra, PW_KEY_APP_NAME);
+			if (str == NULL)
+				str = pw_properties_get(extra, PW_KEY_APP_PROCESS_BINARY);
+		}
 		if (str == NULL)
 			str = name;
 		pw_properties_set(props, PW_KEY_NODE_NAME, str);
@@ -1642,7 +1613,6 @@ pw_filter_connect(struct pw_filter *filter,
 
 	impl->disconnecting = false;
 	impl->draining = false;
-	impl->driving = false;
 	filter_set_state(filter, PW_FILTER_STATE_CONNECTING, 0, NULL);
 
 	if (flags & PW_FILTER_FLAG_DRIVER)
@@ -1974,7 +1944,7 @@ SPA_EXPORT
 int pw_filter_get_time(struct pw_filter *filter, struct pw_time *time)
 {
 	struct filter *impl = SPA_CONTAINER_OF(filter, struct filter, this);
-	struct spa_io_position *p = impl->position;
+	struct spa_io_position *p = filter->node->rt.position;
 
 	if (SPA_LIKELY(p != NULL)) {
 		impl->time.now = p->clock.nsec;
@@ -2091,8 +2061,7 @@ int pw_filter_flush(struct pw_filter *filter, bool drain)
 SPA_EXPORT
 bool pw_filter_is_driving(struct pw_filter *filter)
 {
-	struct filter *impl = SPA_CONTAINER_OF(filter, struct filter, this);
-	return impl->driving;
+	return filter->node->driving;
 }
 
 static int
@@ -2124,11 +2093,11 @@ int pw_filter_trigger_process(struct pw_filter *filter)
 	struct filter *impl = SPA_CONTAINER_OF(filter, struct filter, this);
 	int res = 0;
 
-	pw_log_trace_fp("%p: driving:%d", impl, impl->driving);
+	pw_log_trace_fp("%p: driving:%d", impl, filter->node->driving);
 
 	if (impl->trigger) {
 		pw_impl_node_trigger(filter->node);
-	} else if (impl->driving) {
+	} else if (filter->node->driving) {
 		res = pw_loop_invoke(impl->data_loop,
 			do_trigger_process, 1, NULL, 0, false, impl);
 	} else {
