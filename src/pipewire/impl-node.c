@@ -113,7 +113,8 @@ static void add_node(struct pw_impl_node *this, struct pw_impl_node *driver)
 	spa_list_for_each(t, &this->rt.target_list, link) {
 		dstate = &t->activation->state[0];
 		if (!t->active) {
-			dstate->required++;
+			if (!this->async)
+				dstate->required++;
 			t->active = true;
 		}
 		pw_log_trace("%p: driver state:%p pending:%d/%d, node state:%p pending:%d/%d",
@@ -146,7 +147,8 @@ static void remove_node(struct pw_impl_node *this)
 	spa_list_for_each(t, &this->rt.target_list, link) {
 		dstate = &t->activation->state[0];
 		if (t->active) {
-			dstate->required--;
+			if (!this->async)
+				dstate->required--;
 			t->active = false;
 		}
 		pw_log_trace("%p: driver state:%p pending:%d/%d, node state:%p pending:%d/%d",
@@ -973,7 +975,7 @@ static void check_properties(struct pw_impl_node *node)
 	const char *str, *recalc_reason = NULL;
 	struct spa_fraction frac;
 	uint32_t value;
-	bool driver, trigger, transport, sync;
+	bool driver, trigger, transport, sync, async;
 	struct match match;
 
 	match = MATCH_INIT(node);
@@ -1081,6 +1083,11 @@ static void check_properties(struct pw_impl_node *node)
 		pw_log_info("%p: transport %d -> %d", node, node->transport, transport);
 		node->transport = transport;
 		recalc_reason = "transport changed";
+	}
+	async = pw_properties_get_bool(node->properties, PW_KEY_NODE_ASYNC, false);
+	if (async != node->async) {
+		pw_log_info("%p: async %d -> %d", node, node->async, async);
+		node->async = async;
 	}
 
 	if ((str = pw_properties_get(node->properties, PW_KEY_MEDIA_CLASS)) != NULL &&
@@ -1360,7 +1367,8 @@ static inline int process_node(void *data)
 	/* we don't need to trigger targets when the node was driving the
 	 * graph because that means we finished the graph. */
 	if (SPA_LIKELY(!this->driving)) {
-		trigger_targets(&this->rt.target, status, nsec);
+		if (!this->async)
+			trigger_targets(&this->rt.target, status, nsec);
 	} else {
 		/* calculate CPU time when finished */
 		a->signal_time = this->driver_start;
@@ -1459,12 +1467,7 @@ struct pw_impl_node *pw_context_create_node(struct pw_context *context,
 	this = &impl->this;
 	this->context = context;
 	this->name = strdup("node");
-
-	this->data_loop = pw_context_get_data_loop(context)->loop;
-	this->data_system = this->data_loop->system;
-
-	if (user_data_size > 0)
-                this->user_data = SPA_PTROFF(impl, sizeof(struct impl), void);
+	this->source.fd = -1;
 
 	if (properties == NULL)
 		properties = pw_properties_new(NULL, NULL);
@@ -1472,6 +1475,18 @@ struct pw_impl_node *pw_context_create_node(struct pw_context *context,
 		res = -errno;
 		goto error_clean;
 	}
+
+	this->data_loop = pw_context_acquire_loop(context, &properties->dict);
+	if (this->data_loop == NULL) {
+		pw_log_error("can't find data-loop");
+		res = -ENOENT;
+		goto error_clean;
+	}
+
+	this->data_system = this->data_loop->system;
+
+	if (user_data_size > 0)
+                this->user_data = SPA_PTROFF(impl, sizeof(struct impl), void);
 
 	this->properties = properties;
 
@@ -1546,6 +1561,9 @@ error_clean:
 		pw_memblock_unref(this->activation);
 	if (this->source.fd != -1)
 		spa_system_close(this->data_system, this->source.fd);
+	if (this->data_loop)
+		pw_context_release_loop(context, this->data_loop);
+	free(this->name);
 	free(impl);
 error_exit:
 	pw_properties_free(properties);
@@ -1887,9 +1905,9 @@ static int node_ready(void *data, int status)
 
 		if (SPA_UNLIKELY((pending = pw_node_activation_state_xchg(state)) > 0)) {
 			pw_log_debug("(%s-%u) graph not finished: state:%p quantum:%"PRIu64
-					" pending %d/%d", node->name, node->info.id,
+					" pending %d/%d cycle:%u", node->name, node->info.id,
 					state, a->position.clock.duration,
-					pending, state->required);
+					pending, state->required, a->position.clock.cycle);
 			process_node(node);
 			check_states(node, nsec);
 			pw_impl_node_rt_emit_incomplete(node);
@@ -1962,8 +1980,8 @@ again:
 
 		update_position(node, all_ready, nsec);
 
-		pw_impl_node_rt_emit_start(node);
 		a->position.clock.cycle++;
+		pw_impl_node_rt_emit_start(node);
 	}
 	/* this should not happen, driver nodes that are not currently driving
 	 * should not emit the ready callback */
@@ -2242,6 +2260,10 @@ void pw_impl_node_destroy(struct pw_impl_node *node)
 	clear_info(node);
 
 	spa_system_close(node->data_system, node->source.fd);
+
+	if (node->data_loop)
+		pw_context_release_loop(context, node->data_loop);
+
 	free(impl->group);
 	free(impl->link_group);
 	free(impl->sync_group);

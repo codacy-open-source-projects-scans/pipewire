@@ -419,8 +419,6 @@ struct pw_context {
 
 	struct spa_thread_utils *thread_utils;
 	struct pw_loop *main_loop;		/**< main loop for control */
-	struct pw_loop *data_loop;		/**< data loop for data passing */
-	struct spa_system *data_system;		/**< data system for data passing */
 	struct pw_work_queue *work_queue;	/**< work queue */
 
 	struct spa_support support[16];	/**< support for spa plugins */
@@ -443,6 +441,10 @@ struct pw_context {
 struct pw_data_loop {
 	struct pw_loop *loop;
 
+	char *affinity;
+	char *class;
+	char **classes;
+	int rt_prio;
 	struct spa_hook_list listener_list;
 
 	struct spa_thread_utils *thread_utils;
@@ -688,6 +690,7 @@ struct pw_impl_node {
 	unsigned int checked;		/**< for sorting */
 	unsigned int sync:1;		/**< the sync-groups are active */
 	unsigned int transport:1;	/**< the transport is active */
+	unsigned int async:1;		/**< async processing, one cycle latency */
 
 	uint32_t port_user_data_size;	/**< extra size for port user data */
 
@@ -755,7 +758,8 @@ struct pw_impl_port_mix {
 		enum spa_direction direction;
 		uint32_t port_id;
 	} port;
-	struct spa_io_buffers *io;
+	struct spa_io_buffers *io[2];
+	void *io_data;
 	uint32_t id;
 	uint32_t peer_id;
 	unsigned int have_buffers:1;
@@ -811,6 +815,7 @@ struct pw_impl_port {
 #define PW_IMPL_PORT_FLAG_BUFFERS		(1<<1)		/**< port has data */
 #define PW_IMPL_PORT_FLAG_CONTROL		(1<<2)		/**< port has control */
 #define PW_IMPL_PORT_FLAG_NO_MIXER		(1<<3)		/**< don't try to add mixer to port */
+#define PW_IMPL_PORT_FLAG_ASYNC			(1<<4)		/**< port support async io */
 	uint32_t flags;
 	uint64_t spa_flags;
 
@@ -1158,7 +1163,9 @@ struct pw_control {
 /** Find a good format between 2 ports */
 int pw_context_find_format(struct pw_context *context,
 			struct pw_impl_port *output,
+			uint32_t output_mix,
 			struct pw_impl_port *input,
+			uint32_t input_mix,
 			struct pw_properties *props,
 			uint32_t n_format_filters,
 			struct spa_pod **format_filters,

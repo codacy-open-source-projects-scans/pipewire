@@ -9,6 +9,7 @@
 #include <regex.h>
 #include <limits.h>
 #include <sys/mman.h>
+#include <fnmatch.h>
 
 #include <pipewire/log.h>
 
@@ -20,6 +21,8 @@
 #include <spa/utils/atomic.h>
 #include <spa/utils/names.h>
 #include <spa/utils/string.h>
+#include <spa/utils/json.h>
+#include <spa/utils/cleanup.h>
 #include <spa/debug/types.h>
 
 #include <pipewire/impl.h>
@@ -34,6 +37,18 @@ PW_LOG_TOPIC_EXTERN(log_context);
 
 #define MAX_HOPS	64
 #define MAX_SYNC	4u
+#define MAX_LOOPS	64u
+
+#define DEFAULT_DATA_LOOPS	1
+
+#if !defined(FNM_EXTMATCH)
+#define FNM_EXTMATCH 0
+#endif
+
+struct data_loop {
+	struct pw_data_loop *impl;
+	int ref;
+};
 
 /** \cond */
 struct impl {
@@ -43,7 +58,10 @@ struct impl {
 	unsigned int recalc:1;
 	unsigned int recalc_pending:1;
 
-	struct pw_data_loop *data_loop_impl;
+	uint32_t cpu_count;
+
+	uint32_t n_data_loops;
+	struct data_loop data_loops[MAX_LOOPS];
 };
 
 
@@ -83,6 +101,10 @@ static void fill_properties(struct pw_context *context)
 		pw_properties_set(properties, PW_KEY_WINDOW_X11_DISPLAY,
 				  getenv("DISPLAY"));
 	}
+}
+static void fill_core_properties(struct pw_context *context)
+{
+	struct pw_properties *properties = context->properties;
 	pw_properties_set(properties, PW_KEY_CORE_VERSION, context->core->info.version);
 	pw_properties_set(properties, PW_KEY_CORE_NAME, context->core->info.name);
 }
@@ -91,24 +113,26 @@ static int context_set_freewheel(struct pw_context *context, bool freewheel)
 {
 	struct impl *impl = SPA_CONTAINER_OF(context, struct impl, this);
 	struct spa_thread *thr;
+	uint32_t i;
 	int res = 0;
 
-	if ((thr = pw_data_loop_get_thread(impl->data_loop_impl)) == NULL)
-		return -EIO;
+	for (i = 0; i < impl->n_data_loops; i++) {
+		if ((thr = pw_data_loop_get_thread(impl->data_loops[i].impl)) == NULL)
+			return -EIO;
 
-	if (freewheel) {
-		pw_log_info("%p: enter freewheel", context);
-		if (context->thread_utils)
-			res = spa_thread_utils_drop_rt(context->thread_utils, thr);
-	} else {
-		pw_log_info("%p: exit freewheel", context);
-		/* Use the priority as configured within the realtime module */
-		if (context->thread_utils)
-			res = spa_thread_utils_acquire_rt(context->thread_utils, thr, -1);
+		if (freewheel) {
+			pw_log_info("%p: enter freewheel", context);
+			if (context->thread_utils)
+				res = spa_thread_utils_drop_rt(context->thread_utils, thr);
+		} else {
+			pw_log_info("%p: exit freewheel", context);
+			/* Use the priority as configured within the realtime module */
+			if (context->thread_utils)
+				res = spa_thread_utils_acquire_rt(context->thread_utils, thr, -1);
+		}
+		if (res < 0)
+			pw_log_info("%p: freewheel error:%s", context, spa_strerror(res));
 	}
-	if (res < 0)
-		pw_log_info("%p: freewheel error:%s", context, spa_strerror(res));
-
 	context->freewheeling = freewheel;
 
 	return res;
@@ -164,6 +188,97 @@ static int do_data_loop_setup(struct spa_loop *loop, bool async, uint32_t seq,
 	return 0;
 }
 
+static int setup_data_loops(struct impl *impl)
+{
+	struct pw_properties *pr;
+	struct pw_context *this = &impl->this;
+	const char *str, *lib_name;
+	uint32_t i;
+	int res = 0;
+
+	pr = pw_properties_copy(this->properties);
+
+	lib_name = pw_properties_get(this->properties, "context.data-loop." PW_KEY_LIBRARY_NAME_SYSTEM);
+
+	if ((str = pw_properties_get(this->properties, "context.data-loops")) != NULL) {
+		struct spa_json it[4];
+		char key[512];
+		int r, len = strlen(str);
+		spa_autofree char *s = strndup(str, len);
+
+		i = 0;
+		spa_json_init(&it[0], s, len);
+		if (spa_json_enter_array(&it[0], &it[1]) < 0) {
+			pw_log_error("context.data-loops is not an array in '%s'", str);
+			res = -EINVAL;
+			goto exit;
+		}
+		while ((r = spa_json_enter_object(&it[1], &it[2])) > 0) {
+			char *props = NULL;
+
+			if (i >= MAX_LOOPS) {
+				pw_log_warn("too many context.data-loops, using first %d",
+					MAX_LOOPS);
+				break;
+			}
+
+			pw_properties_clear(pr);
+			pw_properties_update(pr, &this->properties->dict);
+			pw_properties_set(pr, PW_KEY_LIBRARY_NAME_SYSTEM, lib_name);
+
+			while (spa_json_get_string(&it[2], key, sizeof(key)) > 0) {
+				const char *val;
+				int l;
+
+				if ((l = spa_json_next(&it[2], &val)) <= 0) {
+					pw_log_warn("malformed data-loop: key '%s' has no "
+							"value in '%.*s'", key, (int)len, str);
+					break;
+				}
+				if (spa_json_is_container(val, l))
+					l = spa_json_container_len(&it[2], val, l);
+
+				props = (char*)val;
+				spa_json_parse_stringn(val, l, props, l+1);
+				pw_properties_set(pr, key, props);
+				pw_log_info("loop %d: \"%s\" = %s", i, key, props);
+			}
+			impl->data_loops[i].impl = pw_data_loop_new(&pr->dict);
+			if (impl->data_loops[i].impl == NULL)  {
+				res = -errno;
+				goto exit;
+			}
+			i++;
+		}
+		impl->n_data_loops = i;
+	} else {
+		int32_t count = pw_properties_get_int32(pr, "context.num-data-loops",
+				DEFAULT_DATA_LOOPS);
+		if (count < 0)
+			count = impl->cpu_count;
+
+		impl->n_data_loops = count;
+		if (impl->n_data_loops > MAX_LOOPS) {
+			pw_log_warn("too many context.num-data-loops: %d, using %d",
+					impl->n_data_loops, MAX_LOOPS);
+			impl->n_data_loops = MAX_LOOPS;
+		}
+		for (i = 0; i < impl->n_data_loops; i++) {
+			pw_properties_setf(pr, SPA_KEY_THREAD_NAME,  "data-loop.%d", i);
+			impl->data_loops[i].impl = pw_data_loop_new(&pr->dict);
+			if (impl->data_loops[i].impl == NULL)  {
+				res = -errno;
+				goto exit;
+			}
+			pw_log_info("created data loop '%s'", impl->data_loops[i].impl->loop->name);
+		}
+	}
+	pw_log_info("created %d data-loops", impl->n_data_loops);
+exit:
+	pw_properties_free(pr);
+	return res;
+}
+
 /** Create a new context object
  *
  * \param main_loop the main loop to use
@@ -180,8 +295,8 @@ struct pw_context *pw_context_new(struct pw_loop *main_loop,
 	struct pw_context *this;
 	const char *lib, *str;
 	void *dbus_iface = NULL;
-	uint32_t n_support, vm_type;
-	struct pw_properties *pr, *conf;
+	uint32_t i, n_support, vm_type;
+	struct pw_properties *conf;
 	struct spa_cpu *cpu;
 	int res = 0;
 
@@ -232,6 +347,8 @@ struct pw_context *pw_context_new(struct pw_loop *main_loop,
 	}
 	this->properties = properties;
 
+	fill_properties(this);
+
 	conf = pw_properties_new(NULL, NULL);
 	if (conf == NULL) {
 		res = -errno;
@@ -267,6 +384,7 @@ struct pw_context *pw_context_new(struct pw_loop *main_loop,
 		if (pw_properties_get(properties, PW_KEY_CPU_MAX_ALIGN) == NULL)
 			pw_properties_setf(properties, PW_KEY_CPU_MAX_ALIGN,
 				"%u", spa_cpu_get_max_align(cpu));
+		impl->cpu_count = spa_cpu_get_count(cpu);
 	}
 
 	if (getenv("PIPEWIRE_DEBUG") == NULL &&
@@ -285,16 +403,8 @@ struct pw_context *pw_context_new(struct pw_loop *main_loop,
 	pw_settings_init(this);
 	this->settings = this->defaults;
 
-	pr = pw_properties_copy(properties);
-	if ((str = pw_properties_get(pr, "context.data-loop." PW_KEY_LIBRARY_NAME_SYSTEM)))
-		pw_properties_set(pr, PW_KEY_LIBRARY_NAME_SYSTEM, str);
-
-	impl->data_loop_impl = pw_data_loop_new(&pr->dict);
-	pw_properties_free(pr);
-	if (impl->data_loop_impl == NULL)  {
-		res = -errno;
+	if ((res = setup_data_loops(impl)) < 0)
 		goto error_free;
-	}
 
 	this->pool = pw_mempool_new(NULL);
 	if (this->pool == NULL) {
@@ -302,10 +412,7 @@ struct pw_context *pw_context_new(struct pw_loop *main_loop,
 		goto error_free;
 	}
 
-	this->data_loop = pw_data_loop_get_loop(impl->data_loop_impl);
-	this->data_system = this->data_loop->system;
 	this->main_loop = main_loop;
-
 	this->work_queue = pw_work_queue_new(this->main_loop);
 	if (this->work_queue == NULL) {
 		res = -errno;
@@ -317,8 +424,13 @@ struct pw_context *pw_context_new(struct pw_loop *main_loop,
 	this->support[n_support++] = SPA_SUPPORT_INIT(SPA_TYPE_INTERFACE_System, this->main_loop->system);
 	this->support[n_support++] = SPA_SUPPORT_INIT(SPA_TYPE_INTERFACE_Loop, this->main_loop->loop);
 	this->support[n_support++] = SPA_SUPPORT_INIT(SPA_TYPE_INTERFACE_LoopUtils, this->main_loop->utils);
-	this->support[n_support++] = SPA_SUPPORT_INIT(SPA_TYPE_INTERFACE_DataSystem, this->data_system);
-	this->support[n_support++] = SPA_SUPPORT_INIT(SPA_TYPE_INTERFACE_DataLoop, this->data_loop->loop);
+	if (impl->n_data_loops > 0) {
+		this->support[n_support++] = SPA_SUPPORT_INIT(SPA_TYPE_INTERFACE_DataSystem, impl->data_loops[0].impl->loop->system);
+		this->support[n_support++] = SPA_SUPPORT_INIT(SPA_TYPE_INTERFACE_DataLoop, impl->data_loops[0].impl->loop->loop);
+	} else {
+		this->support[n_support++] = SPA_SUPPORT_INIT(SPA_TYPE_INTERFACE_DataSystem, this->main_loop->system);
+		this->support[n_support++] = SPA_SUPPORT_INIT(SPA_TYPE_INTERFACE_DataLoop, this->main_loop->loop);
+	}
 	this->support[n_support++] = SPA_SUPPORT_INIT(SPA_TYPE_INTERFACE_PluginLoader, &impl->plugin_loader);
 
 	if ((str = pw_properties_get(properties, "support.dbus")) == NULL ||
@@ -350,7 +462,7 @@ struct pw_context *pw_context_new(struct pw_loop *main_loop,
 	}
 	pw_impl_core_register(this->core, NULL);
 
-	fill_properties(this);
+	fill_core_properties(this);
 
 	if ((res = pw_context_parse_conf_section(this, conf, "context.spa-libs")) < 0)
 		goto error_free;
@@ -368,11 +480,13 @@ struct pw_context *pw_context_new(struct pw_loop *main_loop,
 		goto error_free;
 	pw_log_info("%p: parsed %d context.exec items", this, res);
 
-	if ((res = pw_data_loop_start(impl->data_loop_impl)) < 0)
-		goto error_free;
+	for (i = 0; i < impl->n_data_loops; i++) {
+		if ((res = pw_data_loop_start(impl->data_loops[i].impl)) < 0)
+			goto error_free;
 
-	pw_data_loop_invoke(impl->data_loop_impl,
-			do_data_loop_setup, 0, NULL, 0, false, this);
+		pw_data_loop_invoke(impl->data_loops[i].impl,
+				do_data_loop_setup, 0, NULL, 0, false, this);
+	}
 
 	pw_settings_expose(this);
 
@@ -405,6 +519,7 @@ void pw_context_destroy(struct pw_context *context)
 	struct factory_entry *entry;
 	struct pw_impl_metadata *metadata;
 	struct pw_impl_core *core_impl;
+	uint32_t i;
 
 	pw_log_debug("%p: destroy", context);
 	pw_context_emit_destroy(context);
@@ -424,8 +539,10 @@ void pw_context_destroy(struct pw_context *context)
 	spa_list_consume(resource, &context->registry_resource_list, link)
 		pw_resource_destroy(resource);
 
-	if (impl->data_loop_impl)
-		pw_data_loop_stop(impl->data_loop_impl);
+	for (i = 0; i < impl->n_data_loops; i++) {
+		if (impl->data_loops[i].impl)
+			pw_data_loop_stop(impl->data_loops[i].impl);
+	}
 
 	spa_list_consume(module, &context->module_list, link)
 		pw_impl_module_destroy(module);
@@ -442,8 +559,11 @@ void pw_context_destroy(struct pw_context *context)
 	pw_log_debug("%p: free", context);
 	pw_context_emit_free(context);
 
-	if (impl->data_loop_impl)
-		pw_data_loop_destroy(impl->data_loop_impl);
+	for (i = 0; i < impl->n_data_loops; i++) {
+		if (impl->data_loops[i].impl)
+			pw_data_loop_destroy(impl->data_loops[i].impl);
+
+	}
 
 	if (context->pool)
 		pw_mempool_destroy(context->pool);
@@ -503,11 +623,96 @@ struct pw_loop *pw_context_get_main_loop(struct pw_context *context)
 	return context->main_loop;
 }
 
+static struct pw_data_loop *acquire_data_loop(struct impl *impl, const char *name, const char *klass)
+{
+	uint32_t i, j;
+	struct data_loop *best_loop = NULL;
+	int best_score = 0;
+
+	if (klass == NULL)
+		klass = "data.rt";
+
+	for (i = 0; i < impl->n_data_loops; i++) {
+		struct data_loop *l = &impl->data_loops[i];
+		const char *ln = l->impl->loop->name;
+		int score = 0;
+
+		if (name && ln && fnmatch(name, ln, FNM_EXTMATCH) == 0)
+			score += 2;
+		if (klass && l->impl->classes) {
+			for (j = 0; l->impl->classes[j]; j++) {
+				if (fnmatch(klass, l->impl->classes[j], FNM_EXTMATCH) == 0) {
+					score += 1;
+					break;
+				}
+			}
+		}
+
+		pw_log_debug("%d: name:'%s' class:'%s' score:%d ref:%d", i,
+				ln, l->impl->class, score, l->ref);
+
+		if ((best_loop == NULL) ||
+		    (score > best_score) ||
+		    (score == best_score && l->ref < best_loop->ref)) {
+			best_loop = l;
+			best_score = score;
+		}
+	}
+	if (best_loop == NULL)
+		return NULL;
+
+	best_loop->ref++;
+	pw_log_info("using name:'%s' class:'%s' ref:%d", best_loop->impl->loop->name,
+			best_loop->impl->class, best_loop->ref);
+
+	return best_loop->impl;
+}
+
 SPA_EXPORT
 struct pw_data_loop *pw_context_get_data_loop(struct pw_context *context)
 {
 	struct impl *impl = SPA_CONTAINER_OF(context, struct impl, this);
-	return impl->data_loop_impl;
+	return acquire_data_loop(impl, NULL, NULL);
+}
+
+SPA_EXPORT
+struct pw_loop *pw_context_acquire_loop(struct pw_context *context, const struct spa_dict *props)
+{
+	struct impl *impl = SPA_CONTAINER_OF(context, struct impl, this);
+	const char *name, *klass;
+	struct pw_data_loop *loop;
+
+	name = spa_dict_lookup(props, PW_KEY_NODE_LOOP_NAME);
+	klass = spa_dict_lookup(props, PW_KEY_NODE_LOOP_CLASS);
+
+	pw_log_info("looking for name:'%s' class:'%s'", name, klass);
+
+	if ((impl->n_data_loops == 0) ||
+	    (name && fnmatch(name, context->main_loop->name, FNM_EXTMATCH) == 0) ||
+	    (klass && fnmatch(klass, "main", FNM_EXTMATCH) == 0)) {
+		pw_log_info("using main loop num-data-loops:%d", impl->n_data_loops);
+		return context->main_loop;
+	}
+
+	loop = acquire_data_loop(impl, name, klass);
+	return loop ? loop->loop : NULL;
+}
+
+SPA_EXPORT
+void pw_context_release_loop(struct pw_context *context, struct pw_loop *loop)
+{
+	struct impl *impl = SPA_CONTAINER_OF(context, struct impl, this);
+	uint32_t i;
+
+	for (i = 0; i < impl->n_data_loops; i++) {
+		struct data_loop *l = &impl->data_loops[i];
+		if (l->impl->loop == loop) {
+			l->ref--;
+			pw_log_info("release name:'%s' class:'%s' ref:%d", l->impl->loop->name,
+					l->impl->class, l->ref);
+			return;
+		}
+	}
 }
 
 SPA_EXPORT
@@ -670,7 +875,9 @@ SPA_PRINTF_FUNC(7, 8) int pw_context_debug_port_params(struct pw_context *this,
  */
 int pw_context_find_format(struct pw_context *context,
 			struct pw_impl_port *output,
+			uint32_t output_mix,
 			struct pw_impl_port *input,
+			uint32_t input_mix,
 			struct pw_properties *props,
 			uint32_t n_format_filters,
 			struct spa_pod **format_filters,
@@ -684,9 +891,26 @@ int pw_context_find_format(struct pw_context *context,
 	struct spa_pod_builder fb = { 0 };
 	uint8_t fbuf[4096];
 	struct spa_pod *filter;
+	struct spa_node *in_node, *out_node;
+	uint32_t in_port, out_port;
 
 	out_state = output->state;
 	in_state = input->state;
+
+	if (output_mix == SPA_ID_INVALID) {
+		out_node = output->node->node;
+		out_port = output->port_id;
+	} else {
+		out_node = output->mix;
+		out_port = output_mix;
+	}
+	if (input_mix == SPA_ID_INVALID) {
+		in_node = input->node->node;
+		in_port = input->port_id;
+	} else {
+		in_node = input->mix;
+		in_port = input_mix;
+	}
 
 	pw_log_debug("%p: finding best format %d %d", context, out_state, in_state);
 
@@ -701,8 +925,8 @@ int pw_context_find_format(struct pw_context *context,
 	if (in_state == PW_IMPL_PORT_STATE_CONFIGURE && out_state > PW_IMPL_PORT_STATE_CONFIGURE) {
 		/* only input needs format */
 		spa_pod_builder_init(&fb, fbuf, sizeof(fbuf));
-		if ((res = spa_node_port_enum_params_sync(output->node->node,
-						     output->direction, output->port_id,
+		if ((res = spa_node_port_enum_params_sync(out_node,
+						     output->direction, out_port,
 						     SPA_PARAM_Format, &oidx,
 						     NULL, &filter, &fb)) != 1) {
 			if (res < 0)
@@ -714,8 +938,8 @@ int pw_context_find_format(struct pw_context *context,
 		pw_log_debug("%p: Got output format:", context);
 		pw_log_format(SPA_LOG_LEVEL_DEBUG, filter);
 
-		if ((res = spa_node_port_enum_params_sync(input->node->node,
-						     input->direction, input->port_id,
+		if ((res = spa_node_port_enum_params_sync(in_node,
+						     input->direction, in_port,
 						     SPA_PARAM_EnumFormat, &iidx,
 						     filter, format, builder)) <= 0) {
 			if (res == -ENOENT || res == 0) {
@@ -730,8 +954,8 @@ int pw_context_find_format(struct pw_context *context,
 	} else if (out_state >= PW_IMPL_PORT_STATE_CONFIGURE && in_state > PW_IMPL_PORT_STATE_CONFIGURE) {
 		/* only output needs format */
 		spa_pod_builder_init(&fb, fbuf, sizeof(fbuf));
-		if ((res = spa_node_port_enum_params_sync(input->node->node,
-						     input->direction, input->port_id,
+		if ((res = spa_node_port_enum_params_sync(in_node,
+						     input->direction, in_port,
 						     SPA_PARAM_Format, &iidx,
 						     NULL, &filter, &fb)) != 1) {
 			if (res < 0)
@@ -743,8 +967,8 @@ int pw_context_find_format(struct pw_context *context,
 		pw_log_debug("%p: Got input format:", context);
 		pw_log_format(SPA_LOG_LEVEL_DEBUG, filter);
 
-		if ((res = spa_node_port_enum_params_sync(output->node->node,
-						     output->direction, output->port_id,
+		if ((res = spa_node_port_enum_params_sync(out_node,
+						     output->direction, out_port,
 						     SPA_PARAM_EnumFormat, &oidx,
 						     filter, format, builder)) <= 0) {
 			if (res == -ENOENT || res == 0) {
@@ -761,8 +985,8 @@ int pw_context_find_format(struct pw_context *context,
 		/* both ports need a format */
 		pw_log_debug("%p: do enum input %d", context, iidx);
 		spa_pod_builder_init(&fb, fbuf, sizeof(fbuf));
-		if ((res = spa_node_port_enum_params_sync(input->node->node,
-						     input->direction, input->port_id,
+		if ((res = spa_node_port_enum_params_sync(in_node,
+						     input->direction, in_port,
 						     SPA_PARAM_EnumFormat, &iidx,
 						     NULL, &filter, &fb)) != 1) {
 			if (res == -ENOENT) {
@@ -779,8 +1003,8 @@ int pw_context_find_format(struct pw_context *context,
 		pw_log_debug("%p: enum output %d with filter: %p", context, oidx, filter);
 		pw_log_format(SPA_LOG_LEVEL_DEBUG, filter);
 
-		if ((res = spa_node_port_enum_params_sync(output->node->node,
-						     output->direction, output->port_id,
+		if ((res = spa_node_port_enum_params_sync(out_node,
+						     output->direction, out_port,
 						     SPA_PARAM_EnumFormat, &oidx,
 						     filter, format, builder)) != 1) {
 			if (res == 0 && filter != NULL) {
@@ -1758,10 +1982,15 @@ int pw_context_set_object(struct pw_context *context, const char *type, void *va
 		entry->value = value;
 	}
 	if (spa_streq(type, SPA_TYPE_INTERFACE_ThreadUtils)) {
+		uint32_t i;
+
 		context->thread_utils = value;
-		if (impl->data_loop_impl)
-			pw_data_loop_set_thread_utils(impl->data_loop_impl,
-					context->thread_utils);
+
+		for (i = 0; i < impl->n_data_loops; i++) {
+			if (impl->data_loops[i].impl)
+				pw_data_loop_set_thread_utils(impl->data_loops[i].impl,
+						context->thread_utils);
+		}
 	}
 	return 0;
 }

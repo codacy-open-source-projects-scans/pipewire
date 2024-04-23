@@ -122,6 +122,12 @@ static int read_props(struct message *m, struct pw_properties *props, bool remap
 				TAG_INVALID)) < 0)
 			return res;
 
+		if (length != size)
+			return -EINVAL;
+
+		if (strnlen(data, size) != size - 1)
+			continue;
+
 		if (remap && (map = str_map_find(props_key_map, NULL, key)) != NULL) {
 			key = map->pw_str;
 			if (map->child != NULL &&
@@ -415,9 +421,9 @@ static void write_string(struct message *m, const char *s)
 {
 	write_8(m, s ? TAG_STRING : TAG_STRING_NULL);
 	if (s != NULL) {
-		int len = strlen(s) + 1;
+		size_t len = strlen(s) + 1;
 		if (ensure_size(m, len) > 0)
-			strcpy(SPA_PTROFF(m->data, m->length, char), s);
+			memcpy(SPA_PTROFF(m->data, m->length, char), s, len);
 		m->length += len;
 	}
 }
@@ -805,6 +811,7 @@ int message_dump(enum spa_log_level level, const char *prefix, struct message *m
 					info.props->dict.n_items);
 			spa_dict_for_each(it, &info.props->dict)
 				pw_log(level, "%s      '%s': '%s'", prefix, it->key, it->value);
+			format_info_clear(&info);
 			break;
 		}
 		}
