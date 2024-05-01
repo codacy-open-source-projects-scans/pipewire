@@ -47,6 +47,8 @@ PW_LOG_TOPIC_EXTERN(log_context);
 
 struct data_loop {
 	struct pw_data_loop *impl;
+	bool autostart;
+	bool started;
 	int ref;
 };
 
@@ -117,8 +119,9 @@ static int context_set_freewheel(struct pw_context *context, bool freewheel)
 	int res = 0;
 
 	for (i = 0; i < impl->n_data_loops; i++) {
-		if ((thr = pw_data_loop_get_thread(impl->data_loops[i].impl)) == NULL)
-			return -EIO;
+		if (impl->data_loops[i].impl == NULL ||
+		    (thr = pw_data_loop_get_thread(impl->data_loops[i].impl)) == NULL)
+			continue;
 
 		if (freewheel) {
 			pw_log_info("%p: enter freewheel", context);
@@ -279,6 +282,29 @@ exit:
 	return res;
 }
 
+static int data_loop_start(struct impl *impl, struct data_loop *loop)
+{
+	int res;
+	if (loop->started || loop->impl == NULL)
+		return 0;
+
+	pw_log_info("starting data loop %s", loop->impl->loop->name);
+	if ((res = pw_data_loop_start(loop->impl)) < 0)
+		return res;
+
+	pw_data_loop_invoke(loop->impl, do_data_loop_setup, 0, NULL, 0, false, &impl->this);
+	loop->started = true;
+	return 0;
+}
+
+static void data_loop_stop(struct impl *impl, struct data_loop *loop)
+{
+	if (!loop->started || loop->impl == NULL)
+		return;
+	pw_data_loop_stop(loop->impl);
+	loop->started = false;
+}
+
 /** Create a new context object
  *
  * \param main_loop the main loop to use
@@ -424,13 +450,6 @@ struct pw_context *pw_context_new(struct pw_loop *main_loop,
 	this->support[n_support++] = SPA_SUPPORT_INIT(SPA_TYPE_INTERFACE_System, this->main_loop->system);
 	this->support[n_support++] = SPA_SUPPORT_INIT(SPA_TYPE_INTERFACE_Loop, this->main_loop->loop);
 	this->support[n_support++] = SPA_SUPPORT_INIT(SPA_TYPE_INTERFACE_LoopUtils, this->main_loop->utils);
-	if (impl->n_data_loops > 0) {
-		this->support[n_support++] = SPA_SUPPORT_INIT(SPA_TYPE_INTERFACE_DataSystem, impl->data_loops[0].impl->loop->system);
-		this->support[n_support++] = SPA_SUPPORT_INIT(SPA_TYPE_INTERFACE_DataLoop, impl->data_loops[0].impl->loop->loop);
-	} else {
-		this->support[n_support++] = SPA_SUPPORT_INIT(SPA_TYPE_INTERFACE_DataSystem, this->main_loop->system);
-		this->support[n_support++] = SPA_SUPPORT_INIT(SPA_TYPE_INTERFACE_DataLoop, this->main_loop->loop);
-	}
 	this->support[n_support++] = SPA_SUPPORT_INIT(SPA_TYPE_INTERFACE_PluginLoader, &impl->plugin_loader);
 
 	if ((str = pw_properties_get(properties, "support.dbus")) == NULL ||
@@ -481,11 +500,11 @@ struct pw_context *pw_context_new(struct pw_loop *main_loop,
 	pw_log_info("%p: parsed %d context.exec items", this, res);
 
 	for (i = 0; i < impl->n_data_loops; i++) {
-		if ((res = pw_data_loop_start(impl->data_loops[i].impl)) < 0)
+		struct data_loop *dl = &impl->data_loops[i];
+		if (!dl->autostart)
+			continue;
+		if ((res = data_loop_start(impl, dl)) < 0)
 			goto error_free;
-
-		pw_data_loop_invoke(impl->data_loops[i].impl,
-				do_data_loop_setup, 0, NULL, 0, false, this);
 	}
 
 	pw_settings_expose(this);
@@ -539,10 +558,8 @@ void pw_context_destroy(struct pw_context *context)
 	spa_list_consume(resource, &context->registry_resource_list, link)
 		pw_resource_destroy(resource);
 
-	for (i = 0; i < impl->n_data_loops; i++) {
-		if (impl->data_loops[i].impl)
-			pw_data_loop_stop(impl->data_loops[i].impl);
-	}
+	for (i = 0; i < impl->n_data_loops; i++)
+		data_loop_stop(impl, &impl->data_loops[i]);
 
 	spa_list_consume(module, &context->module_list, link)
 		pw_impl_module_destroy(module);
@@ -610,11 +627,25 @@ void pw_context_add_listener(struct pw_context *context,
 	spa_hook_list_append(&context->listener_list, listener, events, data);
 }
 
+const struct spa_support *context_get_support(struct pw_context *context, uint32_t *n_support,
+		const struct spa_dict *info)
+{
+	uint32_t n = context->n_support;
+	struct pw_loop *loop;
+
+	loop = pw_context_acquire_loop(context, info);
+	if (loop != NULL) {
+		context->support[n++] = SPA_SUPPORT_INIT(SPA_TYPE_INTERFACE_DataSystem, loop->system);
+		context->support[n++] = SPA_SUPPORT_INIT(SPA_TYPE_INTERFACE_DataLoop, loop->loop);
+	}
+	*n_support = n;
+	return context->support;
+}
+
 SPA_EXPORT
 const struct spa_support *pw_context_get_support(struct pw_context *context, uint32_t *n_support)
 {
-	*n_support = context->n_support;
-	return context->support;
+	return context_get_support(context, n_support, NULL);
 }
 
 SPA_EXPORT
@@ -627,15 +658,17 @@ static struct pw_data_loop *acquire_data_loop(struct impl *impl, const char *nam
 {
 	uint32_t i, j;
 	struct data_loop *best_loop = NULL;
-	int best_score = 0;
-
-	if (klass == NULL)
-		klass = "data.rt";
+	int best_score = 0, res;
 
 	for (i = 0; i < impl->n_data_loops; i++) {
 		struct data_loop *l = &impl->data_loops[i];
 		const char *ln = l->impl->loop->name;
 		int score = 0;
+
+		if (!name && !klass) {
+			best_loop = l;
+			break;
+		}
 
 		if (name && ln && fnmatch(name, ln, FNM_EXTMATCH) == 0)
 			score += 2;
@@ -662,7 +695,13 @@ static struct pw_data_loop *acquire_data_loop(struct impl *impl, const char *nam
 		return NULL;
 
 	best_loop->ref++;
-	pw_log_info("using name:'%s' class:'%s' ref:%d", best_loop->impl->loop->name,
+	if ((res = data_loop_start(impl, best_loop)) < 0) {
+		errno = -res;
+		return NULL;
+	}
+
+	pw_log_info("%p: using name:'%s' class:'%s' ref:%d", impl,
+			best_loop->impl->loop->name,
 			best_loop->impl->class, best_loop->ref);
 
 	return best_loop->impl;
@@ -682,15 +721,15 @@ struct pw_loop *pw_context_acquire_loop(struct pw_context *context, const struct
 	const char *name, *klass;
 	struct pw_data_loop *loop;
 
-	name = spa_dict_lookup(props, PW_KEY_NODE_LOOP_NAME);
-	klass = spa_dict_lookup(props, PW_KEY_NODE_LOOP_CLASS);
+	name = props ? spa_dict_lookup(props, PW_KEY_NODE_LOOP_NAME) : NULL;
+	klass = props ? spa_dict_lookup(props, PW_KEY_NODE_LOOP_CLASS) : NULL;
 
-	pw_log_info("looking for name:'%s' class:'%s'", name, klass);
+	pw_log_info("%p: looking for name:'%s' class:'%s'", context, name, klass);
 
 	if ((impl->n_data_loops == 0) ||
 	    (name && fnmatch(name, context->main_loop->name, FNM_EXTMATCH) == 0) ||
 	    (klass && fnmatch(klass, "main", FNM_EXTMATCH) == 0)) {
-		pw_log_info("using main loop num-data-loops:%d", impl->n_data_loops);
+		pw_log_info("%p: using main loop num-data-loops:%d", context, impl->n_data_loops);
 		return context->main_loop;
 	}
 
@@ -1915,7 +1954,7 @@ struct spa_handle *pw_context_load_spa_handle(struct pw_context *context,
 		return NULL;
 	}
 
-	support = pw_context_get_support(context, &n_support);
+	support = context_get_support(context, &n_support, info);
 
 	handle = pw_load_spa_handle(lib, factory_name,
 			info, n_support, support);
