@@ -60,6 +60,8 @@ struct impl {
 	struct spa_handle handle;
 	struct spa_node node;
 
+	uint32_t quantum_limit;
+
 	struct spa_log *log;
 
 	struct spa_loop *data_loop;
@@ -329,9 +331,9 @@ impl_node_port_enum_params(void *object, int seq,
 
 	spa_return_val_if_fail(this != NULL, -EINVAL);
 	spa_return_val_if_fail(num != 0, -EINVAL);
-	spa_return_val_if_fail(CHECK_PORT(this, direction, port_id), -EINVAL);
+	spa_return_val_if_fail(CHECK_PORT_ANY(this, direction, port_id), -EINVAL);
 
-	port = GET_PORT(this, direction, port_id);
+	port = GET_PORT_ANY(this, direction, port_id);
 
 	result.id = id;
 	result.next = start;
@@ -363,7 +365,8 @@ next:
 			SPA_TYPE_OBJECT_ParamBuffers, id,
 			SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(1, 1, MAX_BUFFERS),
 			SPA_PARAM_BUFFERS_blocks,  SPA_POD_Int(1),
-			SPA_PARAM_BUFFERS_size,    SPA_POD_CHOICE_RANGE_Int(4096, 512, INT32_MAX),
+			SPA_PARAM_BUFFERS_size,    SPA_POD_CHOICE_RANGE_Int(this->quantum_limit,
+				this->quantum_limit, INT32_MAX),
 			SPA_PARAM_BUFFERS_stride,  SPA_POD_Int(1));
 		break;
 
@@ -784,6 +787,12 @@ static int impl_node_process(void *object)
 	}
 	spa_pod_builder_pop(&builder, &f);
 
+	if (builder.state.offset > d->maxsize) {
+		spa_log_warn(this->log, "%p: control overflow %d > %d",
+				this, builder.state.offset, d->maxsize);
+		builder.state.offset = 0;
+	}
+
 	d->chunk->offset = 0;
 	d->chunk->size = builder.state.offset;
 	d->chunk->stride = 1;
@@ -860,6 +869,7 @@ impl_init(const struct spa_handle_factory *factory,
 {
 	struct impl *this;
 	struct port *port;
+	uint32_t i;
 
 	spa_return_val_if_fail(factory != NULL, -EINVAL);
 	spa_return_val_if_fail(handle != NULL, -EINVAL);
@@ -875,6 +885,16 @@ impl_init(const struct spa_handle_factory *factory,
 	if (this->data_loop == NULL) {
 		spa_log_error(this->log, "a data loop is needed");
 		return -EINVAL;
+	}
+
+	this->quantum_limit = 8192;
+
+	for (i = 0; info && i < info->n_items; i++) {
+		const char *k = info->items[i].key;
+		const char *s = info->items[i].value;
+		if (spa_streq(k, "clock.quantum-limit")) {
+			spa_atou32(s, &this->quantum_limit, 0);
+		}
 	}
 
 	spa_hook_list_init(&this->hooks);

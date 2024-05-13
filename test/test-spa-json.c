@@ -773,14 +773,14 @@ static char *read_json_testcase(FILE *f, char **name, size_t *size, char **resul
 			buf = NULL;
 			alloc = 0;
 		} else {
-			char *p = realloc(*dst, len + res + 1);
+			char *p = realloc(*dst, *dst_len + res + 1);
 
 			pwtest_ptr_notnull(p);
 
 			*dst = p;
-			memcpy(*dst + len, buf, res);
+			memcpy(*dst + *dst_len, buf, res);
 			*dst_len += res;
-			(*dst)[len] = '\0';
+			(*dst)[*dst_len] = '\0';
 		}
 	} while (1);
 
@@ -989,10 +989,6 @@ PWTEST(json_data)
 		/* spa_json_parse_string API doesn't do \0 */
 		"y_object_escaped_null_in_key.json",
 		"y_string_null_escape.json",
-
-		/* XXX: something with surrogate handling? */
-		"y_string_last_surrogates_1_and_2.json",
-		"y_string_unicode_U+10FFFE_nonchar.json",
 	};
 
 	const char *basedir = getenv("PWTEST_DATA_DIR");
