@@ -120,6 +120,8 @@ struct spa_bt_monitor {
 	unsigned int connection_info_supported:1;
 	unsigned int dummy_avrcp_player:1;
 
+	struct spa_list bcast_source_config_list;
+
 	struct spa_bt_quirks *quirks;
 
 #define MAX_SETTINGS 128
@@ -144,6 +146,39 @@ struct spa_bt_remote_endpoint {
 	int capabilities_len;
 	bool delay_reporting;
 	bool acceptor;
+};
+
+#define METADATA_MAX_LEN	255
+#define CC_MAX_LEN	255
+
+/*
+ * This structure stores metadata as defined
+ * in Assigned Numbers chapter 6.12.6 Metadata
+ * LTV structures. Length contains the size of
+ * type and value.
+ */
+struct spa_bt_metadata {
+	struct spa_list link;
+	int length;
+	int type;
+	uint8_t value[METADATA_MAX_LEN - 1];
+};
+
+struct spa_bt_bis {
+	struct spa_list link;
+	char qos_preset[255];
+	int channel_allocation;
+	struct spa_list metadata_list;
+};
+
+#define BROADCAST_CODE_LEN	16
+
+struct spa_bt_big {
+	struct spa_list link;
+	int broadcast_code[BROADCAST_CODE_LEN];
+	int presentation_delay;
+	struct spa_list bis_list;
+	int big_id;
 };
 
 /*
@@ -1378,6 +1413,32 @@ static void adapter_free(struct spa_bt_adapter *adapter)
 	free(adapter->address);
 	free(adapter->path);
 	free(adapter);
+}
+
+static void metadata_entry_free(struct spa_bt_metadata *metadata_entry)
+{
+	spa_list_remove(&metadata_entry->link);
+	free(metadata_entry);
+}
+
+static void bis_entry_free(struct spa_bt_bis *bis_entry)
+{
+	struct spa_bt_metadata *m;
+
+	spa_list_consume(m, &bis_entry->metadata_list, link)
+		metadata_entry_free(m);
+	spa_list_remove(&bis_entry->link);
+	free(bis_entry);
+}
+
+static void big_entry_free(struct spa_bt_big *big_entry)
+{
+	struct spa_bt_bis *b;
+
+	spa_list_consume(b, &big_entry->bis_list, link)
+		bis_entry_free(b);
+	spa_list_remove(&big_entry->link);
+	free(big_entry);
 }
 
 static uint32_t adapter_connectable_profiles(struct spa_bt_adapter *adapter)
@@ -3158,10 +3219,7 @@ static int spa_bt_transport_stop_volume_timer(struct spa_bt_transport *transport
 int spa_bt_transport_ensure_sco_io(struct spa_bt_transport *t, struct spa_loop *data_loop)
 {
 	if (t->sco_io == NULL) {
-		t->sco_io = spa_bt_sco_io_create(data_loop,
-						 t->fd,
-						 t->read_mtu,
-						 t->write_mtu);
+		t->sco_io = spa_bt_sco_io_create(t, data_loop, t->monitor->log);
 		if (t->sco_io == NULL)
 			return -ENOMEM;
 	}
@@ -5194,6 +5252,131 @@ static void reselect_backend(struct spa_bt_monitor *monitor, bool silent)
 				backend ? backend->name : "none");
 }
 
+static void configure_bis(struct spa_bt_monitor *monitor,
+				const struct media_codec *codec,
+				DBusConnection *conn,
+				const char *object_path,
+				const char *interface_name,
+				struct spa_bt_big *big,
+				struct spa_bt_bis *bis,
+				const char *local_endpoint)
+{
+	DBusMessageIter iter, entry, variant, qos_dict;
+	spa_autoptr(DBusMessage) msg = NULL;
+	DBusMessageIter dict;
+	int bis_id = 0xFF;
+	uint8_t caps [CC_MAX_LEN];
+	uint8_t metadata [METADATA_MAX_LEN];
+	uint8_t caps_size, metadata_size = 0;
+	struct bap_codec_qos qos;
+	int presentation_delay;
+	struct spa_bt_metadata *metadata_entry;
+	struct spa_dict settings;
+	struct spa_dict_item setting_items[2];
+	char channel_allocation[64] = {0};
+
+	int mse = 0;
+	int options = 0;
+	int skip = 0;
+	int sync_cte_type = 0;
+	int sync_factor = 1;
+	int sync_timeout = 2000;
+	int timeout = 2000;
+
+	/* Configure each BIS from a BIG */
+	spa_list_for_each(metadata_entry, &bis->metadata_list, link) {
+		if ((metadata_size + metadata_entry->length + 1) > METADATA_MAX_LEN) {
+			spa_log_warn(monitor->log, "Metadata configured for the BIS exceeds the maximum metadata size");
+			return;
+		}
+
+		metadata[metadata_size] = (uint8_t)metadata_entry->length;
+		metadata_size++;
+		metadata[metadata_size] = (uint8_t)metadata_entry->type;
+		metadata_size++;
+		memcpy(&metadata[metadata_size], metadata_entry->value, metadata_entry->length - 1);
+		metadata_size += metadata_entry->length - 1;
+	}
+
+	spa_log_debug(monitor->log, "bis->channel_allocation %d", bis->channel_allocation);
+	if (bis->channel_allocation)
+		spa_scnprintf(channel_allocation, sizeof(channel_allocation), "%"PRIu32, bis->channel_allocation);
+	setting_items[0] = SPA_DICT_ITEM_INIT("channel_allocation", channel_allocation);
+	setting_items[1] = SPA_DICT_ITEM_INIT("preset", bis->qos_preset);
+	settings = SPA_DICT_INIT(setting_items, 2);
+
+	codec->get_bis_config(codec, caps, &caps_size, &settings, &qos);
+
+	msg = dbus_message_new_method_call(BLUEZ_SERVICE,
+				object_path,
+				interface_name,
+				"SetConfiguration");
+
+	dbus_message_iter_init_append(msg, &iter);
+	dbus_message_iter_append_basic(&iter, DBUS_TYPE_OBJECT_PATH, &local_endpoint);
+	dbus_message_iter_open_container(&iter, DBUS_TYPE_ARRAY, "{sv}", &dict);
+	append_basic_array_variant_dict_entry(&dict, "Capabilities", "ay", "y", DBUS_TYPE_BYTE, caps, caps_size);
+
+	append_basic_array_variant_dict_entry(&dict, "Metadata", "ay", "y", DBUS_TYPE_BYTE, metadata, metadata_size);
+
+	dbus_message_iter_open_container(&dict, DBUS_TYPE_DICT_ENTRY, NULL, &entry);
+	dbus_message_iter_append_basic(&entry, DBUS_TYPE_STRING, &(const char *) { "QoS" });
+	dbus_message_iter_open_container(&entry, DBUS_TYPE_VARIANT, "a{sv}", &variant);
+
+	dbus_message_iter_open_container(&variant, DBUS_TYPE_ARRAY,
+		DBUS_DICT_ENTRY_BEGIN_CHAR_AS_STRING
+		DBUS_TYPE_STRING_AS_STRING
+		DBUS_TYPE_VARIANT_AS_STRING
+		DBUS_DICT_ENTRY_END_CHAR_AS_STRING,
+		&qos_dict);
+
+	append_basic_variant_dict_entry(&qos_dict, "BIG", DBUS_TYPE_BYTE, "y", &big->big_id);
+	append_basic_variant_dict_entry(&qos_dict, "BIS", DBUS_TYPE_BYTE, "y", &bis_id);
+	append_basic_variant_dict_entry(&qos_dict, "SyncFactor", DBUS_TYPE_BYTE, "y", &sync_factor);
+	append_basic_variant_dict_entry(&qos_dict, "Options", DBUS_TYPE_BYTE, "y", &options);
+	append_basic_variant_dict_entry(&qos_dict, "Skip", DBUS_TYPE_UINT16, "q", &skip);
+	append_basic_variant_dict_entry(&qos_dict, "SyncTimeout", DBUS_TYPE_UINT16, "q", &sync_timeout);
+	append_basic_variant_dict_entry(&qos_dict, "SyncCteType", DBUS_TYPE_BYTE, "y", &sync_cte_type);
+	append_basic_variant_dict_entry(&qos_dict, "MSE", DBUS_TYPE_BYTE, "y", &mse);
+	append_basic_variant_dict_entry(&qos_dict, "Timeout", DBUS_TYPE_UINT16, "q", &timeout);
+	append_basic_array_variant_dict_entry(&qos_dict, "BCode", "ay", "y", DBUS_TYPE_BYTE, big->broadcast_code, BROADCAST_CODE_LEN);
+	append_basic_variant_dict_entry(&qos_dict, "Interval", DBUS_TYPE_UINT32, "u", &qos.interval);
+	append_basic_variant_dict_entry(&qos_dict, "Framing", DBUS_TYPE_BYTE, "y", &qos.framing);
+	append_basic_variant_dict_entry(&qos_dict, "PHY", DBUS_TYPE_BYTE, "y", &qos.phy);
+	append_basic_variant_dict_entry(&qos_dict, "SDU", DBUS_TYPE_UINT16, "q", &qos.sdu);
+	append_basic_variant_dict_entry(&qos_dict, "Retransmissions", DBUS_TYPE_BYTE, "y", &qos.retransmission);
+	append_basic_variant_dict_entry(&qos_dict, "Latency", DBUS_TYPE_UINT16, "q", &qos.latency);
+	append_basic_variant_dict_entry(&qos_dict, "PresentationDelay", DBUS_TYPE_UINT32, "u", &presentation_delay);
+
+	dbus_message_iter_close_container(&variant, &qos_dict);
+	dbus_message_iter_close_container(&entry, &variant);
+	dbus_message_iter_close_container(&dict, &entry);
+
+	dbus_message_iter_close_container(&iter, &dict);
+	dbus_message_set_no_reply(msg, TRUE);
+	if (!dbus_connection_send(conn, msg, NULL)) {
+		spa_log_error(monitor->log, "sending SetConfiguration failed");
+	}
+}
+
+static void configure_bcast_source(struct spa_bt_monitor *monitor,
+				const struct media_codec *codec,
+				DBusConnection *conn,
+				const char *object_path,
+				const char *interface_name,
+				const char *local_endpoint)
+{
+	struct spa_bt_big *big;
+	struct spa_bt_bis *bis;
+	/* Configure each BIS from a BIG */
+	spa_list_for_each(big, &monitor->bcast_source_config_list, link) {
+		spa_list_for_each(bis, &big->bis_list, link) {
+			configure_bis(monitor, codec, conn, object_path, interface_name,
+				big, bis, local_endpoint);
+		}
+	}
+}
+
 static void interface_added(struct spa_bt_monitor *monitor,
 			    DBusConnection *conn,
 			    const char *object_path,
@@ -5281,6 +5464,35 @@ static void interface_added(struct spa_bt_monitor *monitor,
 		d = ep->device;
 		if (d)
 			spa_bt_device_emit_profiles_changed(d, d->profiles, d->connected_profiles);
+
+		if (spa_streq(ep->uuid, SPA_BT_UUID_BAP_BROADCAST_SINK)) {
+			int ret, i;
+			bool codec_found = false;
+			spa_autofree char *local_endpoint = NULL;
+			/* get local endpoint */
+
+			for (i = 0; monitor->media_codecs; i++) {
+				if (!monitor->media_codecs[i]->bap)
+					continue;
+				if (!is_media_codec_enabled(monitor, monitor->media_codecs[i]))
+					continue;
+				if (monitor->media_codecs[i]->codec_id == ep->codec){
+					ret = media_codec_to_endpoint(monitor->media_codecs[i], SPA_BT_MEDIA_SOURCE_BROADCAST, &local_endpoint);
+					if (ret == 0) {
+						codec_found = true;
+						break;
+					}
+				}
+			}
+
+			if (!codec_found) {
+				spa_log_warn(monitor->log, "endpoint codec not found");
+				return;
+			}
+
+			if (local_endpoint != NULL)
+				configure_bcast_source(monitor, monitor->media_codecs[i], conn, object_path, interface_name, local_endpoint);
+		}
 	}
 }
 
@@ -5726,6 +5938,7 @@ static int impl_clear(struct spa_handle *handle)
 	struct spa_bt_device *d;
 	struct spa_bt_remote_endpoint *ep;
 	struct spa_bt_transport *t;
+	struct spa_bt_big *b;
 	const struct spa_dict_item *it;
 	size_t i;
 
@@ -5754,6 +5967,8 @@ static int impl_clear(struct spa_handle *handle)
 		device_free(d);
 	spa_list_consume(a, &monitor->adapter_list, link)
 		adapter_free(a);
+	spa_list_consume(b, &monitor->bcast_source_config_list, link)
+		big_entry_free(b);
 
 	for (i = 0; i < SPA_N_ELEMENTS(monitor->backends); ++i) {
 		spa_bt_backend_free(monitor->backends[i]);
@@ -5854,6 +6069,134 @@ static int parse_roles(struct spa_bt_monitor *monitor, const struct spa_dict *in
 done:
 	monitor->enabled_profiles = profiles;
 	return res;
+}
+
+static void parse_broadcast_source_config(struct spa_bt_monitor *monitor, const struct spa_dict *info)
+{
+	const char *str;
+	char key[256];
+	char bis_key[256];
+	char qos_key[256];
+	int cursor;
+	int big_id = 0;
+	struct spa_json it[4], it_array[4];
+	struct spa_list big_list = SPA_LIST_INIT(&big_list);
+	struct spa_error_location loc;
+	struct spa_bt_big *big;
+
+	/* Search for bluez5.bcast_source.config */
+	if (!(info && (str = spa_dict_lookup(info, "bluez5.bcast_source.config"))))
+		return;
+
+	spa_json_init(&it[0], str, strlen(str));
+
+	/* Verify is an array of BIGS */
+	if (spa_json_enter_array(&it[0], &it_array[0]) <= 0)
+		goto parse_failed;
+
+	/* Iterate on all BIG objects */
+	while (spa_json_enter_object(&it_array[0], &it[1]) > 0) {
+		struct spa_bt_big *big_entry = calloc(1, sizeof(struct spa_bt_big));
+
+		if (!big_entry)
+			goto errno_failed;
+
+		big_entry->big_id = big_id++;
+		spa_list_init(&big_entry->bis_list);
+		spa_list_append(&big_list, &big_entry->link);
+
+		/* Iterate on all BIG values */
+		while (spa_json_get_string(&it[1], key, sizeof(key)) > 0) {
+			if (spa_streq(key, "broadcast_code")) {
+				if (spa_json_enter_array(&it[1], &it_array[1]) <= 0)
+					goto parse_failed;
+				for (cursor = 0; cursor < BROADCAST_CODE_LEN; cursor++) {
+					if (spa_json_get_int(&it_array[1], &big_entry->broadcast_code[cursor]) <= 0)
+						goto parse_failed;
+					spa_log_debug(monitor->log, "big_entry->broadcast_code[%d] %d", cursor, big_entry->broadcast_code[cursor]);
+				}
+			} else if (spa_streq(key, "bis")) {
+				if (spa_json_enter_array(&it[1], &it_array[1]) <= 0)
+					goto parse_failed;
+				while (spa_json_enter_object(&it_array[1], &it[2]) > 0) {
+					/* Iterate on all BIS values */
+					struct spa_bt_bis *bis_entry = calloc(1, sizeof(struct spa_bt_bis));
+
+					if (!bis_entry)
+						goto errno_failed;
+
+					spa_list_init(&bis_entry->metadata_list);
+					spa_list_append(&big_entry->bis_list, &bis_entry->link);
+
+					while (spa_json_get_string(&it[2], bis_key, sizeof(bis_key)) > 0) {
+						if (spa_streq(bis_key, "qos_preset")) {
+							if (spa_json_get_string(&it[2], bis_entry->qos_preset, sizeof(bis_entry->qos_preset)) <= 0)
+								goto parse_failed;
+							spa_log_debug(monitor->log, "bis_entry->qos_preset %s", bis_entry->qos_preset);
+						} else if (spa_streq(bis_key, "audio_channel_allocation")) {
+							if (spa_json_get_int(&it[2], &bis_entry->channel_allocation) <= 0)
+								goto parse_failed;
+							spa_log_debug(monitor->log, "bis_entry->channel_allocation %d", bis_entry->channel_allocation);
+						} else if (spa_streq(bis_key, "metadata")) {
+							if (spa_json_enter_array(&it[2], &it_array[2]) <= 0)
+								goto parse_failed;
+							while (spa_json_enter_object(&it_array[2], &it[3]) > 0) {
+								struct spa_bt_metadata *metadata_entry = calloc(1, sizeof(struct spa_bt_metadata));
+
+								if (!metadata_entry)
+									goto errno_failed;
+
+								spa_list_append(&bis_entry->metadata_list, &metadata_entry->link);
+
+								while (spa_json_get_string(&it[3], qos_key, sizeof(qos_key)) > 0) {
+									if (spa_streq(qos_key, "type")) {
+										if (spa_json_get_int(&it[3], &metadata_entry->type) <= 0)
+											goto parse_failed;
+										spa_log_debug(monitor->log, "metadata_entry->type %d", metadata_entry->type);
+									} else if (spa_streq(qos_key, "value")) {
+										if (spa_json_enter_array(&it[3], &it_array[3]) <= 0)
+											goto parse_failed;
+										for (cursor = 0; cursor < METADATA_MAX_LEN - 1; cursor++) {
+											int temp_val = 0;
+											if (spa_json_get_int(&it_array[3], &temp_val) <= 0)
+												break;
+											metadata_entry->value[cursor] = (uint8_t)temp_val;
+											spa_log_debug(monitor->log, "metadata_entry->value[%d] %d", cursor, metadata_entry->value[cursor]);
+										}
+										/* length is size of value plus 1 octet for type */
+										metadata_entry->length = cursor + 1;
+										spa_log_debug(monitor->log, "metadata_entry->length %d", metadata_entry->length);
+										spa_log_debug(monitor->log, "metadata_entry->value_size %d", cursor);
+									}
+								}
+							}
+						}
+					}
+				}
+			}
+		}
+	}
+
+	spa_list_insert_list(&monitor->bcast_source_config_list, &big_list);
+	return;
+
+errno_failed:
+	spa_log_warn(monitor->log, "failed in bluez5.bcast_source.config: %m");
+	goto cleanup;
+
+parse_failed:
+	str = spa_dict_lookup(info, "bluez5.bcast_source.config");
+	if (spa_json_get_error(&it[0], str, &loc)) {
+		spa_debug_log_error_location(monitor->log, SPA_LOG_LEVEL_WARN,
+			&loc, "malformed bluez5.bcast_source.config: %s", loc.reason);
+	} else {
+		spa_log_warn(monitor->log, "malformed bluez5.bcast_source.config");
+	}
+	goto cleanup;
+
+cleanup:
+	spa_list_consume(big, &big_list, link)
+		big_entry_free(big);
 }
 
 static int parse_codec_array(struct spa_bt_monitor *this, const struct spa_dict *info)
@@ -6039,11 +6382,13 @@ impl_init(const struct spa_handle_factory *factory,
 	spa_list_init(&this->device_list);
 	spa_list_init(&this->remote_endpoint_list);
 	spa_list_init(&this->transport_list);
+	spa_list_init(&this->bcast_source_config_list);
 
 	if ((res = parse_codec_array(this, info)) < 0)
 		goto fail;
 
 	parse_roles(this, info);
+	parse_broadcast_source_config(this, info);
 
 	this->default_audio_info.rate = A2DP_CODEC_DEFAULT_RATE;
 	this->default_audio_info.channels = A2DP_CODEC_DEFAULT_CHANNELS;
