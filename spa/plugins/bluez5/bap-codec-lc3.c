@@ -74,6 +74,7 @@ static const struct {
 	uint32_t bit;
 	enum spa_audio_channel channel;
 } channel_bits[] = {
+	{ BAP_CHANNEL_MONO, SPA_AUDIO_CHANNEL_MONO },
 	{ BAP_CHANNEL_FL,   SPA_AUDIO_CHANNEL_FL },
 	{ BAP_CHANNEL_FR,   SPA_AUDIO_CHANNEL_FR },
 	{ BAP_CHANNEL_FC,   SPA_AUDIO_CHANNEL_FC },
@@ -282,7 +283,7 @@ static int parse_bluez_pacs(const uint8_t *data, size_t data_size, struct pac_da
 		struct spa_debug_context *debug_ctx)
 {
 	/*
-	 * BlueZ capabilites for the same codec may contain multiple
+	 * BlueZ capabilities for the same codec may contain multiple
 	 * PACs separated by zero-length LTV (see BlueZ b907befc2d80)
 	 */
 	int pac = 0;
@@ -1170,7 +1171,7 @@ static int codec_get_bis_config(const struct media_codec *codec, uint8_t *caps,
 		}
 	}
 
-	if ((preset == NULL) || (channel_allocation == 0))
+	if (preset == NULL)
 		return -EINVAL;
 
 	SPA_FOR_EACH_ELEMENT_VAR(bap_bcast_qos_configs, c) {

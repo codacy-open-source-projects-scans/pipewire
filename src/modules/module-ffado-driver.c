@@ -407,7 +407,7 @@ static int process_byte(struct port *p, uint32_t time, uint8_t byte,
 	int res = 0;
 	if (byte >= 0xf8) {
 		if (byte == 0xfd) {
-			pw_log_warn("droping invalid MIDI status bytes %08x", byte);
+			pw_log_warn("dropping invalid MIDI status bytes %08x", byte);
 			return false;
 		}
 		p->event_byte = byte;
@@ -944,12 +944,15 @@ static void on_ffado_timeout(void *data, uint64_t expirations)
 	uint64_t nsec;
 	ffado_wait_response response;
 
+	pw_log_trace_fp("wakeup %d", impl->done);
+
 	if (!impl->done) {
 		impl->pw_xrun++;
 		impl->new_xrun = true;
 		ffado_streaming_reset(impl->dev);
 	}
 again:
+	pw_log_trace_fp("FFADO wait");
 	response = ffado_streaming_wait(impl->dev);
 	nsec = get_time_ns(impl);
 
@@ -977,8 +980,8 @@ again:
 	if (!sink_running)
 		silence_playback(impl);
 
-	pw_log_trace_fp("process %d %u %u %p %d", impl->period_size, source_running,
-			sink_running, impl->position, impl->frame_time);
+	pw_log_trace_fp("process %d %u %u %p %d %"PRIu64, impl->period_size, source_running,
+			sink_running, impl->position, impl->frame_time, nsec);
 
 	if (impl->new_xrun) {
 		pw_log_warn("Xrun FFADO:%u PipeWire:%u source:%d sink:%d",
@@ -1010,7 +1013,7 @@ again:
 		c->duration = impl->period_size;
 		c->delay = 0;
 		c->rate_diff = 1.0;
-		c->next_nsec = nsec;
+		c->next_nsec = nsec + (c->duration * SPA_NSEC_PER_SEC) / impl->sample_rate;
 
 		c->target_rate = c->rate;
 		c->target_duration = c->duration;
@@ -1501,11 +1504,13 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 
 	pw_properties_set(impl->sink.props, PW_KEY_MEDIA_CLASS, "Audio/Sink");
 	pw_properties_set(impl->sink.props, PW_KEY_PRIORITY_DRIVER, "35000");
+	pw_properties_set(impl->sink.props, PW_KEY_PRIORITY_SESSION, "2000");
 	pw_properties_set(impl->sink.props, PW_KEY_NODE_NAME, "ffado_sink");
 	pw_properties_set(impl->sink.props, PW_KEY_NODE_DESCRIPTION, "FFADO Sink");
 
 	pw_properties_set(impl->source.props, PW_KEY_MEDIA_CLASS, "Audio/Source");
 	pw_properties_set(impl->source.props, PW_KEY_PRIORITY_DRIVER, "35001");
+	pw_properties_set(impl->source.props, PW_KEY_PRIORITY_SESSION, "2001");
 	pw_properties_set(impl->source.props, PW_KEY_NODE_NAME, "ffado_source");
 	pw_properties_set(impl->source.props, PW_KEY_NODE_DESCRIPTION, "FFADO Source");
 

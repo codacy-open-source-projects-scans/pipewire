@@ -603,6 +603,17 @@ static GstBuffer *dequeue_buffer(GstPipeWireSrc *pwsrc)
     GST_BUFFER_PTS (buf) = b->time - pwsrc->delay;
     GST_BUFFER_DTS (buf) = b->time - pwsrc->delay;
   }
+
+  if (pwsrc->is_video) {
+    if (pwsrc->video_info.fps_n) {
+      GST_BUFFER_DURATION (buf) = gst_util_uint64_scale (GST_SECOND,
+          pwsrc->video_info.fps_d, pwsrc->video_info.fps_n);
+    }
+  } else {
+    GST_BUFFER_DURATION (buf) = gst_util_uint64_scale (GST_SECOND,
+        time.size * time.rate.num, time.rate.denom);
+  }
+
   crop = data->crop;
   if (crop) {
     GstVideoCropMeta *meta = gst_buffer_get_video_crop_meta(buf);
@@ -1028,6 +1039,11 @@ handle_format_change (GstPipeWireSrc *pwsrc,
   if (pwsrc->caps && gst_caps_is_fixed (pwsrc->caps)) {
     pwsrc->negotiated = TRUE;
 
+    if (g_str_has_prefix (gst_structure_get_name (
+            gst_caps_get_structure (pwsrc->caps, 0)),
+          "video/")) {
+      pwsrc->is_video = TRUE;
+
 #ifdef HAVE_GSTREAMER_DMA_DRM
     if (gst_video_is_dma_drm_caps (pwsrc->caps)) {
       if (!gst_video_info_dma_drm_from_caps (&pwsrc->drm_info, pwsrc->caps)) {
@@ -1042,13 +1058,12 @@ handle_format_change (GstPipeWireSrc *pwsrc,
         pw_stream_set_error (pwsrc->stream, -EINVAL, "internal error");
         return;
       }
-
-      pwsrc->is_video = TRUE;
     } else {
       gst_video_info_dma_drm_init (&pwsrc->drm_info);
 #endif
-      pwsrc->is_video = gst_video_info_from_caps (&pwsrc->video_info,
-                                                  pwsrc->caps);
+      gst_video_info_from_caps (&pwsrc->video_info,
+          pwsrc->caps);
+      }
 #ifdef HAVE_GSTREAMER_DMA_DRM
     }
 #endif

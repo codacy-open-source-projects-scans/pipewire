@@ -524,7 +524,7 @@ struct pw_node_activation_state {
 
 static inline void pw_node_activation_state_reset(struct pw_node_activation_state *state)
 {
-        state->pending = state->required;
+	SPA_ATOMIC_STORE(state->pending, SPA_ATOMIC_LOAD(state->required));
 }
 
 #define pw_node_activation_state_dec(s) (SPA_ATOMIC_DEC(s->pending) == 0)
@@ -610,6 +610,40 @@ struct pw_node_activation {
 	uint32_t reposition_owner;			/* owner id with new reposition info, last one
 							 * to update wins */
 };
+
+static inline uint64_t get_time_ns(struct spa_system *system)
+{
+	struct timespec ts;
+	spa_system_clock_gettime(system, CLOCK_MONOTONIC, &ts);
+	return SPA_TIMESPEC_TO_NSEC(&ts);
+}
+
+static inline void wake_target(struct pw_node_target *t, uint64_t nsec)
+{
+	struct pw_node_activation *a = t->activation;
+
+	if (SPA_ATOMIC_CAS(a->status,
+				PW_NODE_ACTIVATION_NOT_TRIGGERED,
+				PW_NODE_ACTIVATION_TRIGGERED)) {
+		a->signal_time = nsec;
+		if (SPA_UNLIKELY(spa_system_eventfd_write(t->system, t->fd, 1) < 0))
+			pw_log_warn("%p: write failed %m", t->node);
+	}
+}
+
+/* called from data-loop decrement the dependency counter of the target and when
+ * there are no more dependencies, trigger the node. */
+static inline void trigger_target(struct pw_node_target *t, uint64_t nsec)
+{
+	struct pw_node_activation *a = t->activation;
+	struct pw_node_activation_state *state = &a->state[0];
+
+	pw_log_trace_fp("%p: (%s-%u) state:%p pending:%d/%d", t->node,
+			t->name, t->id, state, state->pending, state->required);
+
+	if (pw_node_activation_state_dec(state))
+		wake_target(t, nsec);
+}
 
 #define pw_impl_node_emit(o,m,v,...) spa_hook_list_call(&o->listener_list, struct pw_impl_node_events, m, v, ##__VA_ARGS__)
 #define pw_impl_node_emit_destroy(n)			pw_impl_node_emit(n, destroy, 0)
