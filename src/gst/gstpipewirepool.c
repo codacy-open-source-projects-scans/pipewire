@@ -117,43 +117,31 @@ void gst_pipewire_pool_wrap_buffer (GstPipeWirePool *pool, struct pw_buffer *b)
                              data,
                              pool_data_destroy);
   b->user_data = data;
+
+  pool->n_buffers++;
+}
+
+void gst_pipewire_pool_remove_buffer (GstPipeWirePool *pool, struct pw_buffer *b)
+{
+  GstPipeWirePoolData *data = b->user_data;
+
+  data->b = NULL;
+  data->header = NULL;
+  data->crop = NULL;
+  data->videotransform = NULL;
+
+  gst_buffer_remove_all_memory (data->buf);
+
+  /* this will also destroy the pool data, if this is the last reference */
+  gst_clear_buffer (&data->buf);
+
+  pool->n_buffers--;
 }
 
 GstPipeWirePoolData *gst_pipewire_pool_get_data (GstBuffer *buffer)
 {
   return gst_mini_object_get_qdata (GST_MINI_OBJECT_CAST (buffer), pool_data_quark);
 }
-
-#if 0
-gboolean
-gst_pipewire_pool_add_buffer (GstPipeWirePool *pool, GstBuffer *buffer)
-{
-  g_return_val_if_fail (GST_IS_PIPEWIRE_POOL (pool), FALSE);
-  g_return_val_if_fail (GST_IS_BUFFER (buffer), FALSE);
-
-  GST_OBJECT_LOCK (pool);
-  g_queue_push_tail (&pool->available, buffer);
-  g_cond_signal (&pool->cond);
-  GST_OBJECT_UNLOCK (pool);
-
-  return TRUE;
-}
-
-gboolean
-gst_pipewire_pool_remove_buffer (GstPipeWirePool *pool, GstBuffer *buffer)
-{
-  gboolean res;
-
-  g_return_val_if_fail (GST_IS_PIPEWIRE_POOL (pool), FALSE);
-  g_return_val_if_fail (GST_IS_BUFFER (buffer), FALSE);
-
-  GST_OBJECT_LOCK (pool);
-  res = g_queue_remove (&pool->available, buffer);
-  GST_OBJECT_UNLOCK (pool);
-
-  return res;
-}
-#endif
 
 static GstFlowReturn
 acquire_buffer (GstBufferPool * pool, GstBuffer ** buffer,
@@ -182,7 +170,7 @@ acquire_buffer (GstBufferPool * pool, GstBuffer ** buffer,
   *buffer = data->buf;
 
   GST_OBJECT_UNLOCK (pool);
-  GST_LOG_OBJECT (pool, "acquire buffer %p", buffer);
+  GST_LOG_OBJECT (pool, "acquire buffer %p", *buffer);
 
   return GST_FLOW_OK;
 

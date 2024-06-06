@@ -465,6 +465,7 @@ static void
 on_add_buffer (void *_data, struct pw_buffer *b)
 {
   GstPipeWireSink *pwsink = _data;
+  GST_DEBUG_OBJECT (pwsink, "add pw_buffer %p", b);
   gst_pipewire_pool_wrap_buffer (pwsink->pool, b);
 }
 
@@ -472,11 +473,15 @@ static void
 on_remove_buffer (void *_data, struct pw_buffer *b)
 {
   GstPipeWireSink *pwsink = _data;
-  GstPipeWirePoolData *data = b->user_data;
+  GST_DEBUG_OBJECT (pwsink, "remove pw_buffer %p", b);
+  gst_pipewire_pool_remove_buffer (pwsink->pool, b);
 
-  GST_LOG_OBJECT (pwsink, "remove buffer");
-
-  gst_buffer_unref (data->buf);
+  if (!gst_pipewire_pool_has_buffers (pwsink->pool) &&
+      !GST_BUFFER_POOL_IS_FLUSHING (GST_BUFFER_POOL_CAST (pwsink->pool))) {
+    GST_ELEMENT_ERROR (pwsink, RESOURCE, NOT_FOUND,
+        ("all buffers have been removed"),
+        ("PipeWire link to remote node was destroyed"));
+  }
 }
 
 static void
@@ -488,6 +493,8 @@ do_send_buffer (GstPipeWireSink *pwsink, GstBuffer *buffer)
   struct spa_buffer *b;
 
   data = gst_pipewire_pool_get_data(buffer);
+
+  GST_LOG_OBJECT (pwsink, "queue buffer %p, pw_buffer %p", buffer, data->b);
 
   b = data->b->buffer;
 
@@ -761,7 +768,6 @@ gst_pipewire_sink_render (GstBaseSink * bsink, GstBuffer * buffer)
       goto done_unlock;
   }
 
-  GST_DEBUG ("push buffer");
   do_send_buffer (pwsink, buffer);
   if (unref_buffer)
     gst_buffer_unref (buffer);
