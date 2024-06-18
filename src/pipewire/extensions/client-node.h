@@ -25,7 +25,7 @@ extern "C" {
 /*
  * version 4: new port_set_mix_info event added
  * version 5: driver nodes are scheduled on the client
- * version 6: nodes activate peer links themselves when ready
+ * version 6: client needs to set activation INACTIVE -> FINISHED
  */
 #define PW_VERSION_CLIENT_NODE			6
 struct pw_client_node;
