@@ -3,7 +3,6 @@
 /* SPDX-License-Identifier: MIT */
 
 #include "config.h"
-#include "pipewire/properties.h"
 
 #include <limits.h>
 #include <unistd.h>
@@ -180,7 +179,8 @@ static const struct spa_dict_item module_info[] = {
 
 struct sdp_info {
 	uint16_t hash;
-	uint32_t ntp;
+	uint32_t session_id;
+	uint32_t session_version;
 	uint32_t t_ntp;
 
 	char *origin;
@@ -376,7 +376,7 @@ static bool is_multicast(struct sockaddr *sa, socklen_t salen)
 static int make_unix_socket(const char *path) {
 	struct sockaddr_un addr;
 
-	spa_autoclose int fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+	spa_autoclose int fd = socket(AF_UNIX, SOCK_DGRAM | SOCK_CLOEXEC, 0);
 	if (fd < 0) {
 		pw_log_warn("Failed to create PTP management socket");
 		return -1;
@@ -529,9 +529,11 @@ static void update_ts_refclk(struct impl *impl)
 
 	// Read if something is left in the socket
 	int avail;
-	ioctl(impl->ptp_fd, FIONREAD, &avail);
 	uint8_t tmp;
-	while (avail--) read(impl->ptp_fd, &tmp, 1);
+
+	ioctl(impl->ptp_fd, FIONREAD, &avail);
+	pw_log_debug("Flushing stale data: %u bytes", avail);
+	while (avail-- && read(impl->ptp_fd, &tmp, 1));
 
 	struct ptp_management_msg req;
 	spa_zero(req);
@@ -688,12 +690,12 @@ static int send_sap(struct impl *impl, struct session *sess, bool bye)
 	   the end. */
 	spa_strbuf_append(&buf,
 			"v=0\n"
-			"o=%s %u 0 IN %s %s\n"
+			"o=%s %u %u IN %s %s\n"
 			"s=%s\n"
 			"c=IN %s %s%s\n"
 			"t=%u 0\n"
 			"m=%s %u RTP/AVP %i\n",
-			user_name, sdp->ntp, src_ip4 ? "IP4" : "IP6", src_addr,
+			user_name, sdp->session_id, sdp->session_version, src_ip4 ? "IP4" : "IP6", src_addr,
 			sdp->session_name,
 			dst_ip4 ? "IP4" : "IP6", dst_addr, dst_ttl,
 			sdp->t_ntp,
@@ -836,6 +838,10 @@ static struct session *session_new_announce(struct impl *impl, struct node *node
 	uint32_t port;
 	int res;
 
+	// We want to recreate the session with updated parameters, maybe
+	if (node->session)
+		session_free(node->session);
+
 	if (impl->n_sessions >= MAX_SESSIONS) {
 		pw_log_warn("too many sessions (%u >= %u)", impl->n_sessions, MAX_SESSIONS);
 		errno = EMFILE;
@@ -851,8 +857,25 @@ static struct session *session_new_announce(struct impl *impl, struct node *node
 	sess->announce = true;
 
 	sdp->hash = pw_rand32();
-	sdp->ntp = (uint32_t) time(NULL) + 2208988800U + impl->n_sessions;
-	sdp->t_ntp = pw_properties_get_uint32(props, "rtp.ntp", sdp->ntp);
+	if ((str = pw_properties_get(props, "sess.id")) != NULL) {
+		if (!spa_atou32(str, &sdp->session_id, 10)) {
+			pw_log_error("Invalid session id: %s (must be a uint32)", str);
+			goto error_free;
+		}
+		sdp->t_ntp = pw_properties_get_uint32(props, "rtp.ntp",
+				(uint32_t) time(NULL) + 2208988800U + impl->n_sessions);
+	} else {
+		sdp->session_id = (uint32_t) time(NULL) + 2208988800U + impl->n_sessions;
+		sdp->t_ntp = pw_properties_get_uint32(props, "rtp.ntp", sdp->session_id);
+	}
+	if ((str = pw_properties_get(props, "sess.version")) != NULL) {
+		if (!spa_atou32(str, &sdp->session_version, 10)) {
+			pw_log_error("Invalid session version: %s (must be a uint32)", str);
+			goto error_free;
+		}
+	} else {
+		sdp->session_version = sdp->t_ntp;
+	}
 	sess->props = props;
 
 	if ((str = pw_properties_get(props, "sess.name")) == NULL)
@@ -974,6 +997,10 @@ static int session_load_source(struct session *session, struct pw_properties *pr
 
 	if ((media = pw_properties_get(props, "sess.media")) == NULL)
 		media = "audio";
+
+	if ((str = pw_properties_get(props, "cleanup.sec")) != NULL) {
+		fprintf(f, "\"cleanup.sec\" = \"%s\", ", str);
+	}
 
 	if (spa_streq(media, "audio")) {
 		const char *mime;
@@ -1501,7 +1528,12 @@ static void node_event_info(void *data, const struct pw_node_info *info)
 	struct impl *impl = n->impl;
 	const char *str;
 
-	if (n->session != NULL || info == NULL)
+	if (info == NULL)
+		return;
+
+	// We only really want to do anything here if properties are updated,
+	// or if we don't have a session for this node already
+	if (!(info->change_mask & PW_NODE_CHANGE_MASK_PROPS) && n->session != NULL)
 		return;
 
 	n->info = pw_node_info_merge(n->info, info, true);

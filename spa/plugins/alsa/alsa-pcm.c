@@ -91,6 +91,64 @@ static void release_card(struct card *c)
 	free(c);
 }
 
+#define CHECK(s,msg,...) if ((err = (s)) < 0) { spa_log_error(state->log, msg ": %s", ##__VA_ARGS__, snd_strerror(err)); return err; }
+
+static int write_bind_ctl_param(struct state *state, const char *name, const char *param) {
+	int err;
+	unsigned int count, idx;
+	char _name[1024];
+
+	for (unsigned int i = 0; i < state->num_bind_ctls; i++) {
+		snd_ctl_elem_info_t *info = state->bound_ctls[i].info;
+		bool changed = false;
+		int type;
+
+		if(!state->bound_ctls[i].value || !info)
+			continue;
+
+		snprintf(_name, sizeof(_name), "api.alsa.bind-ctl.%s",
+				snd_ctl_elem_info_get_name(info));
+
+		if (!spa_streq(name, _name))
+			continue;
+
+		type = snd_ctl_elem_info_get_type(info);
+		count = snd_ctl_elem_info_get_count(info);
+
+		switch (type) {
+		case SND_CTL_ELEM_TYPE_BOOLEAN: {
+				bool b = spa_atob(param);
+
+				for (idx = 0; idx < count; idx++)
+					snd_ctl_elem_value_set_boolean(state->bound_ctls[i].value, idx, b);
+				changed = true;
+			}
+			break;
+
+		case SND_CTL_ELEM_TYPE_INTEGER: {
+				long l = (long) atoi(param);
+
+				for (idx = 0; idx < count; idx++)
+					snd_ctl_elem_value_set_integer(state->bound_ctls[i].value, idx, l);
+				changed = true;
+			}
+			break;
+
+		default:
+			spa_log_warn(state->log, "%s ctl '%s' not supported",
+					snd_ctl_elem_type_name(snd_ctl_elem_info_get_type(info)),
+					snd_ctl_elem_info_get_name(info));
+			break;
+		}
+
+		if(changed)
+			CHECK(snd_ctl_elem_write(state->ctl, state->bound_ctls[i].value), "snd_ctl_elem_write");
+		return 0;
+	}
+
+	return 0;
+}
+
 static int alsa_set_param(struct state *state, const char *k, const char *s)
 {
 	int fmt_change = 0;
@@ -144,6 +202,9 @@ static int alsa_set_param(struct state *state, const char *k, const char *s)
 	} else if (spa_streq(k, "clock.name")) {
 		spa_scnprintf(state->clock_name,
 				sizeof(state->clock_name), "%s", s);
+	} else if (spa_strstartswith(k,  "api.alsa.bind-ctl.")) {
+		write_bind_ctl_param(state, k, s);
+		fmt_change++;
 	} else
 		return 0;
 
@@ -628,7 +689,6 @@ int spa_alsa_parse_prop_params(struct state *state, struct spa_pod *params)
 	return changed;
 }
 
-#define CHECK(s,msg,...) if ((err = (s)) < 0) { spa_log_error(state->log, msg ": %s", ##__VA_ARGS__, snd_strerror(err)); return err; }
 
 static ssize_t log_write(void *cookie, const char *buf, size_t size)
 {
@@ -2245,7 +2305,9 @@ int spa_alsa_set_format(struct state *state, struct spa_audio_info *fmt, uint32_
 
 	state->max_delay = state->buffer_frames / 2;
 	if (spa_strstartswith(state->props.device, "a52") ||
-	    spa_strstartswith(state->props.device, "dca"))
+			spa_strstartswith(state->props.device, "dca") ||
+			(spa_strstartswith(state->props.device, "plug:") &&
+					strstr(state->props.device, "a52:")))
 		state->min_delay = SPA_MIN(2048u, state->buffer_frames);
 	else
 		state->min_delay = 0;
@@ -3758,7 +3820,10 @@ void spa_alsa_emit_port_info(struct state *state, bool full)
 		state->port_info.change_mask = state->port_info_all;
 	if (state->port_info.change_mask) {
 		uint32_t i;
-
+		static const struct spa_dict_item info_items[] = {
+			{ SPA_KEY_PORT_GROUP, "stream.0" },
+		};
+		state->port_info.props = &SPA_DICT_INIT_ARRAY(info_items);
 		if (state->port_info.change_mask & SPA_PORT_CHANGE_MASK_PARAMS) {
 			for (i = 0; i < state->port_info.n_params; i++) {
 				if (state->port_params[i].user > 0) {

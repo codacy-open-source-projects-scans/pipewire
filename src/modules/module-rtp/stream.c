@@ -344,7 +344,6 @@ struct rtp_stream *rtp_stream_new(struct pw_core *core,
 		impl->info.media_type = SPA_MEDIA_TYPE_audio;
 		impl->info.media_subtype = SPA_MEDIA_SUBTYPE_raw;
 		impl->payload = 0x60;
-		impl->marker_on_first = 1;
 	}
 	else if (spa_streq(str, "midi")) {
 		impl->info.media_type = SPA_MEDIA_TYPE_application;
@@ -424,6 +423,8 @@ struct rtp_stream *rtp_stream_new(struct pw_core *core,
 		pw_properties_set(props, PW_KEY_NODE_NETWORK, "true");
 
 	impl->marker_on_first = pw_properties_get_bool(props, "sess.marker-on-first", false);
+	if (spa_streq(str, "raop"))
+		impl->marker_on_first = 1;
 	impl->ignore_ssrc = pw_properties_get_bool(props, "sess.ignore-ssrc", false);
 	impl->direct_timestamp = pw_properties_get_bool(props, "sess.ts-direct", false);
 
@@ -632,7 +633,7 @@ int rtp_stream_receive_packet(struct rtp_stream *s, uint8_t *buffer, size_t len)
 	return impl->receive_rtp(impl, buffer, len);
 }
 
-uint64_t rtp_stream_get_time(struct rtp_stream *s, uint64_t *rate)
+uint64_t rtp_stream_get_time(struct rtp_stream *s, uint32_t *rate)
 {
 	struct impl *impl = (struct impl*)s;
 	struct spa_io_position *pos = impl->io_position;
