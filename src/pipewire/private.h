@@ -563,6 +563,8 @@ static inline void copy_target(struct pw_node_target *dst, const struct pw_node_
  */
 #define PW_VERSION_NODE_ACTIVATION	1
 
+#define PW_NODE_ACTIVATION_PENDING_TRIGGER(status) ((status) <= PW_NODE_ACTIVATION_AWAKE)
+
 /* nodes start as INACTIVE, when they are ready to be scheduled, they add their
  * fd to the loop and change status to FINISHED. When the node shuts down, the
  * status is set back to INACTIVE.
@@ -591,10 +593,12 @@ struct pw_node_activation {
 
 	struct pw_node_activation_state state[2];	/* one current state and one next state,
 							 * as version flag */
-	uint64_t signal_time;
-	uint64_t awake_time;
-	uint64_t finish_time;
-	uint64_t prev_signal_time;
+	uint64_t signal_time;                           /* time at which the node was triggered (i.e. marked
+							 * as ready to start processing in the current loop
+							 * iteration) */
+	uint64_t awake_time;                            /* time at which processing actually started */
+	uint64_t finish_time;                           /* time at which processing was completed */
+	uint64_t prev_signal_time;                      /* previous time at which the node was triggered */
 
 	/* updates */
 	struct spa_io_segment reposition;		/* reposition info, used when driver reposition_owner

@@ -65,7 +65,7 @@
  * - `net.ttl = <int>`: TTL to use, default 1
  * - `net.loop = <bool>`: loopback multicast, default false
  * - `netjack2.connect`: if jack ports should be connected automatically. Can also be
- *                   placed per stream.
+ *                   placed per stream, default false.
  * - `netjack2.sample-rate`: the sample rate to use, default 48000
  * - `netjack2.period-size`: the buffer size to use, default 1024
  * - `netjack2.encoding`: the encoding, float|opus|int, default float
@@ -133,6 +133,7 @@ PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
 
 #define NETWORK_MAX_LATENCY	30
 
+#define DEFAULT_CONNECT		false
 #define DEFAULT_SAMPLE_RATE	48000
 #define DEFAULT_PERIOD_SIZE	1024
 #define DEFAULT_ENCODING	"float"
@@ -148,7 +149,7 @@ PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
 			"( net.mtu=<MTU to use, default 1500> ) "		\
 			"( net.ttl=<TTL to use, default 1> ) "			\
 			"( net.loop=<loopback, default false> ) "		\
-			"( netjack2.connect=<bool, autoconnect ports> ) "	\
+			"( netjack2.connect=<autoconnect ports, default false> ) "	\
 			"( netjack2.sample-rate=<sampl erate, default 48000> ) "\
 			"( netjack2.period-size=<period size, default 1024> ) "	\
 			"( midi.ports=<number of midi ports> ) "		\
@@ -297,6 +298,8 @@ static void stream_state_changed(void *d, enum pw_filter_state old,
 	struct impl *impl = s->impl;
 	switch (state) {
 	case PW_FILTER_STATE_ERROR:
+		pw_log_warn("stream %p: error: %s", s, error);
+		break;
 	case PW_FILTER_STATE_UNCONNECTED:
 		pw_impl_module_schedule_destroy(impl->module);
 		break;
@@ -390,11 +393,8 @@ static void follower_free(struct follower *follower)
 	free(follower);
 }
 
-static int
-do_stop_follower(struct spa_loop *loop,
-	bool async, uint32_t seq, const void *data, size_t size, void *user_data)
+static int stop_follower(struct follower *follower)
 {
-	struct follower *follower = user_data;
 	follower->started = false;
 	if (follower->source.filter)
 		pw_filter_set_active(follower->source.filter, false);
@@ -421,12 +421,10 @@ static void
 on_setup_io(void *data, int fd, uint32_t mask)
 {
 	struct follower *follower = data;
-	struct impl *impl = follower->impl;
 
 	if (mask & (SPA_IO_ERR | SPA_IO_HUP)) {
 		pw_log_warn("error:%08x", mask);
-		pw_loop_destroy_source(impl->main_loop, follower->setup_socket);
-		follower->setup_socket = NULL;
+		stop_follower(follower);
 		return;
 	}
 	if (mask & SPA_IO_IN) {
@@ -471,7 +469,6 @@ on_data_io(void *data, int fd, uint32_t mask)
 		pw_log_warn("error:%08x", mask);
 		pw_loop_destroy_source(impl->data_loop, follower->socket);
 		follower->socket = NULL;
-		pw_loop_invoke(impl->main_loop, do_stop_follower, 1, NULL, 0, false, follower);
 		return;
 	}
 	if (mask & SPA_IO_IN) {
@@ -517,21 +514,13 @@ static void make_stream_ports(struct stream *s)
 	struct follower *follower = s->follower;
 	uint32_t i;
 	struct pw_properties *props;
-	const char *str, *prefix;
+	const char *str;
 	char name[256];
 	bool is_midi;
 	uint8_t buffer[512];
 	struct spa_pod_builder b;
 	struct spa_latency_info latency;
 	const struct spa_pod *params[1];
-
-	if (s->direction == PW_DIRECTION_INPUT) {
-		/* sink */
-		prefix = "playback";
-	} else {
-		/* source */
-		prefix = "capture";
-	}
 
 	for (i = 0; i < s->n_ports; i++) {
 		struct port *port = s->ports[i];
@@ -543,25 +532,20 @@ static void make_stream_ports(struct stream *s)
 		if (i < s->info.channels) {
 			str = spa_debug_type_find_short_name(spa_type_audio_channel,
 					s->info.position[i]);
-			if (str)
-				snprintf(name, sizeof(name), "%s_%s", prefix, str);
-			else
-				snprintf(name, sizeof(name), "%s_%d", prefix, i);
 
 			props = pw_properties_new(
 					PW_KEY_FORMAT_DSP, "32 bit float mono audio",
 					PW_KEY_AUDIO_CHANNEL, str ? str : "UNK",
 					PW_KEY_PORT_PHYSICAL, "true",
-					PW_KEY_PORT_NAME, name,
 					NULL);
 
 			is_midi = false;
 		} else {
-			snprintf(name, sizeof(name), "%s_%d", prefix, i - s->info.channels);
+			snprintf(name, sizeof(name), "midi%d", i - s->info.channels);
 			props = pw_properties_new(
 					PW_KEY_FORMAT_DSP, "8 bit raw midi",
-					PW_KEY_PORT_NAME, name,
 					PW_KEY_PORT_PHYSICAL, "true",
+					PW_KEY_AUDIO_CHANNEL, name,
 					NULL);
 
 			is_midi = true;
@@ -753,7 +737,7 @@ static bool is_multicast(struct sockaddr *sa, socklen_t salen)
 }
 
 static int make_data_socket(struct sockaddr_storage *sa, socklen_t salen,
-		bool loop, int ttl, int dscp, char *ifname)
+		bool loop, int ttl, int dscp, const char *ifname)
 {
 	int af, fd, val, res;
 	struct timeval timeout;
@@ -763,6 +747,13 @@ static int make_data_socket(struct sockaddr_storage *sa, socklen_t salen,
 		pw_log_error("socket failed: %m");
 		return -errno;
 	}
+#ifdef SO_BINDTODEVICE
+	if (ifname && setsockopt(fd, SOL_SOCKET, SO_BINDTODEVICE, ifname, strlen(ifname)) < 0) {
+		res = -errno;
+		pw_log_error("setsockopt(SO_BINDTODEVICE) failed: %m");
+		goto error;
+	}
+#endif
 	if (connect(fd, (struct sockaddr*)sa, salen) < 0) {
 		res = -errno;
 		pw_log_error("connect() failed: %m");
@@ -795,7 +786,7 @@ error:
 }
 
 static int make_announce_socket(struct sockaddr_storage *sa, socklen_t salen,
-		char *ifname)
+		const char *ifname)
 {
 	int af, fd, val, res;
 	struct ifreq req;
@@ -963,7 +954,8 @@ static int handle_follower_available(struct impl *impl, struct nj2_session_param
 		goto create_failed;
 
 	fd = make_data_socket(addr, addr_len, impl->loop,
-			impl->ttl, impl->dscp, NULL);
+			impl->ttl, impl->dscp,
+			pw_properties_get(impl->props, "local.ifname"));
 	if (fd < 0)
 		goto socket_failed;
 
@@ -1089,8 +1081,10 @@ static int create_netjack2_socket(struct impl *impl)
 	impl->ttl = pw_properties_get_uint32(impl->props, "net.ttl", DEFAULT_NET_TTL);
 	impl->loop = pw_properties_get_bool(impl->props, "net.loop", DEFAULT_NET_LOOP);
 	impl->dscp = pw_properties_get_uint32(impl->props, "net.dscp", DEFAULT_NET_DSCP);
+	str = pw_properties_get(impl->props, "local.ifname");
 
-	fd = make_announce_socket(&impl->src_addr, impl->src_len, NULL);
+	fd = make_announce_socket(&impl->src_addr, impl->src_len,
+			pw_properties_get(impl->props, "local.ifname"));
 	if (fd < 0) {
 		res = fd;
 		pw_log_error("can't create socket: %s", spa_strerror(res));
@@ -1329,10 +1323,7 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	if (pw_properties_get(props, PW_KEY_NODE_LOCK_RATE) == NULL)
 		pw_properties_set(props, PW_KEY_NODE_LOCK_RATE, "true");
 
-	pw_properties_set(impl->sink_props, PW_KEY_MEDIA_CLASS, "Audio/Sink");
 	pw_properties_set(impl->sink_props, PW_KEY_NODE_NAME, "netjack2_manager_send");
-
-	pw_properties_set(impl->source_props, PW_KEY_MEDIA_CLASS, "Audio/Source");
 	pw_properties_set(impl->source_props, PW_KEY_NODE_NAME, "netjack2_manager_recv");
 
 	if ((str = pw_properties_get(props, "sink.props")) != NULL)
@@ -1349,6 +1340,26 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	copy_props(impl, props, PW_KEY_NODE_LOCK_RATE);
 	copy_props(impl, props, PW_KEY_AUDIO_CHANNELS);
 	copy_props(impl, props, SPA_KEY_AUDIO_POSITION);
+	copy_props(impl, props, "netjack2.connect");
+
+	if (pw_properties_get_bool(impl->sink_props, "netjack2.connect", DEFAULT_CONNECT)) {
+		if (pw_properties_get(impl->sink_props, PW_KEY_NODE_AUTOCONNECT) == NULL)
+			pw_properties_set(impl->sink_props, PW_KEY_NODE_AUTOCONNECT, "true");
+		if (pw_properties_get(impl->sink_props, PW_KEY_MEDIA_CLASS) == NULL)
+			pw_properties_set(impl->sink_props, PW_KEY_MEDIA_CLASS, "Stream/Input/Audio");
+	} else {
+		if (pw_properties_get(impl->sink_props, PW_KEY_MEDIA_CLASS) == NULL)
+			pw_properties_set(impl->sink_props, PW_KEY_MEDIA_CLASS, "Audio/Sink");
+	}
+	if (pw_properties_get_bool(impl->source_props, "netjack2.connect", DEFAULT_CONNECT)) {
+		if (pw_properties_get(impl->source_props, PW_KEY_NODE_AUTOCONNECT) == NULL)
+			pw_properties_set(impl->source_props, PW_KEY_NODE_AUTOCONNECT, "true");
+		if (pw_properties_get(impl->source_props, PW_KEY_MEDIA_CLASS) == NULL)
+			pw_properties_set(impl->source_props, PW_KEY_MEDIA_CLASS, "Stream/Output/Audio");
+	} else {
+		if (pw_properties_get(impl->source_props, PW_KEY_MEDIA_CLASS) == NULL)
+			pw_properties_set(impl->source_props, PW_KEY_MEDIA_CLASS, "Audio/Source");
+	}
 
 	impl->core = pw_context_get_object(impl->context, PW_TYPE_INTERFACE_Core);
 	if (impl->core == NULL) {
