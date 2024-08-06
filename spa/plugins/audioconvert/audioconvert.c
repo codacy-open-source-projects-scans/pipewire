@@ -28,6 +28,7 @@
 #include <spa/pod/filter.h>
 #include <spa/pod/dynamic.h>
 #include <spa/debug/types.h>
+#include <spa/control/ump-utils.h>
 
 #include "volume-ops.h"
 #include "fmt-ops.h"
@@ -193,6 +194,7 @@ struct impl {
 
 	struct spa_log *log;
 	struct spa_cpu *cpu;
+	struct spa_loop *data_loop;
 
 	uint32_t cpu_flags;
 	uint32_t max_align;
@@ -301,7 +303,7 @@ static void emit_port_info(struct impl *this, struct port *port, bool full)
 				items[n_items++] = SPA_DICT_ITEM_INIT(SPA_KEY_PORT_IGNORE_LATENCY, "true");
 		} else if (PORT_IS_CONTROL(this, port->direction, port->id)) {
 			items[n_items++] = SPA_DICT_ITEM_INIT(SPA_KEY_PORT_NAME, "control");
-			items[n_items++] = SPA_DICT_ITEM_INIT(SPA_KEY_FORMAT_DSP, "8 bit raw midi");
+			items[n_items++] = SPA_DICT_ITEM_INIT(SPA_KEY_FORMAT_DSP, "32 bit raw UMP");
 		}
 		if (this->group_name[0] != '\0')
 			items[n_items++] = SPA_DICT_ITEM_INIT(SPA_KEY_PORT_GROUP, this->group_name);
@@ -1258,17 +1260,19 @@ static int apply_props(struct impl *this, const struct spa_pod *param)
 
 static int apply_midi(struct impl *this, const struct spa_pod *value)
 {
-	const uint8_t *val = SPA_POD_BODY(value);
-	uint32_t size = SPA_POD_BODY_SIZE(value);
 	struct props *p = &this->props;
+	uint8_t data[8];
+	int size;
 
+	size = spa_ump_to_midi(SPA_POD_BODY(value), SPA_POD_BODY_SIZE(value),
+			data, sizeof(data));
 	if (size < 3)
 		return -EINVAL;
 
-	if ((val[0] & 0xf0) != 0xb0 || val[1] != 7)
+	if ((data[0] & 0xf0) != 0xb0 || data[1] != 7)
 		return 0;
 
-	p->volume = val[2] / 127.0f;
+	p->volume = data[2] / 127.0f;
 	set_volume(this);
 	return 1;
 }
@@ -2070,7 +2074,9 @@ static int port_enum_formats(void *object,
 			*param = spa_pod_builder_add_object(builder,
 				SPA_TYPE_OBJECT_Format, SPA_PARAM_EnumFormat,
 				SPA_FORMAT_mediaType,      SPA_POD_Id(SPA_MEDIA_TYPE_application),
-				SPA_FORMAT_mediaSubtype,   SPA_POD_Id(SPA_MEDIA_SUBTYPE_control));
+				SPA_FORMAT_mediaSubtype,   SPA_POD_Id(SPA_MEDIA_SUBTYPE_control),
+				SPA_FORMAT_CONTROL_types,  SPA_POD_CHOICE_FLAGS_Int(
+					(1u<<SPA_CONTROL_UMP) | (1u<<SPA_CONTROL_Properties)));
 		} else {
 			struct spa_pod_frame f[1];
 			uint32_t rate = this->io_position ?
@@ -2176,7 +2182,9 @@ impl_node_port_enum_params(void *object, int seq,
 			param = spa_pod_builder_add_object(&b,
 				SPA_TYPE_OBJECT_Format,  id,
 				SPA_FORMAT_mediaType,    SPA_POD_Id(SPA_MEDIA_TYPE_application),
-				SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_control));
+				SPA_FORMAT_mediaSubtype, SPA_POD_Id(SPA_MEDIA_SUBTYPE_control),
+				SPA_FORMAT_CONTROL_types,  SPA_POD_Int(
+					(1u<<SPA_CONTROL_UMP) | (1u<<SPA_CONTROL_Properties)));
 		else
 			param = spa_format_audio_raw_build(&b, id, &port->format.info.raw);
 		break;
@@ -2448,7 +2456,7 @@ static int port_set_format(void *object,
 
 	port = GET_PORT(this, direction, port_id);
 
-	spa_log_debug(this->log, "%p: set format", this);
+	spa_log_debug(this->log, "%p: %d:%d set format", this, direction, port_id);
 
 	if (format == NULL) {
 		port->have_format = false;
@@ -2677,6 +2685,20 @@ impl_node_port_use_buffers(void *object,
 	return 0;
 }
 
+struct io_data {
+	struct port *port;
+	void *data;
+	size_t size;
+};
+
+static int do_set_port_io(struct spa_loop *loop, bool async, uint32_t seq,
+		const void *data, size_t size, void *user_data)
+{
+	const struct io_data *d = user_data;
+	d->port->io = d->data;
+	return 0;
+}
+
 static int
 impl_node_port_set_io(void *object,
 		      enum spa_direction direction, uint32_t port_id,
@@ -2696,7 +2718,12 @@ impl_node_port_set_io(void *object,
 
 	switch (id) {
 	case SPA_IO_Buffers:
-		port->io = data;
+		if (this->data_loop) {
+			struct io_data d = { .port = port, .data = data, .size = size };
+			spa_loop_invoke(this->data_loop, do_set_port_io, 0, NULL, 0, true, &d);
+		}
+		else
+			port->io = data;
 		break;
 	case SPA_IO_RateMatch:
 		this->io_rate_match = data;
@@ -2788,7 +2815,7 @@ static int channelmix_process_apply_sequence(struct impl *this,
 
 		if (prev) {
 			switch (prev->type) {
-			case SPA_CONTROL_Midi:
+			case SPA_CONTROL_UMP:
 				apply_midi(this, &prev->value);
 				break;
 			case SPA_CONTROL_Properties:
@@ -3432,6 +3459,7 @@ impl_init(const struct spa_handle_factory *factory,
 
 	this = (struct impl *) handle;
 
+	this->data_loop = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_DataLoop);
 	this->log = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_Log);
 	spa_log_topic_init(this->log, &log_topic);
 

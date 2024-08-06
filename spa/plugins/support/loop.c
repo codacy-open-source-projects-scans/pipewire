@@ -212,9 +212,12 @@ static void flush_all_queues(struct impl *impl)
 		 * read index before we call the function because then the item
 		 * might get overwritten. */
 		func = spa_steal_ptr(item->func);
-		if (func)
+		if (func) {
+			pthread_mutex_unlock(&impl->queue_lock);
 			item->res = func(&impl->loop, true, item->seq, item->data,
 				item->size, item->user_data);
+			pthread_mutex_lock(&impl->queue_lock);
+		}
 
 		/* if this function did a recursive invoke, it now flushed the
 		 * ringbuffer and we can exit */
@@ -313,13 +316,9 @@ retry:
 		if (block) {
 			uint64_t count = 1;
 
-			spa_loop_control_hook_before(&impl->hooks_list);
-
 			if ((res = spa_system_eventfd_read(impl->system, queue->ack_fd, &count)) < 0)
 				spa_log_warn(impl->log, "%p: failed to read event fd:%d: %s",
 						queue, queue->ack_fd, spa_strerror(res));
-
-			spa_loop_control_hook_after(&impl->hooks_list);
 
 			res = item->res;
 		}
