@@ -850,6 +850,49 @@ static struct session *session_new_announce(struct impl *impl, struct node *node
 		return NULL;
 	}
 
+	if (impl->sap_fd == -1) {
+		int fd;
+		char addr[64];
+
+		if ((str = pw_properties_get(props, "source.ip")) == NULL) {
+			if (impl->ifname) {
+				int fd = socket(impl->sap_addr.ss_family, SOCK_DGRAM, 0);
+				if (fd >= 0) {
+					struct ifreq req;
+					spa_zero(req);
+					req.ifr_addr.sa_family = impl->sap_addr.ss_family;
+					snprintf(req.ifr_name, sizeof(req.ifr_name), "%s", impl->ifname);
+					res = ioctl(fd, SIOCGIFADDR, &req);
+					if (res < 0)
+						pw_log_warn("SIOCGIFADDR %s failed: %m", impl->ifname);
+					str = inet_ntop(req.ifr_addr.sa_family,
+							&((struct sockaddr_in *)&req.ifr_addr)->sin_addr,
+							addr, sizeof(addr));
+					if (str == NULL) {
+						pw_log_warn("can't parse interface ip: %m");
+					} else {
+						pw_log_info("interface %s IP: %s", impl->ifname, str);
+					}
+					close(fd);
+				}
+			}
+			if (str == NULL)
+				str = impl->sap_addr.ss_family == AF_INET ?
+					DEFAULT_SOURCE_IP : DEFAULT_SOURCE_IP6;
+		}
+		if ((res = pw_net_parse_address(str, 0, &impl->src_addr, &impl->src_len)) < 0) {
+			pw_log_error("invalid source.ip %s: %s", str, spa_strerror(res));
+			return NULL;
+		}
+
+		if ((fd = make_send_socket(&impl->src_addr, impl->src_len,
+						&impl->sap_addr, impl->sap_len,
+						impl->mcast_loop, impl->ttl)) < 0)
+			return NULL;
+
+		impl->sap_fd = fd;
+	}
+
 	sess = calloc(1, sizeof(struct session));
 	if (sess == NULL)
 		return NULL;
@@ -1482,16 +1525,9 @@ on_sap_io(void *data, int fd, uint32_t mask)
 
 static int start_sap(struct impl *impl)
 {
-	int fd, res;
+	int fd = -1, res;
 	struct timespec value, interval;
 	char addr[128] = "invalid";
-
-	if ((fd = make_send_socket(&impl->src_addr, impl->src_len,
-					&impl->sap_addr, impl->sap_len,
-					impl->mcast_loop, impl->ttl)) < 0)
-		return fd;
-
-	impl->sap_fd = fd;
 
 	pw_log_info("starting SAP timer");
 	impl->timer = pw_loop_add_timer(impl->loop, on_timer_event, impl);
@@ -1520,7 +1556,8 @@ static int start_sap(struct impl *impl)
 
 	return 0;
 error:
-	close(fd);
+	if (fd > 0)
+		close(fd);
 	return res;
 }
 
@@ -1708,7 +1745,6 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	uint32_t port;
 	const char *str;
 	int res = 0;
-	char addr[64];
 
 	PW_LOG_TOPIC_INIT(mod_topic);
 
@@ -1752,37 +1788,6 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	}
 	impl->cleanup_interval = pw_properties_get_uint32(impl->props,
 			"sap.cleanup.sec", DEFAULT_CLEANUP_SEC);
-
-	if ((str = pw_properties_get(props, "source.ip")) == NULL) {
-		if (impl->ifname) {
-			int fd = socket(impl->sap_addr.ss_family, SOCK_DGRAM, 0);
-			if (fd >= 0) {
-				struct ifreq req;
-				spa_zero(req);
-				req.ifr_addr.sa_family = impl->sap_addr.ss_family;
-				snprintf(req.ifr_name, sizeof(req.ifr_name), "%s", impl->ifname);
-				res = ioctl(fd, SIOCGIFADDR, &req);
-				if (res < 0)
-					pw_log_warn("SIOCGIFADDR %s failed: %m", impl->ifname);
-				str = inet_ntop(req.ifr_addr.sa_family,
-						&((struct sockaddr_in *)&req.ifr_addr)->sin_addr,
-						addr, sizeof(addr));
-				if (str == NULL) {
-					pw_log_warn("can't parse interface ip: %m");
-				} else {
-					pw_log_info("interface %s IP: %s", impl->ifname, str);
-				}
-				close(fd);
-			}
-		}
-		if (str == NULL)
-			str = impl->sap_addr.ss_family == AF_INET ?
-				DEFAULT_SOURCE_IP : DEFAULT_SOURCE_IP6;
-	}
-	if ((res = pw_net_parse_address(str, 0, &impl->src_addr, &impl->src_len)) < 0) {
-		pw_log_error("invalid source.ip %s: %s", str, spa_strerror(res));
-		goto out;
-	}
 
 	impl->ttl = pw_properties_get_uint32(props, "net.ttl", DEFAULT_TTL);
 	impl->mcast_loop = pw_properties_get_bool(props, "net.loop", DEFAULT_LOOP);
