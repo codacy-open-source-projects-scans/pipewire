@@ -1,5 +1,6 @@
 /* PipeWire */
 /* SPDX-FileCopyrightText: Copyright © 2018 Wim Taymans */
+/* SPDX-FileCopyrightText: Copyright © 2024 Nedko Arnaudov */
 /* SPDX-License-Identifier: MIT */
 
 #include "config.h"
@@ -142,11 +143,16 @@ struct object {
 #define INTERFACE_Port		1
 #define INTERFACE_Node		2
 #define INTERFACE_Link		3
+#define INTERFACE_Client	4
 	uint32_t type;
 	uint32_t id;
 	uint32_t serial;
 
 	union {
+		struct {
+			char name[1024];
+			int32_t pid;
+		} pwclient;
 		struct {
 			char name[JACK_CLIENT_NAME_SIZE+1];
 			char node_name[512];
@@ -879,6 +885,11 @@ static struct object *find_type(struct client *c, uint32_t id, uint32_t type, bo
 	return NULL;
 }
 
+static struct object *find_client(struct client *c, uint32_t client_id)
+{
+	return find_type(c, client_id, INTERFACE_Client, false);
+}
+
 static struct object *find_link(struct client *c, uint32_t src, uint32_t dst)
 {
 	struct object *l;
@@ -938,11 +949,11 @@ void jack_get_version(int *major_ptr, int *minor_ptr, int *micro_ptr, int *proto
 	if (major_ptr)
 		*major_ptr = 3;
 	if (minor_ptr)
-		*minor_ptr = 0;
+		*minor_ptr = PW_MAJOR;
 	if (micro_ptr)
-		*micro_ptr = 0;
+		*micro_ptr = PW_MINOR;
 	if (proto_ptr)
-		*proto_ptr = 0;
+		*proto_ptr = PW_MICRO;
 }
 
 #define do_callback_expr(c,expr,callback,do_emit,...)		\
@@ -989,7 +1000,10 @@ const char *
 jack_get_version_string(void)
 {
 	static char name[1024];
-	snprintf(name, sizeof(name), "3.0.0.0 (using PipeWire %s)", pw_get_library_version());
+	int major, minor, micro, proto;
+	jack_get_version(&major, &minor, &micro, &proto);
+	snprintf(name, sizeof(name), "%d.%d.%d.%d (using PipeWire %s)",
+			major, minor, micro, proto, pw_get_library_version());
 	return name;
 }
 
@@ -2915,7 +2929,8 @@ static int client_node_port_use_buffers(void *data,
 
 	if (n_buffers > MAX_BUFFERS) {
 		pw_log_error("%p: too many buffers %u > %u", c, n_buffers, MAX_BUFFERS);
-		return -ENOSPC;
+		res = -ENOSPC;
+		goto done;
 	}
 
 	fl = PW_MEMMAP_FLAG_READ;
@@ -3029,9 +3044,11 @@ static int client_node_port_use_buffers(void *data,
 	mix->n_buffers = n_buffers;
 	res = 0;
 
-      done:
+done:
 	if (res < 0)
-		pw_proxy_error((struct pw_proxy*)c->node, res, spa_strerror(res));
+		pw_proxy_errorf((struct pw_proxy*)c->node, res,
+				"port_use_buffers(%u:%u:%u): %s", direction, port_id,
+				mix_id, spa_strerror(res));
 	return res;
 }
 
@@ -3096,7 +3113,9 @@ exit_free:
 	pw_memmap_free(old);
 exit:
 	if (res < 0)
-		pw_proxy_error((struct pw_proxy*)c->node, res, spa_strerror(res));
+		pw_proxy_errorf((struct pw_proxy*)c->node, res,
+				"port_set_io(%u:%u:%u %u): %s", direction, port_id,
+				mix_id, id, spa_strerror(res));
 	return res;
 }
 
@@ -3229,7 +3248,8 @@ static int client_node_set_activation(void *data,
 
       exit:
 	if (res < 0)
-		pw_proxy_error((struct pw_proxy*)c->node, res, spa_strerror(res));
+		pw_proxy_errorf((struct pw_proxy*)c->node, res,
+				"set_activation(%u): %s", node_id, spa_strerror(res));
 	return res;
 }
 
@@ -3246,7 +3266,7 @@ static int client_node_port_set_mix_info(void *data,
 	int res = 0;
 
 	if (p == NULL || !p->valid) {
-		res = -EINVAL;
+		res = peer_id == SPA_ID_INVALID ? 0 : -EINVAL;
 		goto exit;
 	}
 
@@ -3270,7 +3290,9 @@ static int client_node_port_set_mix_info(void *data,
 	}
 exit:
 	if (res < 0)
-		pw_proxy_error((struct pw_proxy*)c->node, res, spa_strerror(res));
+		pw_proxy_errorf((struct pw_proxy*)c->node, res,
+				"set_mix_info(%u:%u:%u %u): %s", direction, port_id,
+				mix_id, peer_id, spa_strerror(res));
 	return res;
 }
 
@@ -3670,6 +3692,7 @@ static void registry_event_global(void *data, uint32_t id,
 	const char *str;
 	bool do_emit = true, do_sync = false;
 	uint32_t serial;
+	const char *app;
 
 	if (props == NULL)
 		return;
@@ -3680,8 +3703,30 @@ static void registry_event_global(void *data, uint32_t id,
 
 	pw_log_debug("new %s id:%u serial:%u", type, id, serial);
 
-	if (spa_streq(type, PW_TYPE_INTERFACE_Node)) {
-		const char *app, *node_name;
+	if (spa_streq(type, PW_TYPE_INTERFACE_Client)) {
+		app = spa_dict_lookup(props, PW_KEY_APP_NAME);
+
+		if ((str = spa_dict_lookup(props, PW_KEY_SEC_PID)) != NULL) {
+			pw_log_debug("%p: pid of \"%s\" is \"%s\"", c, app, str);
+		} else {
+			pw_log_debug("%p: pid of \"%s\" is unknown", c, app);
+		}
+
+		o = alloc_object(c, INTERFACE_Client);
+		if (o == NULL)
+			goto exit;
+
+		o->pwclient.pid = (int32_t)atoi(str);
+		snprintf(o->pwclient.name, sizeof(o->pwclient.name), "%s", app);
+
+		pw_log_debug("%p: add pw client %d (%s) pid %llu", c, id, app, (unsigned long long)o->pwclient.pid);
+
+		pthread_mutex_lock(&c->context.lock);
+		spa_list_append(&c->context.objects, &o->link);
+		pthread_mutex_unlock(&c->context.lock);
+	}
+	else if (spa_streq(type, PW_TYPE_INTERFACE_Node)) {
+		const char *node_name;
 		char tmp[JACK_CLIENT_NAME_SIZE+1];
 
 		o = alloc_object(c, INTERFACE_Node);
@@ -4040,6 +4085,9 @@ static void registry_event_global_remove(void *data, uint32_t id)
 	o->removing = true;
 
 	switch (o->type) {
+	case INTERFACE_Client:
+		free_object(c, o);
+		break;
 	case INTERFACE_Node:
 		if (c->metadata) {
 			if (spa_streq(o->node.node_name, c->metadata->default_audio_sink))
@@ -4110,10 +4158,12 @@ static int execute_match(void *data, const char *location, const char *action,
 	return 1;
 }
 
+static struct client * g_first_client;
+
 SPA_EXPORT
 jack_client_t * jack_client_open (const char *client_name,
                                   jack_options_t options,
-                                  jack_status_t *status, ...)
+                                  jack_status_t *status_ptr, ...)
 {
 	struct client *client;
 	const struct spa_support *support;
@@ -4122,7 +4172,7 @@ jack_client_t * jack_client_open (const char *client_name,
 	struct spa_cpu *cpu_iface;
 	const struct pw_properties *props;
 	va_list ap;
-
+        jack_status_t status;
         if (getenv("PIPEWIRE_NOJACK") != NULL ||
             getenv("PIPEWIRE_INTERNAL") != NULL ||
 	    spa_strstartswith(pw_get_library_version(), "0.2"))
@@ -4136,7 +4186,7 @@ jack_client_t * jack_client_open (const char *client_name,
 
 	pw_log_info("%p: open '%s' options:%d", client, client_name, options);
 
-	va_start(ap, status);
+	va_start(ap, status_ptr);
 	varargs_parse(client, options, ap);
 	va_end(ap);
 
@@ -4375,8 +4425,9 @@ jack_client_t * jack_client_open (const char *client_name,
 
 	client->rt_max = pw_properties_get_int32(client->props, "rt.prio", DEFAULT_RT_MAX);
 
-	if (status)
-		*status = 0;
+	status = 0;
+	if (status_ptr)
+		*status_ptr = status;
 
 	client->pending_sync = pw_proxy_sync((struct pw_proxy*)client->core, client->pending_sync);
 
@@ -4391,12 +4442,16 @@ jack_client_t * jack_client_open (const char *client_name,
 	}
 
 	if (!spa_streq(client->name, client_name)) {
-		if (status)
-			*status |= JackNameNotUnique;
+		status |= JackNameNotUnique;
+		if (status_ptr)
+			*status_ptr = status;
 		if (options & JackUseExactName)
 			goto exit_unlock;
 	}
 	pw_thread_loop_unlock(client->context.loop);
+
+	if (g_first_client == NULL)
+		g_first_client = client;
 
 	pw_thread_loop_start(client->context.notify);
 
@@ -4404,27 +4459,31 @@ jack_client_t * jack_client_open (const char *client_name,
 	return (jack_client_t *)client;
 
 no_props:
-	if (status)
-		*status = JackFailure | JackInitFailure;
+	status = JackFailure | JackInitFailure;
+	if (status_ptr)
+		*status_ptr = status;
 	goto exit;
 init_failed:
-	if (status)
-		*status = JackFailure | JackInitFailure;
+	status = JackFailure | JackInitFailure;
+	if (status_ptr)
+		*status_ptr = status;
 	goto exit_unlock;
 server_failed:
-	if (status)
-		*status = JackFailure | JackServerFailed;
+	status = JackFailure | JackServerFailed;
+	if (status_ptr)
+		*status_ptr = status;
 	goto exit_unlock;
 exit_unlock:
 	pw_thread_loop_unlock(client->context.loop);
 exit:
-	pw_log_info("%p: error %d", client, *status);
+	pw_log_info("%p: error %d", client, status);
 	jack_client_close((jack_client_t *) client);
 	return NULL;
 disabled:
 	pw_log_warn("JACK is disabled");
-	if (status)
-		*status = JackFailure | JackInitFailure;
+	status = JackFailure | JackInitFailure;
+	if (status_ptr)
+		*status_ptr = status;
 	return NULL;
 }
 
@@ -4450,6 +4509,9 @@ int jack_client_close (jack_client_t *client)
 	return_val_if_fail(c != NULL, -EINVAL);
 
 	pw_log_info("%p: close", client);
+
+	if (g_first_client == c)
+		g_first_client = NULL;
 
 	c->destroyed = true;
 
@@ -4757,8 +4819,25 @@ int jack_deactivate (jack_client_t *client)
 SPA_EXPORT
 int jack_get_client_pid (const char *name)
 {
-	pw_log_error("not implemented on library side");
-	return 0;
+	struct object *on, *oc;
+
+	if (g_first_client == NULL) return 0;
+
+	on = find_node(g_first_client, name);
+	if (on == NULL) {
+		pw_log_warn("unknown (jack-client) node \"%s\"", name);
+		return 0;
+	}
+
+	oc = find_client(g_first_client, on->node.client_id);
+	if (oc == NULL) {
+		pw_log_warn("unknown (pw) client %d", (int)on->node.client_id);
+		return 0;
+	}
+
+	pw_log_info("pid %d (%s)", (int)oc->pwclient.pid, oc->pwclient.name);
+
+	return (int)oc->pwclient.pid;
 }
 
 SPA_EXPORT

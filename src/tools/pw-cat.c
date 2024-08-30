@@ -103,6 +103,7 @@ struct data {
 #define TYPE_ENCODED    3
 #endif
 	int data_type;
+	bool raw;
 	const char *remote_name;
 	const char *media_type;
 	const char *media_category;
@@ -678,7 +679,7 @@ static void channelmap_print(struct channelmap *map)
 		const char *name = spa_debug_type_find_name(spa_type_audio_channel, map->channels[i]);
 		if (name == NULL)
 			name = ":UNK";
-		printf("%s%s", spa_debug_type_short_name(name), i + 1 < map->n_channels ? "," : "");
+		fprintf(stderr, "%s%s", spa_debug_type_short_name(name), i + 1 < map->n_channels ? "," : "");
 	}
 }
 
@@ -687,7 +688,7 @@ static void on_core_info(void *userdata, const struct pw_core_info *info)
 	struct data *data = userdata;
 
 	if (data->verbose)
-		printf("remote %"PRIu32" is named \"%s\"\n",
+		fprintf(stderr, "remote %"PRIu32" is named \"%s\"\n",
 				info->id, info->name);
 }
 
@@ -716,7 +717,7 @@ on_state_changed(void *userdata, enum pw_stream_state old,
 	int ret;
 
 	if (data->verbose)
-		printf("stream state changed %s -> %s\n",
+		fprintf(stderr, "stream state changed %s -> %s\n",
 				pw_stream_state_as_string(old),
 				pw_stream_state_as_string(state));
 
@@ -727,7 +728,7 @@ on_state_changed(void *userdata, enum pw_stream_state old,
 					SPA_PROP_volume, 1, &data->volume,
 					0);
 			if (data->verbose)
-				printf("stream set volume to %.3f - %s\n", data->volume,
+				fprintf(stderr, "stream set volume to %.3f - %s\n", data->volume,
 						ret == 0 ? "success" : "FAILED");
 
 			data->volume_is_set = true;
@@ -736,7 +737,7 @@ on_state_changed(void *userdata, enum pw_stream_state old,
 			struct timespec timeout = {0, 1}, interval = {1, 0};
 			struct pw_loop *l = pw_main_loop_get_loop(data->loop);
 			pw_loop_update_timer(l, data->timer, &timeout, &interval, false);
-			printf("stream node %"PRIu32"\n",
+			fprintf(stderr, "stream node %"PRIu32"\n",
 				pw_stream_get_node_id(data->stream));
 		}
 		break;
@@ -748,13 +749,13 @@ on_state_changed(void *userdata, enum pw_stream_state old,
 		}
 		break;
 	case PW_STREAM_STATE_ERROR:
-		printf("stream node %"PRIu32" error: %s\n",
+		fprintf(stderr, "stream node %"PRIu32" error: %s\n",
 				pw_stream_get_node_id(data->stream),
 				error);
 		pw_main_loop_quit(data->loop);
 		break;
 	case PW_STREAM_STATE_UNCONNECTED:
-		printf("stream node %"PRIu32" unconnected\n",
+		fprintf(stderr, "stream node %"PRIu32" unconnected\n",
 				pw_stream_get_node_id(data->stream));
 		pw_main_loop_quit(data->loop);
 		break;
@@ -785,7 +786,7 @@ on_param_changed(void *userdata, uint32_t id, const struct spa_pod *param)
 	int err;
 
 	if (data->verbose)
-		printf("stream param change: %s\n",
+		fprintf(stderr, "stream param change: %s\n",
 			spa_debug_type_find_name(spa_type_param, id));
 
 	if (id != SPA_PARAM_Format || param == NULL)
@@ -812,7 +813,7 @@ on_param_changed(void *userdata, uint32_t id, const struct spa_pod *param)
 	data->stride = data->dsf.layout.channels * SPA_ABS(data->dsf.layout.interleave);
 
 	if (data->verbose) {
-		printf("DSD: channels:%d bitorder:%s interleave:%d stride:%d\n",
+		fprintf(stderr, "DSD: channels:%d bitorder:%s interleave:%d stride:%d\n",
 				data->dsf.layout.channels,
 				data->dsf.layout.lsb ? "lsb" : "msb",
 				data->dsf.layout.interleave,
@@ -874,7 +875,7 @@ static void on_process(void *userdata)
 			fprintf(stderr, "fill error %d\n", n_fill_frames);
 		} else {
 			if (data->verbose)
-				printf("drain start\n");
+				fprintf(stderr, "drain start\n");
 		}
 	} else {
 		bool null_frame = false;
@@ -905,7 +906,7 @@ static void on_drained(void *userdata)
 	struct data *data = userdata;
 
 	if (data->verbose)
-		printf("stream drained\n");
+		fprintf(stderr, "stream drained\n");
 
 	data->drained = true;
 	pw_main_loop_quit(data->loop);
@@ -931,7 +932,7 @@ static void do_print_delay(void *userdata, uint64_t expirations)
 	struct data *data = userdata;
 	struct pw_time time;
 	pw_stream_get_time_n(data->stream, &time, sizeof(time));
-	printf("stream time: now:%"PRIi64" rate:%u/%u ticks:%"PRIu64
+	fprintf(stderr, "stream time: now:%"PRIi64" rate:%u/%u ticks:%"PRIu64
 			" delay:%"PRIi64" queued:%"PRIu64
 			" buffered:%"PRIi64" buffers:%u avail:%u size:%"PRIu64"\n",
 		time.now,
@@ -962,6 +963,8 @@ static const struct option long_options[] = {
 	{ "record",		no_argument,	   NULL, 'r' },
 	{ "playback",		no_argument,	   NULL, 'p' },
 	{ "midi",		no_argument,	   NULL, 'm' },
+	{ "dsd",		no_argument,	   NULL, 'd' },
+	{ "encoded",		no_argument,	   NULL, 'o' },
 
 	{ "remote",		required_argument, NULL, 'R' },
 
@@ -978,6 +981,7 @@ static const struct option long_options[] = {
 	{ "format",		required_argument, NULL, OPT_FORMAT },
 	{ "volume",		required_argument, NULL, OPT_VOLUME },
 	{ "quality",		required_argument, NULL, 'q' },
+	{ "raw",		no_argument, NULL, 'a' },
 
 	{ NULL, 0, NULL, 0 }
 };
@@ -1022,6 +1026,7 @@ static void show_usage(const char *name, bool is_error)
 	     "      --format                          Sample format %s (req. for rec) (default %s)\n"
 	     "      --volume                          Stream volume 0-1.0 (default %.3f)\n"
 	     "  -q  --quality                         Resampler quality (0 - 15) (default %d)\n"
+	     "  -a, --raw                             RAW mode\n"
 	     "\n"),
 	     DEFAULT_RATE,
 	     DEFAULT_CHANNELS,
@@ -1081,7 +1086,7 @@ static int midi_play(struct data *d, void *src, unsigned int n_frames, bool *nul
 		midi_file_read_event(d->midi.file, &ev);
 
 		if (d->verbose)
-			midi_file_dump_event(stdout, &ev);
+			midi_file_dump_event(stderr, &ev);
 
 		if (ev.type == MIDI_EVENT_TYPE_MIDI1) {
 			size_t size;
@@ -1145,7 +1150,7 @@ static int midi_record(struct data *d, void *src, unsigned int n_frames, bool *n
 		ev.type = MIDI_EVENT_TYPE_UMP;
 
 		if (d->verbose)
-			midi_file_dump_event(stdout, &ev);
+			midi_file_dump_event(stderr, &ev);
 
 		midi_file_write_event(d->midi.file, &ev);
 	}
@@ -1170,7 +1175,7 @@ static int setup_midifile(struct data *data)
 	}
 
 	if (data->verbose)
-		printf("midifile: opened file \"%s\" format %08x ntracks:%d div:%d\n",
+		fprintf(stderr, "midifile: opened file \"%s\" format %08x ntracks:%d div:%d\n",
 				data->filename,
 				data->midi.info.format, data->midi.info.ntracks,
 				data->midi.info.division);
@@ -1221,7 +1226,7 @@ static int setup_dsdfile(struct data *data)
 
 	if (data->dsf.file != NULL) {
 		if (data->verbose)
-			printf("dsffile: opened file \"%s\" channels:%d rate:%d "
+			fprintf(stderr, "dsffile: opened file \"%s\" channels:%d rate:%d "
 					"samples:%"PRIu64" bitorder:%s\n",
 				data->filename,
 				data->dsf.info.channels, data->dsf.info.rate,
@@ -1231,7 +1236,7 @@ static int setup_dsdfile(struct data *data)
 		data->fill = dsf_play;
 	} else {
 		if (data->verbose)
-			printf("dfffile: opened file \"%s\" channels:%d rate:%d "
+			fprintf(stderr, "dfffile: opened file \"%s\" channels:%d rate:%d "
 					"samples:%"PRIu64" bitorder:%s\n",
 				data->filename,
 				data->dff.info.channels, data->dff.info.rate,
@@ -1275,7 +1280,7 @@ static int setup_pipe(struct data *data)
 	data->fill = data->mode == mode_playback ?  stdin_play : stdout_record;
 
 	if (data->verbose)
-		printf("PIPE: rate=%u channels=%u fmt=%s samplesize=%u stride=%u\n",
+		fprintf(stderr, "PIPE: rate=%u channels=%u fmt=%s samplesize=%u stride=%u\n",
 				data->rate, data->channels,
 				info->name, info->width, data->stride);
 
@@ -1445,7 +1450,7 @@ static int setup_encodedfile(struct data *data)
 	data->fill = encoded_playback_fill;
 
 	if (data->verbose) {
-		printf("Opened file \"%s\" with encoded audio; channels:%d rate:%d bitrate: %d time units %d/%d\n",
+		fprintf(stderr, "Opened file \"%s\" with encoded audio; channels:%d rate:%d bitrate: %d time units %d/%d\n",
 		       data->filename, data->channels, data->rate, data->bitrate,
 		       data->encoded.audio_stream->time_base.num, data->encoded.audio_stream->time_base.den);
 	}
@@ -1492,7 +1497,7 @@ static int setup_sndfile(struct data *data)
 	}
 
 	if (data->verbose)
-		printf("sndfile: opened file \"%s\" format %08x channels:%d rate:%d\n",
+		fprintf(stderr, "sndfile: opened file \"%s\" format %08x channels:%d rate:%d\n",
 				data->filename, info.format, info.channels, info.samplerate);
 	if (data->channels > 0 && info.channels != data->channels) {
 		fprintf(stderr, "sndfile: given channels (%u) don't match file channels (%d)\n",
@@ -1519,9 +1524,9 @@ static int setup_sndfile(struct data *data)
 				def = true;
 			}
 			if (data->verbose) {
-				printf("sndfile: using %s channel map: ", def ? "default" : "file");
+				fprintf(stderr, "sndfile: using %s channel map: ", def ? "default" : "file");
 				channelmap_print(&data->channelmap);
-				printf("\n");
+				fprintf(stderr, "\n");
 			}
 		}
 		fill_properties(data);
@@ -1535,7 +1540,7 @@ static int setup_sndfile(struct data *data)
 		return -EIO;
 
 	if (data->verbose)
-		printf("PCM: fmt:%s rate:%u channels:%u width:%u\n",
+		fprintf(stderr, "PCM: fmt:%s rate:%u channels:%u width:%u\n",
 				fi->name, data->rate, data->channels, fi->width);
 
 	/* we read and write S24 as S32 with sndfile */
@@ -1615,7 +1620,7 @@ static int setup_properties(struct data *data)
 	}
 
 	if (data->verbose)
-		printf("rate:%d latency:%u (%.3fs)\n",
+		fprintf(stderr, "rate:%d latency:%u (%.3fs)\n",
 				data->rate, nom, data->rate ? (double)nom/data->rate : 0.0f);
 	if (nom && pw_properties_get(data->props, PW_KEY_NODE_LATENCY) == NULL)
 		pw_properties_setf(data->props, PW_KEY_NODE_LATENCY, "%u/%u", nom, data->rate);
@@ -1689,9 +1694,9 @@ int main(int argc, char *argv[])
 	}
 
 #ifdef HAVE_PW_CAT_FFMPEG_INTEGRATION
-	while ((c = getopt_long(argc, argv, "hvprmdoR:q:P:", long_options, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "hvprmdoR:q:P:a", long_options, NULL)) != -1) {
 #else
-	while ((c = getopt_long(argc, argv, "hvprmdR:q:P:", long_options, NULL)) != -1) {
+	while ((c = getopt_long(argc, argv, "hvprmdR:q:P:a", long_options, NULL)) != -1) {
 #endif
 
 		switch (c) {
@@ -1741,6 +1746,10 @@ int main(int argc, char *argv[])
 
 		case 'q':
 			data.quality = atoi(optarg);
+			break;
+
+		case 'a':
+			data.raw = true;
 			break;
 
 		case OPT_MEDIA_TYPE:
@@ -1803,7 +1812,8 @@ int main(int argc, char *argv[])
 			break;
 
 		case OPT_VOLUME:
-			data.volume = (float)atof(optarg);
+			if (!spa_atof(optarg, &data.volume))
+				data.volume = (float)atof(optarg);
 			break;
 		default:
 			goto error_usage;
@@ -1891,7 +1901,7 @@ int main(int argc, char *argv[])
 	}
 	pw_core_add_listener(data.core, &data.core_listener, &core_events, &data);
 
-	if (spa_streq(data.filename, "-")) {
+	if (data.raw) {
 		ret = setup_pipe(&data);
 	} else {
 		switch (data.data_type) {
@@ -2032,7 +2042,7 @@ int main(int argc, char *argv[])
 	pw_stream_add_listener(data.stream, &data.stream_listener, &stream_events, &data);
 
 	if (data.verbose)
-		printf("connecting %s stream; target=%s\n",
+		fprintf(stderr, "connecting %s stream; target=%s\n",
 				data.mode == mode_playback ? "playback" : "record",
 				data.target);
 
@@ -2056,11 +2066,11 @@ int main(int argc, char *argv[])
 		const char *key, *val;
 
 		if ((props = pw_stream_get_properties(data.stream)) != NULL) {
-			printf("stream properties:\n");
+			fprintf(stderr, "stream properties:\n");
 			pstate = NULL;
 			while ((key = pw_properties_iterate(props, &pstate)) != NULL &&
 				(val = pw_properties_get(props, key)) != NULL) {
-				printf("\t%s = \"%s\"\n", key, val);
+				fprintf(stderr, "\t%s = \"%s\"\n", key, val);
 			}
 		}
 	}
