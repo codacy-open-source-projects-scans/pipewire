@@ -1087,7 +1087,7 @@ static void on_notify_event(void *data, uint64_t count)
 			do_recompute_capture = do_recompute_playback = true;
 			break;
 		case NOTIFY_TYPE_BUFFER_FRAMES:
-			pw_log_debug("%p: buffer frames %d", c, notify->arg1);
+			pw_log_debug("%p: buffer frames %d -> %d", c, c->buffer_frames, notify->arg1);
 			if (c->buffer_frames != (uint32_t)notify->arg1) {
 				do_callback_expr(c, c->buffer_frames = notify->arg1,
 						bufsize_callback, c->active,
@@ -1096,7 +1096,7 @@ static void on_notify_event(void *data, uint64_t count)
 			}
 			break;
 		case NOTIFY_TYPE_SAMPLE_RATE:
-			pw_log_debug("%p: sample rate %d", c, notify->arg1);
+			pw_log_debug("%p: sample rate %d -> %d", c, c->sample_rate, notify->arg1);
 			if (c->sample_rate != (uint32_t)notify->arg1) {
 				do_callback_expr(c, c->sample_rate = notify->arg1,
 						srate_callback, c->active,
@@ -4720,6 +4720,17 @@ static int do_activate(struct client *c)
 	return res;
 }
 
+static int
+do_emit_buffer_size(struct spa_loop *loop,
+                  bool async, uint32_t seq, const void *data, size_t size, void *user_data)
+{
+	struct client *c = user_data;
+	c->buffer_frames = c->rt.position->clock.duration;
+	pw_log_debug("%p: emit buffersize %d", c, c->buffer_frames);
+	c->bufsize_callback(c->buffer_frames, c->bufsize_arg);
+	return 0;
+}
+
 SPA_EXPORT
 int jack_activate (jack_client_t *client)
 {
@@ -4760,8 +4771,12 @@ done:
 	if (res < 0) {
 		c->active = false;
 		pw_data_loop_stop(c->loop);
+	} else if (SPA_LIKELY(c->bufsize_callback != NULL)) {
+		pw_thread_loop_unlock(c->context.loop);
+		pw_data_loop_invoke(c->loop,
+				do_emit_buffer_size, SPA_ID_INVALID, NULL, 0, true, c);
+		pw_thread_loop_lock(c->context.loop);
 	}
-
 	pw_log_debug("%p: activate result:%d", c, res);
 	thaw_callbacks(c);
 	pw_thread_loop_unlock(c->context.loop);
