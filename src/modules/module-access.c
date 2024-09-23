@@ -274,21 +274,16 @@ get_server_name(const struct spa_dict *props)
 
 static int parse_socket_args(struct impl *impl, const char *str)
 {
-	struct spa_json it[2];
+	struct spa_json it[1];
 	char socket[PATH_MAX];
+	const char *val;
+	int len;
 
-	spa_json_init(&it[0], str, strlen(str));
-
-	if (spa_json_enter_object(&it[0], &it[1]) <= 0)
+	if (spa_json_begin_object(&it[0], str, strlen(str)) <= 0)
 		return -EINVAL;
 
-	while (spa_json_get_string(&it[1], socket, sizeof(socket)) > 0) {
+	while ((len = spa_json_object_next(&it[0], socket, sizeof(socket), &val)) > 0) {
 		char value[256];
-		const char *val;
-		int len;
-
-		if ((len = spa_json_next(&it[1], &val)) <= 0)
-			return -EINVAL;
 
 		if (spa_json_parse_stringn(val, len, value, sizeof(value)) <= 0)
 			return -EINVAL;

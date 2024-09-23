@@ -15,6 +15,7 @@ extern "C" {
  */
 
 #include <spa/utils/type.h>
+#include <spa/utils/string.h>
 #include <spa/param/audio/raw.h>
 
 #define SPA_TYPE_INFO_AudioFormat		SPA_TYPE_INFO_ENUM_BASE "AudioFormat"
@@ -127,6 +128,15 @@ static const struct spa_type_info spa_type_audio_format[] = {
 #endif
 	{ 0, 0, NULL, NULL },
 };
+
+static inline uint32_t spa_type_audio_format_from_short_name(const char *name)
+{
+	return spa_type_from_short_name(name, spa_type_audio_format, SPA_AUDIO_FORMAT_UNKNOWN);
+}
+static inline const char * spa_type_audio_format_to_short_name(uint32_t type)
+{
+	return spa_type_to_short_name(type, spa_type_audio_format, "UNKNOWN");
+}
 
 #define SPA_TYPE_INFO_AudioFlags	SPA_TYPE_INFO_FLAGS_BASE "AudioFlags"
 #define SPA_TYPE_INFO_AUDIO_FLAGS_BASE	SPA_TYPE_INFO_AudioFlags ":"
@@ -246,6 +256,16 @@ static const struct spa_type_info spa_type_audio_channel[] = {
 	{ SPA_AUDIO_CHANNEL_AUX63, SPA_TYPE_Int, SPA_TYPE_INFO_AUDIO_CHANNEL_BASE "AUX63", NULL },
 	{ 0, 0, NULL, NULL },
 };
+
+static inline uint32_t spa_type_audio_channel_from_short_name(const char *name)
+{
+	return spa_type_from_short_name(name, spa_type_audio_channel, SPA_AUDIO_CHANNEL_UNKNOWN);
+}
+static inline const char * spa_type_audio_channel_to_short_name(uint32_t type)
+{
+	return spa_type_to_short_name(type, spa_type_audio_channel, "UNK");
+}
+
 
 /**
  * \}

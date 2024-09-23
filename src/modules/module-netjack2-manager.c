@@ -29,6 +29,7 @@
 #include <spa/param/audio/format-utils.h>
 #include <spa/param/latency-utils.h>
 #include <spa/param/audio/raw.h>
+#include <spa/param/audio/raw-json.h>
 
 #include <pipewire/impl.h>
 #include <pipewire/i18n.h>
@@ -92,6 +93,8 @@
  * ## Example configuration of a duplex sink/source
  *
  *\code{.unparsed}
+ * # ~/.config/pipewire/pipewire.conf.d/my-netjack2-manager.conf
+ *
  * context.modules = [
  * {   name = libpipewire-module-netjack2-manager
  *     args = {
@@ -1170,45 +1173,15 @@ static const struct pw_impl_module_events module_events = {
 	.destroy = module_destroy,
 };
 
-static uint32_t channel_from_name(const char *name)
-{
-	int i;
-	for (i = 0; spa_type_audio_channel[i].name; i++) {
-		if (spa_streq(name, spa_debug_type_short_name(spa_type_audio_channel[i].name)))
-			return spa_type_audio_channel[i].type;
-	}
-	return SPA_AUDIO_CHANNEL_UNKNOWN;
-}
-
-static void parse_position(struct spa_audio_info_raw *info, const char *val, size_t len)
-{
-	struct spa_json it[2];
-	char v[256];
-
-	spa_json_init(&it[0], val, len);
-        if (spa_json_enter_array(&it[0], &it[1]) <= 0)
-                spa_json_init(&it[1], val, len);
-
-	info->channels = 0;
-	while (spa_json_get_string(&it[1], v, sizeof(v)) > 0 &&
-	    info->channels < SPA_AUDIO_MAX_CHANNELS) {
-		info->position[info->channels++] = channel_from_name(v);
-	}
-}
-
 static void parse_audio_info(const struct pw_properties *props, struct spa_audio_info_raw *info)
 {
-	const char *str;
-
-	spa_zero(*info);
-	info->format = SPA_AUDIO_FORMAT_F32P;
-	info->rate = 0;
-	info->channels = pw_properties_get_uint32(props, PW_KEY_AUDIO_CHANNELS, info->channels);
-	info->channels = SPA_MIN(info->channels, SPA_AUDIO_MAX_CHANNELS);
-	if ((str = pw_properties_get(props, SPA_KEY_AUDIO_POSITION)) != NULL)
-		parse_position(info, str, strlen(str));
-	if (info->channels == 0)
-		parse_position(info, DEFAULT_POSITION, strlen(DEFAULT_POSITION));
+	spa_audio_info_raw_init_dict_keys(info,
+			&SPA_DICT_ITEMS(
+				 SPA_DICT_ITEM(SPA_KEY_AUDIO_FORMAT, "F32P"),
+				 SPA_DICT_ITEM(SPA_KEY_AUDIO_POSITION, DEFAULT_POSITION)),
+			&props->dict,
+			SPA_KEY_AUDIO_CHANNELS,
+			SPA_KEY_AUDIO_POSITION, NULL);
 }
 
 static void copy_props(struct impl *impl, struct pw_properties *props, const char *key)

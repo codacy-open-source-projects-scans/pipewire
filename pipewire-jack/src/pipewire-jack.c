@@ -3456,29 +3456,6 @@ static jack_uuid_t client_make_uuid(uint32_t id, bool monitor)
 	return uuid;
 }
 
-static int json_object_find(const char *obj, const char *key, char *value, size_t len)
-{
-	struct spa_json it[2];
-	const char *v;
-	char k[128];
-
-	spa_json_init(&it[0], obj, strlen(obj));
-	if (spa_json_enter_object(&it[0], &it[1]) <= 0)
-		return -EINVAL;
-
-	while (spa_json_get_string(&it[1], k, sizeof(k)) > 0) {
-		if (spa_streq(k, key)) {
-			if (spa_json_get_string(&it[1], value, len) <= 0)
-				continue;
-			return 0;
-		} else {
-			if (spa_json_next(&it[1], &v) <= 0)
-				break;
-		}
-	}
-	return -ENOENT;
-}
-
 static int metadata_property(void *data, uint32_t id,
 		const char *key, const char *type, const char *value)
 {
@@ -3491,7 +3468,7 @@ static int metadata_property(void *data, uint32_t id,
 	if (id == PW_ID_CORE) {
 		if (key == NULL || spa_streq(key, "default.audio.sink")) {
 			if (value != NULL) {
-				if (json_object_find(value, "name",
+				if (spa_json_str_object_find(value, strlen(value), "name",
 						c->metadata->default_audio_sink,
 						sizeof(c->metadata->default_audio_sink)) < 0)
 					value = NULL;
@@ -3501,7 +3478,7 @@ static int metadata_property(void *data, uint32_t id,
 		}
 		if (key == NULL || spa_streq(key, "default.audio.source")) {
 			if (value != NULL) {
-				if (json_object_find(value, "name",
+				if (spa_json_str_object_find(value, strlen(value), "name",
 						c->metadata->default_audio_source,
 						sizeof(c->metadata->default_audio_source)) < 0)
 					value = NULL;

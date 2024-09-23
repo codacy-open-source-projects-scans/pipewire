@@ -772,7 +772,7 @@ static int snd_pcm_pipewire_hw_params(snd_pcm_ioplug_t * io,
 		pw->requested.info.raw.channels = io->channels;
 		pw->requested.info.raw.rate = io->rate;
 		set_default_channels(io->channels, pw->requested.info.raw.position);
-		fmt_str = spa_debug_type_find_name(spa_type_audio_format, pw->requested.info.raw.format);
+		fmt_str = spa_type_audio_format_to_short_name(pw->requested.info.raw.format);
 		pw->format = pw->requested;
 		break;
 	case SPA_MEDIA_SUBTYPE_dsd:
@@ -1122,8 +1122,7 @@ static int parse_value(const char *str, struct param_info *info)
 	const char *val;
 	int len;
 
-	spa_json_init(&it[0], str, strlen(str));
-	if ((len = spa_json_next(&it[0], &val)) <= 0)
+	if ((len = spa_json_begin(&it[0], str, strlen(str), &val)) <= 0)
 		return -EINVAL;
 
 	if (spa_json_is_array(val, len)) {
@@ -1141,9 +1140,7 @@ static int parse_value(const char *str, struct param_info *info)
 		info->type = TYPE_MIN_MAX;
 		info->n_vals = 2;
 		spa_json_enter(&it[0], &it[1]);
-                while (spa_json_get_string(&it[1], key, sizeof(key)) > 0) {
-                        if ((len = spa_json_next(&it[1], &val)) <= 0)
-                                break;
+                while ((len = spa_json_object_next(&it[1], key, sizeof(key), &val)) > 0) {
 			if (info->collect(val, len, &v) < 0)
 				continue;
 			if (spa_streq(key, "min"))

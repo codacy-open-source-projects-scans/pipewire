@@ -21,6 +21,7 @@
 #include <spa/support/cpu.h>
 #include <spa/param/latency-utils.h>
 #include <spa/param/tag-utils.h>
+#include <spa/param/audio/raw-json.h>
 #include <spa/pod/dynamic.h>
 #include <spa/debug/types.h>
 #include <spa/debug/log.h>
@@ -477,7 +478,12 @@ PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
  * This example uses the rnnoise LADSPA plugin to create a new
  * virtual source.
  *
+ * Run with `pipewire -c filter-chain.conf`. The configuration can also
+ * be put under `pipewire.conf.d/` to run it inside the PipeWire server.
+ *
  *\code{.unparsed}
+ * # ~/.config/pipewire/filter-chain.conf.d/my-filter-chain-1.conf
+ *
  * context.modules = [
  * {   name = libpipewire-module-filter-chain
  *     args = {
@@ -515,6 +521,8 @@ PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
  * to a stereo Dolby Surround signal.
  *
  *\code{.unparsed}
+ * # ~/.config/pipewire/filter-chain.conf.d/my-filter-chain-2.conf
+ *
  * context.modules = [
  * {   name = libpipewire-module-filter-chain
  *     args = {
@@ -1913,14 +1921,12 @@ done:
 static int parse_control(struct node *node, struct spa_json *control)
 {
 	char key[256];
+	const char *val;
+	int len;
 
-	while (spa_json_get_string(control, key, sizeof(key)) > 0) {
+	while ((len = spa_json_object_next(control, key, sizeof(key), &val)) > 0) {
 		float fl;
-		const char *val;
-		int res, len;
-
-		if ((len = spa_json_next(control, &val)) < 0)
-			break;
+		int res;
 
 		if (spa_json_parse_float(val, len, &fl) <= 0) {
 			pw_log_warn("control '%s' expects a number, ignoring", key);
@@ -1946,29 +1952,28 @@ static int parse_link(struct graph *graph, struct spa_json *json)
 	struct node *def_in_node, *def_out_node;
 	struct port *in_port, *out_port;
 	struct link *link;
+	int len;
 
 	if (spa_list_is_empty(&graph->node_list)) {
 		pw_log_error("can't make links in graph without nodes");
 		return -EINVAL;
 	}
 
-	while (spa_json_get_string(json, key, sizeof(key)) > 0) {
+	while ((len = spa_json_object_next(json, key, sizeof(key), &val)) > 0) {
 		if (spa_streq(key, "output")) {
-			if (spa_json_get_string(json, output, sizeof(output)) <= 0) {
+			if (spa_json_parse_stringn(val, len, output, sizeof(output)) <= 0) {
 				pw_log_error("output expects a string");
 				return -EINVAL;
 			}
 		}
 		else if (spa_streq(key, "input")) {
-			if (spa_json_get_string(json, input, sizeof(input)) <= 0) {
+			if (spa_json_parse_stringn(val, len, input, sizeof(input)) <= 0) {
 				pw_log_error("input expects a string");
 				return -EINVAL;
 			}
 		}
 		else {
 			pw_log_error("unexpected link key '%s'", key);
-			if (spa_json_next(json, &val) < 0)
-				break;
 		}
 	}
 	def_out_node = spa_list_first(&graph->node_list, struct node, link);
@@ -2049,40 +2054,39 @@ static int parse_volume(struct graph *graph, struct spa_json *json, bool capture
 	struct port *port;
 	struct volume *vol = capture ? &graph->capture_volume :
 		&graph->playback_volume;
+	int len;
 
 	if (spa_list_is_empty(&graph->node_list)) {
 		pw_log_error("can't set volume in graph without nodes");
 		return -EINVAL;
 	}
-	while (spa_json_get_string(json, key, sizeof(key)) > 0) {
+	while ((len = spa_json_object_next(json, key, sizeof(key), &val)) > 0) {
 		if (spa_streq(key, "control")) {
-			if (spa_json_get_string(json, control, sizeof(control)) <= 0) {
+			if (spa_json_parse_stringn(val, len, control, sizeof(control)) <= 0) {
 				pw_log_error("control expects a string");
 				return -EINVAL;
 			}
 		}
 		else if (spa_streq(key, "min")) {
-			if (spa_json_get_float(json, &min) <= 0) {
+			if (spa_json_parse_float(val, len, &min) <= 0) {
 				pw_log_error("min expects a float");
 				return -EINVAL;
 			}
 		}
 		else if (spa_streq(key, "max")) {
-			if (spa_json_get_float(json, &max) <= 0) {
+			if (spa_json_parse_float(val, len, &max) <= 0) {
 				pw_log_error("max expects a float");
 				return -EINVAL;
 			}
 		}
 		else if (spa_streq(key, "scale")) {
-			if (spa_json_get_string(json, scale, sizeof(scale)) <= 0) {
+			if (spa_json_parse_stringn(val, len, scale, sizeof(scale)) <= 0) {
 				pw_log_error("scale expects a string");
 				return -EINVAL;
 			}
 		}
 		else {
 			pw_log_error("unexpected volume key '%s'", key);
-			if (spa_json_next(json, &val) < 0)
-				break;
 		}
 	}
 	if (capture)
@@ -2144,44 +2148,41 @@ static int load_node(struct graph *graph, struct spa_json *json)
 	bool have_control = false;
 	bool have_config = false;
 	uint32_t i;
-	int res;
+	int res, len;
 
-	while (spa_json_get_string(json, key, sizeof(key)) > 0) {
+	while ((len = spa_json_object_next(json, key, sizeof(key), &val)) > 0) {
 		if (spa_streq("type", key)) {
-			if (spa_json_get_string(json, type, sizeof(type)) <= 0) {
+			if (spa_json_parse_stringn(val, len, type, sizeof(type)) <= 0) {
 				pw_log_error("type expects a string");
 				return -EINVAL;
 			}
 		} else if (spa_streq("name", key)) {
-			if (spa_json_get_string(json, name, sizeof(name)) <= 0) {
+			if (spa_json_parse_stringn(val, len, name, sizeof(name)) <= 0) {
 				pw_log_error("name expects a string");
 				return -EINVAL;
 			}
 		} else if (spa_streq("plugin", key)) {
-			if (spa_json_get_string(json, plugin, sizeof(plugin)) <= 0) {
+			if (spa_json_parse_stringn(val, len, plugin, sizeof(plugin)) <= 0) {
 				pw_log_error("plugin expects a string");
 				return -EINVAL;
 			}
 		} else if (spa_streq("label", key)) {
-			if (spa_json_get_string(json, label, sizeof(label)) <= 0) {
+			if (spa_json_parse_stringn(val, len, label, sizeof(label)) <= 0) {
 				pw_log_error("label expects a string");
 				return -EINVAL;
 			}
 		} else if (spa_streq("control", key)) {
-			if (spa_json_enter_object(json, &control) <= 0) {
+			if (!spa_json_is_object(val, len)) {
 				pw_log_error("control expects an object");
 				return -EINVAL;
 			}
+			spa_json_enter(json, &control);
 			have_control = true;
 		} else if (spa_streq("config", key)) {
-			config = SPA_JSON_SAVE(json);
+			config = SPA_JSON_START(json, val);
 			have_config = true;
-			if (spa_json_next(json, &val) < 0)
-				break;
 		} else {
 			pw_log_warn("unexpected node key '%s'", key);
-			if (spa_json_next(json, &val) < 0)
-				break;
 		}
 	}
 	if (spa_streq(type, "builtin"))
@@ -2714,13 +2715,13 @@ error:
  */
 static int load_graph(struct graph *graph, struct pw_properties *props)
 {
-	struct spa_json it[3];
+	struct spa_json it[2];
 	struct spa_json inputs, outputs, *pinputs = NULL, *poutputs = NULL;
 	struct spa_json cvolumes, pvolumes, *pcvolumes = NULL, *ppvolumes = NULL;
 	struct spa_json nodes, *pnodes = NULL, links, *plinks = NULL;
 	const char *json, *val;
 	char key[256];
-	int res;
+	int res, len;
 
 	spa_list_init(&graph->node_list);
 	spa_list_init(&graph->link_list);
@@ -2730,83 +2731,86 @@ static int load_graph(struct graph *graph, struct pw_properties *props)
 		return -EINVAL;
 	}
 
-	spa_json_init(&it[0], json, strlen(json));
-        if (spa_json_enter_object(&it[0], &it[1]) <= 0) {
+        if (spa_json_begin_object(&it[0], json, strlen(json)) <= 0) {
 		pw_log_error("filter.graph must be an object");
 		return -EINVAL;
 	}
 
-	while (spa_json_get_string(&it[1], key, sizeof(key)) > 0) {
+	while ((len = spa_json_object_next(&it[0], key, sizeof(key), &val)) > 0) {
 		if (spa_streq("nodes", key)) {
-			if (spa_json_enter_array(&it[1], &nodes) <= 0) {
+			if (!spa_json_is_array(val, len)) {
 				pw_log_error("nodes expects an array");
 				return -EINVAL;
 			}
+			spa_json_enter(&it[0], &nodes);
 			pnodes = &nodes;
 		}
 		else if (spa_streq("links", key)) {
-			if (spa_json_enter_array(&it[1], &links) <= 0) {
+			if (!spa_json_is_array(val, len)) {
 				pw_log_error("links expects an array");
 				return -EINVAL;
 			}
+			spa_json_enter(&it[0], &links);
 			plinks = &links;
 		}
 		else if (spa_streq("inputs", key)) {
-			if (spa_json_enter_array(&it[1], &inputs) <= 0) {
+			if (!spa_json_is_array(val, len)) {
 				pw_log_error("inputs expects an array");
 				return -EINVAL;
 			}
+			spa_json_enter(&it[0], &inputs);
 			pinputs = &inputs;
 		}
 		else if (spa_streq("outputs", key)) {
-			if (spa_json_enter_array(&it[1], &outputs) <= 0) {
+			if (!spa_json_is_array(val, len)) {
 				pw_log_error("outputs expects an array");
 				return -EINVAL;
 			}
+			spa_json_enter(&it[0], &outputs);
 			poutputs = &outputs;
 		}
 		else if (spa_streq("capture.volumes", key)) {
-			if (spa_json_enter_array(&it[1], &cvolumes) <= 0) {
+			if (!spa_json_is_array(val, len)) {
 				pw_log_error("capture.volumes expects an array");
 				return -EINVAL;
 			}
+			spa_json_enter(&it[0], &cvolumes);
 			pcvolumes = &cvolumes;
 		}
 		else if (spa_streq("playback.volumes", key)) {
-			if (spa_json_enter_array(&it[1], &pvolumes) <= 0) {
+			if (!spa_json_is_array(val, len)) {
 				pw_log_error("playback.volumes expects an array");
 				return -EINVAL;
 			}
+			spa_json_enter(&it[0], &pvolumes);
 			ppvolumes = &pvolumes;
 		} else {
 			pw_log_warn("unexpected graph key '%s'", key);
-			if (spa_json_next(&it[1], &val) < 0)
-				break;
 		}
 	}
 	if (pnodes == NULL) {
 		pw_log_error("filter.graph is missing a nodes array");
 		return -EINVAL;
 	}
-	while (spa_json_enter_object(pnodes, &it[2]) > 0) {
-		if ((res = load_node(graph, &it[2])) < 0)
+	while (spa_json_enter_object(pnodes, &it[1]) > 0) {
+		if ((res = load_node(graph, &it[1])) < 0)
 			return res;
 	}
 	if (plinks != NULL) {
-		while (spa_json_enter_object(plinks, &it[2]) > 0) {
-			if ((res = parse_link(graph, &it[2])) < 0)
+		while (spa_json_enter_object(plinks, &it[1]) > 0) {
+			if ((res = parse_link(graph, &it[1])) < 0)
 				return res;
 		}
 	}
 	if (pcvolumes != NULL) {
-		while (spa_json_enter_object(pcvolumes, &it[2]) > 0) {
-			if ((res = parse_volume(graph, &it[2], true)) < 0)
+		while (spa_json_enter_object(pcvolumes, &it[1]) > 0) {
+			if ((res = parse_volume(graph, &it[1], true)) < 0)
 				return res;
 		}
 	}
 	if (ppvolumes != NULL) {
-		while (spa_json_enter_object(ppvolumes, &it[2]) > 0) {
-			if ((res = parse_volume(graph, &it[2], false)) < 0)
+		while (spa_json_enter_object(ppvolumes, &it[1]) > 0) {
+			if ((res = parse_volume(graph, &it[1], false)) < 0)
 				return res;
 		}
 	}
@@ -2901,43 +2905,14 @@ static const struct pw_impl_module_events module_events = {
 	.destroy = module_destroy,
 };
 
-static uint32_t channel_from_name(const char *name)
-{
-	int i;
-	for (i = 0; spa_type_audio_channel[i].name; i++) {
-		if (spa_streq(name, spa_debug_type_short_name(spa_type_audio_channel[i].name)))
-			return spa_type_audio_channel[i].type;
-	}
-	return SPA_AUDIO_CHANNEL_UNKNOWN;
-}
-
-static void parse_position(struct spa_audio_info_raw *info, const char *val, size_t len)
-{
-	struct spa_json it[2];
-	char v[256];
-
-	spa_json_init(&it[0], val, len);
-        if (spa_json_enter_array(&it[0], &it[1]) <= 0)
-                spa_json_init(&it[1], val, len);
-
-	info->channels = 0;
-	while (spa_json_get_string(&it[1], v, sizeof(v)) > 0 &&
-	    info->channels < SPA_AUDIO_MAX_CHANNELS) {
-		info->position[info->channels++] = channel_from_name(v);
-	}
-}
-
 static void parse_audio_info(struct pw_properties *props, struct spa_audio_info_raw *info)
 {
-	const char *str;
-
-	*info = SPA_AUDIO_INFO_RAW_INIT(
-			.format = SPA_AUDIO_FORMAT_F32P);
-	info->rate = pw_properties_get_int32(props, PW_KEY_AUDIO_RATE, info->rate);
-	info->channels = pw_properties_get_int32(props, PW_KEY_AUDIO_CHANNELS, info->channels);
-	info->channels = SPA_MIN(info->channels, SPA_AUDIO_MAX_CHANNELS);
-	if ((str = pw_properties_get(props, SPA_KEY_AUDIO_POSITION)) != NULL)
-		parse_position(info, str, strlen(str));
+	spa_audio_info_raw_init_dict_keys(info,
+			&SPA_DICT_ITEMS(
+				 SPA_DICT_ITEM(SPA_KEY_AUDIO_FORMAT, "F32P")),
+			&props->dict,
+			SPA_KEY_AUDIO_CHANNELS,
+			SPA_KEY_AUDIO_POSITION, NULL);
 }
 
 static void copy_props(struct impl *impl, struct pw_properties *props, const char *key)

@@ -177,6 +177,20 @@ elif cc.has_argument('-mfpu=neon')
   endif
 endif
 
+have_rvv = false
+if host_machine.cpu_family() == 'riscv64'
+  if cc.compiles('''
+      int main() {
+          __asm__ __volatile__ (
+            ".option arch, +v\nvsetivli zero, 0, e8, m1, ta, ma"
+          );
+      }
+    ''',
+    name : 'riscv64 V Support')
+      have_rvv = true
+  endif
+endif
+
 libatomic = cc.find_library('atomic', required : false)
 
 test_8_byte_atomic = '''
@@ -237,6 +251,7 @@ if host_machine.endian() == 'big'
 endif
 
 check_headers = [
+  ['sys/auxv.h', 'HAVE_SYS_AUXV_H'],
   ['sys/mount.h', 'HAVE_SYS_MOUNT_H'],
   ['sys/param.h', 'HAVE_SYS_PARAM_H'],
   ['sys/random.h', 'HAVE_SYS_RANDOM_H'],
@@ -257,6 +272,10 @@ systemd_dep = dependency('libsystemd',required: get_option('systemd'))
 summary({'systemd conf data': systemd.found()}, bool_yn: true)
 summary({'libsystemd': systemd_dep.found()}, bool_yn: true)
 cdata.set('HAVE_SYSTEMD', systemd.found() and systemd_dep.found())
+
+logind_dep = dependency(get_option('logind-provider'), required: get_option('logind'))
+summary({'logind': logind_dep.found()}, bool_yn: true)
+cdata.set('HAVE_LOGIND', logind_dep.found())
 
 selinux_dep = dependency('libselinux', required: get_option('selinux'))
 summary({'libselinux': selinux_dep.found()}, bool_yn: true)

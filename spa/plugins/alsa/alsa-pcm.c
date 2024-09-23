@@ -159,7 +159,7 @@ static int alsa_set_param(struct state *state, const char *k, const char *s)
 		state->default_rate = atoi(s);
 		fmt_change++;
 	} else if (spa_streq(k, SPA_KEY_AUDIO_FORMAT)) {
-		state->default_format = spa_alsa_format_from_name(s, strlen(s));
+		state->default_format = spa_type_audio_format_from_short_name(s);
 		fmt_change++;
 	} else if (spa_streq(k, SPA_KEY_AUDIO_POSITION)) {
 		spa_alsa_parse_position(&state->default_pos, s, strlen(s));
@@ -968,16 +968,15 @@ int spa_alsa_init(struct state *state, const struct spa_dict *info)
 		} else if (spa_streq(k, "clock.quantum-limit")) {
 			spa_atou32(s, &state->quantum_limit, 0);
 		} else if (spa_streq(k, SPA_KEY_API_ALSA_BIND_CTLS)) {
-			struct spa_json it[2];
+			struct spa_json it[1];
 			char v[256];
 			unsigned int i = 0;
 
 			/* Read a list of ALSA control names to bind as params */
-			spa_json_init(&it[0], s, strlen(s));
-			if (spa_json_enter_array(&it[0], &it[1]) <= 0)
-				spa_json_init(&it[1], s, strlen(s));
+			if (spa_json_begin_array_relax(&it[0], s, strlen(s)) <= 0)
+				continue;
 
-			while (spa_json_get_string(&it[1], v, sizeof(v)) > 0 &&
+			while (spa_json_get_string(&it[0], v, sizeof(v)) > 0 &&
 					i < SPA_N_ELEMENTS(state->bound_ctls)) {
 				snprintf(state->bound_ctls[i].name,
 						sizeof(state->bound_ctls[i].name), "%s", v);
@@ -2042,7 +2041,7 @@ int spa_alsa_set_format(struct state *state, struct spa_audio_info *fmt, uint32_
 		unsigned aes3;
 
 		spa_log_info(state->log, "using IEC958 Codec:%s rate:%d",
-				spa_debug_type_find_short_name(spa_type_audio_iec958_codec, f->codec),
+				spa_type_audio_iec958_codec_to_short_name(f->codec),
 				f->rate);
 
 		rformat = SND_PCM_FORMAT_S16_LE;

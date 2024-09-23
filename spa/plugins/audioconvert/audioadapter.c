@@ -1394,7 +1394,8 @@ static void follower_event(void *data, const struct spa_event *event)
 
 	switch (SPA_NODE_EVENT_ID(event)) {
 	case SPA_NODE_EVENT_Error:
-		/* Forward errors */
+	case SPA_NODE_EVENT_RequestProcess:
+		/* Forward errors and process requests */
 		spa_node_emit_event(&this->hooks, event);
 		break;
 	default:
@@ -1825,21 +1826,21 @@ static int do_auto_port_config(struct impl *this, const char *str)
 #define POSITION_PRESERVE 0
 #define POSITION_AUX 1
 #define POSITION_UNKNOWN 2
-	int res, position = POSITION_PRESERVE;
+	int l, res, position = POSITION_PRESERVE;
 	struct spa_pod *param;
 	bool have_format = false, monitor = false, control = false;
 	struct spa_audio_info format = { 0, };
 	enum spa_param_port_config_mode mode = SPA_PARAM_PORT_CONFIG_MODE_none;
-	struct spa_json it[2];
+	struct spa_json it[1];
 	char key[1024], val[256];
+	const char *v;
 
-	spa_json_init(&it[0], str, strlen(str));
-	if (spa_json_enter_object(&it[0], &it[1]) <= 0)
+	if (spa_json_begin_object(&it[0], str, strlen(str)) <= 0)
 		return -EINVAL;
 
-	while (spa_json_get_string(&it[1], key, sizeof(key)) > 0) {
-		if (spa_json_get_string(&it[1], val, sizeof(val)) <= 0)
-			break;
+	while ((l = spa_json_object_next(&it[0], key, sizeof(key), &v)) > 0) {
+		if (spa_json_parse_stringn(v, l, val, sizeof(val)) <= 0)
+			continue;
 
 		if (spa_streq(key, "mode")) {
 			mode = spa_debug_type_find_type_short(spa_type_param_port_config_mode, val);
