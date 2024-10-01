@@ -5,6 +5,9 @@
 /*
  [title]
  Audio source using \ref pw_stream "pw_stream" and ringbuffer.
+
+ This one uses a thread-loop and does a blocking push into a
+ ringbuffer.
  [title]
  */
 
@@ -26,20 +29,25 @@
 
 #define BUFFER_SIZE		(16*1024)
 
+#define MIN_SIZE	256
+#define MAX_SIZE	BUFFER_SIZE
+
+static float samples[BUFFER_SIZE * DEFAULT_CHANNELS];
+
 struct data {
-	struct pw_main_loop *main_loop;
+	struct pw_thread_loop *thread_loop;
 	struct pw_loop *loop;
 	struct pw_stream *stream;
+	int eventfd;
+	bool running;
 
 	float accumulator;
-
-	struct spa_source *refill_event;
 
 	struct spa_ringbuffer ring;
 	float buffer[BUFFER_SIZE * DEFAULT_CHANNELS];
 };
 
-static void fill_f32(struct data *d, uint32_t offset, int n_frames)
+static void fill_f32(struct data *d, float *samples, int n_frames)
 {
 	float val;
 	int i, c;
@@ -51,33 +59,52 @@ static void fill_f32(struct data *d, uint32_t offset, int n_frames)
 
                 val = sinf(d->accumulator) * DEFAULT_VOLUME;
                 for (c = 0; c < DEFAULT_CHANNELS; c++)
-                        d->buffer[((offset + i) % BUFFER_SIZE) * DEFAULT_CHANNELS + c] = val;
+			samples[i * DEFAULT_CHANNELS + c] = val;
         }
 }
 
-/* this is called from the main-thread when we need to fill up the ringbuffer
- * with more data */
-static void do_refill(void *userdata, uint64_t count)
+/* this can be called from any thread with a block of samples to write into
+ * the ringbuffer. It will block until all data has been written */
+static void push_samples(void *userdata, float *samples, uint32_t n_samples)
 {
 	struct data *data = userdata;
 	int32_t filled;
-	uint32_t index, avail;
+	uint32_t index, avail, stride = sizeof(float) * DEFAULT_CHANNELS;
+	uint64_t count;
+	float *s = samples;
 
-	filled = spa_ringbuffer_get_write_index(&data->ring, &index);
-	/* we xrun, this can not happen because we never read more
-	 * than what there is in the ringbuffer and we never write more than
-	 * what is left */
-	spa_assert(filled >= 0);
-	spa_assert(filled <= BUFFER_SIZE);
+	while (n_samples > 0) {
+		while (true) {
+			filled = spa_ringbuffer_get_write_index(&data->ring, &index);
+			/* we xrun, this can not happen because we never read more
+			 * than what there is in the ringbuffer and we never write more than
+			 * what is left */
+			spa_assert(filled >= 0);
+			spa_assert(filled <= BUFFER_SIZE);
 
-	/* this is how much samples we can write */
-	avail = BUFFER_SIZE - filled;
+			/* this is how much samples we can write */
+			avail = BUFFER_SIZE - filled;
+			if (avail > 0)
+				break;
 
-	/* write new samples to the ringbuffer from the given index */
-	fill_f32(data, index, avail);
+			/* no space.. block and wait for free space */
+			spa_system_eventfd_read(data->loop->system, data->eventfd, &count);
+		}
+		if (avail > n_samples)
+			avail = n_samples;
 
-	/* and advance the ringbuffer */
-	spa_ringbuffer_write_update(&data->ring, index + avail);
+		spa_ringbuffer_write_data(&data->ring,
+				data->buffer, BUFFER_SIZE * stride,
+				(index % BUFFER_SIZE) * stride,
+				s, avail * stride);
+
+		s += avail * DEFAULT_CHANNELS;
+		n_samples -= avail;
+
+		/* and advance the ringbuffer */
+		spa_ringbuffer_write_update(&data->ring, index + avail);
+	}
+
 }
 
 /* our data processing function is in general:
@@ -144,7 +171,7 @@ static void on_process(void *userdata)
 	/* signal the main thread to fill the ringbuffer, we can only do this, for
 	 * example when the available ringbuffer space falls below a certain
 	 * level. */
-	pw_loop_signal_event(data->loop, data->refill_event);
+	spa_system_eventfd_write(data->loop->system, data->eventfd, 1);
 }
 
 static const struct pw_stream_events stream_events = {
@@ -155,7 +182,7 @@ static const struct pw_stream_events stream_events = {
 static void do_quit(void *userdata, int signal_number)
 {
 	struct data *data = userdata;
-	pw_main_loop_quit(data->main_loop);
+	data->running = false;
 }
 
 int main(int argc, char *argv[])
@@ -168,18 +195,19 @@ int main(int argc, char *argv[])
 
 	pw_init(&argc, &argv);
 
-	data.main_loop = pw_main_loop_new(NULL);
-	data.loop = pw_main_loop_get_loop(data.main_loop);
+	data.thread_loop = pw_thread_loop_new("audio-src", NULL);
+	data.loop = pw_thread_loop_get_loop(data.thread_loop);
+	data.running = true;
 
+	pw_thread_loop_lock(data.thread_loop);
 	pw_loop_add_signal(data.loop, SIGINT, do_quit, &data);
 	pw_loop_add_signal(data.loop, SIGTERM, do_quit, &data);
 
-	/* we're going to refill a ringbuffer from the main loop. Make an
-	 * event for this. */
 	spa_ringbuffer_init(&data.ring);
-	data.refill_event = pw_loop_add_event(data.loop, do_refill, &data);
-	/* prefill the ringbuffer */
-	do_refill(&data, 0);
+	if ((data.eventfd = spa_system_eventfd_create(data.loop->system, SPA_FD_CLOEXEC)) < 0)
+                return data.eventfd;
+
+	pw_thread_loop_start(data.thread_loop);
 
 	props = pw_properties_new(PW_KEY_MEDIA_TYPE, "Audio",
 			PW_KEY_MEDIA_CATEGORY, "Playback",
@@ -214,12 +242,27 @@ int main(int argc, char *argv[])
 			  PW_STREAM_FLAG_RT_PROCESS,
 			  params, 1);
 
-	/* and wait while we let things run */
-	pw_main_loop_run(data.main_loop);
+	/* prefill the ringbuffer */
+	fill_f32(&data, samples, BUFFER_SIZE);
+	push_samples(&data, samples, BUFFER_SIZE);
 
+	srand(time(NULL));
+
+	pw_thread_loop_start(data.thread_loop);
+	pw_thread_loop_unlock(data.thread_loop);
+
+	while (data.running) {
+		uint32_t size = rand() % ((MAX_SIZE - MIN_SIZE + 1) + MIN_SIZE);
+		/* make new random sized block of samples and push */
+		fill_f32(&data, samples, size);
+		push_samples(&data, samples, size);
+	}
+
+	pw_thread_loop_lock(data.thread_loop);
 	pw_stream_destroy(data.stream);
-	pw_loop_destroy_source(data.loop, data.refill_event);
-	pw_main_loop_destroy(data.main_loop);
+	pw_thread_loop_unlock(data.thread_loop);
+	pw_thread_loop_destroy(data.thread_loop);
+	close(data.eventfd);
 	pw_deinit();
 
 	return 0;
