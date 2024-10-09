@@ -29,6 +29,7 @@ struct pw_filter;
 #include <spa/node/io.h>
 #include <spa/param/param.h>
 #include <spa/pod/command.h>
+#include <spa/pod/event.h>
 
 #include <pipewire/core.h>
 #include <pipewire/stream.h>
@@ -237,7 +238,10 @@ void *pw_filter_get_dsp_buffer(void *port_data, uint32_t n_samples);
 int pw_filter_set_active(struct pw_filter *filter, bool active);
 
 /** Flush a filter. When \a drain is true, the drained callback will
- * be called when all data is played or recorded */
+ * be called when all data is played or recorded. The filter can be resumed
+ * after the drain by setting it active again with
+ * \ref pw_filter_set_active(). A flush without a drain is mostly useful afer
+ * a state change to PAUSED, to flush any remaining data from the queues. */
 int pw_filter_flush(struct pw_filter *filter, bool drain);
 
 /** Check if the filter is driving. The filter needs to have the
@@ -249,6 +253,10 @@ bool pw_filter_is_driving(struct pw_filter *filter);
 /** Trigger a push/pull on the filter. One iteration of the graph will
  * be scheduled and process() will be called. Since 0.3.66 */
 int pw_filter_trigger_process(struct pw_filter *filter);
+
+/** Emit an event from this filter.
+ * Since 1.2.6 */
+int pw_filter_emit_event(struct pw_filter *filter, const struct spa_event *event);
 
 /**
  * \}

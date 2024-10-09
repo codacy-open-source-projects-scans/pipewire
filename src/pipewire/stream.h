@@ -229,6 +229,7 @@ struct pw_stream;
 #include <spa/buffer/buffer.h>
 #include <spa/param/param.h>
 #include <spa/pod/command.h>
+#include <spa/pod/event.h>
 
 /** \enum pw_stream_state The state of a stream */
 enum pw_stream_state {
@@ -593,7 +594,11 @@ int pw_stream_queue_buffer(struct pw_stream *stream, struct pw_buffer *buffer);
 int pw_stream_set_active(struct pw_stream *stream, bool active);
 
 /** Flush a stream. When \a drain is true, the drained callback will
- * be called when all data is played or recorded */
+ * be called when all data is played or recorded. The stream can be resumed
+ * after the drain by setting it active again with
+ * \ref pw_stream_set_active(). A flush without a drain is mostly useful afer
+ * a state change to PAUSED, to flush any remaining data from the queues and
+ * the converters. */
 int pw_stream_flush(struct pw_stream *stream, bool drain);
 
 /** Check if the stream is driving. The stream needs to have the
@@ -621,6 +626,10 @@ bool pw_stream_is_driving(struct pw_stream *stream);
  *
  * Since 0.3.34 */
 int pw_stream_trigger_process(struct pw_stream *stream);
+
+/** Emit an event from this stream.
+ * Since 1.2.6 */
+int pw_stream_emit_event(struct pw_stream *stream, const struct spa_event *event);
 
 /**
  * \}
