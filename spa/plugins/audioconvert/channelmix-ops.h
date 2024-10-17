@@ -10,7 +10,6 @@
 #include <spa/param/audio/raw.h>
 
 #include "crossover.h"
-#include "delay.h"
 
 #define VOLUME_MIN 0.0f
 #define VOLUME_NORM 1.0f
@@ -24,7 +23,7 @@
 #define MASK_7_1	_M(FL)|_M(FR)|_M(FC)|_M(LFE)|_M(SL)|_M(SR)|_M(RL)|_M(RR)
 
 #define BUFFER_SIZE 4096
-#define MAX_TAPS 255
+#define MAX_TAPS 255u
 
 struct channelmix {
 	uint32_t src_chan;
@@ -60,7 +59,7 @@ struct channelmix {
 	uint32_t hilbert_taps;				/* to phase shift, 0 disabled */
 	struct lr4 lr4[SPA_AUDIO_MAX_CHANNELS];
 
-	float buffer[2][BUFFER_SIZE];
+	float buffer[2][BUFFER_SIZE*2];
 	uint32_t pos[2];
 	uint32_t delay;
 	float taps[MAX_TAPS];

@@ -115,6 +115,11 @@ void dsp_biquad_run_c(struct dsp_ops *ops, struct biquad *bq,
 	float b0, b1, b2, a1, a2;
 	uint32_t i;
 
+	if (bq->type == BQ_NONE) {
+		dsp_copy_c(ops, out, in, n_samples);
+		return;
+	}
+
 	x1 = bq->x1;
 	x2 = bq->x2;
 	b0 = bq->b0;
@@ -133,6 +138,25 @@ void dsp_biquad_run_c(struct dsp_ops *ops, struct biquad *bq,
 	bq->x1 = F(x1);
 	bq->x2 = F(x2);
 #undef F
+}
+
+void dsp_biquadn_run_c(struct dsp_ops *ops, struct biquad *bq, uint32_t n_bq, uint32_t bq_stride,
+		float * SPA_RESTRICT out[], const float * SPA_RESTRICT in[],
+		uint32_t n_src, uint32_t n_samples)
+{
+	uint32_t i, j;
+	const float *s;
+	float *d;
+	for (i = 0; i < n_src; i++, bq+=bq_stride) {
+		s = in[i];
+		d = out[i];
+		if (s == NULL || d == NULL)
+			continue;
+		for (j = 0; j < n_bq; j++) {
+			dsp_biquad_run_c(ops, &bq[j], d, s, n_samples);
+			s = d;
+		}
+	}
 }
 
 void dsp_sum_c(struct dsp_ops *ops, float * dst,
@@ -161,6 +185,27 @@ void dsp_linear_c(struct dsp_ops *ops, float * dst,
 			for (i = 0; i < n_samples; i++)
 				dst[i] = mult * src[i] + add;
 		}
+	}
+}
+
+
+void dsp_delay_c(struct dsp_ops *ops, float *buffer, uint32_t *pos, uint32_t n_buffer,
+		uint32_t delay, float *dst, const float *src, uint32_t n_samples)
+{
+	if (delay == 0) {
+		dsp_copy_c(ops, dst, src, n_samples);
+	} else {
+		uint32_t w, o, i;
+
+		w = *pos;
+		o = n_buffer - delay;
+
+		for (i = 0; i < n_samples; i++) {
+			buffer[w] = buffer[w + n_buffer] = src[i];
+			dst[i] = buffer[w + o];
+			w = w + 1 > n_buffer ? 0 : w + 1;
+		}
+		*pos = w;
 	}
 }
 

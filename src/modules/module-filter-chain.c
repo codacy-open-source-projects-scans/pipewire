@@ -233,6 +233,84 @@ PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
  * }
  *\endcode
  *
+ * ### Parametric EQ
+ *
+ * The parametric EQ chains a number of biquads together. It is more efficient than
+ * specifying a number of chained biquads and it can also load configuration from a
+ * file.
+ *
+ * The parametric EQ supports multichannel processing and has 8 input and 8 output ports
+ * that don't all need to be connected. The ports are named `In 1` to `In 8` and
+ * `Out 1` to `Out 8`.
+ *
+ *\code{.unparsed}
+ * filter.graph = {
+ *     nodes = [
+ *         {
+ *             type   = builtin
+ *             name   = ...
+ *             label  = param_eq
+ *             config = {
+ *                 filename = "..."
+ *                 #filename1 = "...", filename2 = "...", ...
+ *                 filters = [
+ *                     { type = ..., freq = ..., gain = ..., q = ... },
+ *                     { type = ..., freq = ..., gain = ..., q = ... },
+ *                     ....
+ *                 ]
+ *                 #filters1 = [ ... ], filters2 = [ ... ], ...
+ *             }
+ *             ...
+ *         }
+ *     }
+ *     ...
+ * }
+ *\endcode
+ *
+ * Either a `filename` or a `filters` array can be specified. The configuration
+ * will be used for all channels. Alternatively `filenameX` or `filtersX` where
+ * X is the channel number (between 1 and 8) can be used to load a channel
+ * specific configuration.
+ *
+ * The `filename` must point to a parametric equalizer configuration
+ * generated from the AutoEQ project or Squiglink. Both the projects allow
+ * equalizing headphones or an in-ear monitor to a target curve.
+ *
+ * A popular example of the above being EQ'ing to the Harman target curve
+ * or EQ'ing one headphone/IEM to another.
+ *
+ * For AutoEQ, see https://github.com/jaakkopasanen/AutoEq.
+ * For SquigLink, see https://squig.link/.
+ *
+ * Parametric equalizer configuration generated from AutoEQ or Squiglink looks
+ * like below.
+ *
+ * \code{.unparsed}
+ * Preamp: -6.8 dB
+ * Filter 1: ON PK Fc 21 Hz Gain 6.7 dB Q 1.100
+ * Filter 2: ON PK Fc 85 Hz Gain 6.9 dB Q 3.000
+ * Filter 3: ON PK Fc 110 Hz Gain -2.6 dB Q 2.700
+ * Filter 4: ON PK Fc 210 Hz Gain 5.9 dB Q 2.100
+ * Filter 5: ON PK Fc 710 Hz Gain -1.0 dB Q 0.600
+ * Filter 6: ON PK Fc 1600 Hz Gain 2.3 dB Q 2.700
+ * \endcode
+ *
+ * Fc, Gain and Q specify the frequency, gain and Q factor respectively.
+ * The fourth column can be one of PK, LSC or HSC specifying peaking, low
+ * shelf and high shelf filter respectively. More often than not only peaking
+ * filters are involved.
+ *
+ * The `filters` (or channel specific `filtersX` where X is the channel between 1 and
+ * 8) can contain an array of filter specification object with the following keys:
+ *
+ *   `type` specifies the filter type, choose one from the available biquad labels.
+ *   `freq` is the frequency passed to the biquad.
+ *   `gain` is the gain passed to the biquad.
+ *   `q` is the Q passed to the biquad.
+ *
+ * This makes it possible to also use the param eq without a file and with all the
+ * available biquads.
+ *
  * ### Convolver
  *
  * The convolver can be used to apply an impulse response to a signal. It is usually used
@@ -272,7 +350,9 @@ PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
  *               computed automatically from the number of samples in the file.
  * - `tailsize` specifies the size of the tail blocks to use in the FFT.
  * - `gain`     the overall gain to apply to the IR file.
- * - `delay`    The extra delay (in samples) to add to the IR.
+ * - `delay`    The extra delay to add to the IR. A float number will be interpreted as seconds,
+ *              and integer as samples. Using the delay in seconds is independent of the graph
+ *              and IR rate and is recommended.
  * - `filename` The IR to load or create. Possible values are:
  *     - `/hilbert` creates a [hilbert function](https://en.wikipedia.org/wiki/Hilbert_transform)
  *                that can be used to phase shift the signal by +/-90 degrees. The
@@ -2279,14 +2359,20 @@ static void node_cleanup(struct node *node)
 static int port_ensure_data(struct port *port, uint32_t i, uint32_t max_samples)
 {
 	float *data;
+	struct node *node = port->node;
+	const struct fc_descriptor *d = node->desc->desc;
+
 	if ((data = port->audio_data[i]) == NULL) {
 		data = calloc(max_samples, sizeof(float));
 		if (data == NULL) {
 			pw_log_error("cannot create port data: %m");
 			return -errno;
 		}
+		port->audio_data[i] = data;
 	}
-	port->audio_data[i] = data;
+	pw_log_info("connect output port %s[%d]:%s %p",
+			node->name, i, d->ports[port->p].name, data);
+	d->connect_port(port->node->hndl[i], port->p, data);
 	return 0;
 }
 
@@ -2335,7 +2421,7 @@ static int graph_instantiate(struct graph *graph)
 	const struct fc_descriptor *d;
 	uint32_t i, j, max_samples = impl->quantum_limit;
 	int res;
-	float *sd = impl->silence_data, *dd = impl->discard_data;
+	float *sd, *dd;
 
 	if (graph->instantiated)
 		return 0;
@@ -2348,8 +2434,13 @@ static int graph_instantiate(struct graph *graph)
 
 		desc = node->desc;
 		d = desc->desc;
-		if (d->flags & FC_DESCRIPTOR_SUPPORTS_NULL_DATA)
+		if (d->flags & FC_DESCRIPTOR_SUPPORTS_NULL_DATA) {
 			sd = dd = NULL;
+		}
+		else {
+			sd = impl->silence_data;
+			dd = impl->discard_data;
+		}
 
 		for (i = 0; i < node->n_hndl; i++) {
 			pw_log_info("instantiate %s %d rate:%lu", d->name, i, impl->rate);
@@ -2375,12 +2466,11 @@ static int graph_instantiate(struct graph *graph)
 			}
 			for (j = 0; j < desc->n_output; j++) {
 				port = &node->output_port[j];
-				if ((res = port_ensure_data(port, i, max_samples)) < 0)
-					goto error;
-				pw_log_info("connect output port %s[%d]:%s %p",
-						node->name, i, d->ports[port->p].name,
-						port->audio_data[i]);
-				d->connect_port(node->hndl[i], port->p, port->audio_data[i]);
+				if (port->audio_data[i] == NULL) {
+					pw_log_info("connect output port %s[%d]:%s %p",
+						node->name, i, d->ports[port->p].name, dd);
+					d->connect_port(node->hndl[i], port->p, dd);
+				}
 			}
 			for (j = 0; j < desc->n_control; j++) {
 				port = &node->control_port[j];
@@ -2455,6 +2545,7 @@ static int setup_graph(struct graph *graph, struct spa_json *inputs, struct spa_
 	struct descriptor *desc;
 	const struct fc_descriptor *d;
 	char v[256];
+	bool allow_unused;
 
 	first = spa_list_first(&graph->node_list, struct node, link);
 	last = spa_list_last(&graph->node_list, struct node, link);
@@ -2463,16 +2554,22 @@ static int setup_graph(struct graph *graph, struct spa_json *inputs, struct spa_
 	 * If we have a list of inputs/outputs, just count them. Otherwise
 	 * we count all input ports of the first node and all output
 	 * ports of the last node */
-	if (inputs != NULL) {
+	if (inputs != NULL)
 		n_input = count_array(inputs);
-	} else {
+	else
 		n_input = first->desc->n_input;
-	}
-	if (outputs != NULL) {
+
+	if (outputs != NULL)
 		n_output = count_array(outputs);
-	} else {
+	else
 		n_output = last->desc->n_output;
-	}
+
+	/* we allow unconnected ports when not explicitly given and the nodes support
+	 * NULL data */
+	allow_unused = inputs == NULL && outputs == NULL &&
+	    SPA_FLAG_IS_SET(first->desc->desc->flags, FC_DESCRIPTOR_SUPPORTS_NULL_DATA) &&
+	    SPA_FLAG_IS_SET(last->desc->desc->flags, FC_DESCRIPTOR_SUPPORTS_NULL_DATA);
+
 	if (n_input == 0) {
 		pw_log_error("no inputs");
 		res = -EINVAL;
@@ -2509,7 +2606,8 @@ static int setup_graph(struct graph *graph, struct spa_json *inputs, struct spa_
 	}
 	if (n_hndl == 0) {
 		n_hndl = 1;
-		pw_log_warn("The capture stream has %1$d channels and "
+		if (!allow_unused)
+			pw_log_warn("The capture stream has %1$d channels and "
 				"the filter has %2$d inputs. The playback stream has %3$d channels "
 				"and the filter has %4$d outputs. Some filter ports will be "
 				"unconnected..",

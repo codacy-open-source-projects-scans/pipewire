@@ -245,6 +245,31 @@ static int bq_type_from_name(const char *name)
 	return BQ_NONE;
 }
 
+static const char *bq_name_from_type(int type)
+{
+	switch (type) {
+	case BQ_LOWPASS:
+		return "lowpass";
+	case BQ_HIGHPASS:
+		return "highpass";
+	case BQ_BANDPASS:
+		return "bandpass";
+	case BQ_LOWSHELF:
+		return "lowshelf";
+	case BQ_HIGHSHELF:
+		return "highshelf";
+	case BQ_PEAKING:
+		return "peaking";
+	case BQ_NOTCH:
+		return "notch";
+	case BQ_ALLPASS:
+		return "allpass";
+	case BQ_NONE:
+		return "raw";
+	}
+	return "unknown";
+}
+
 static void bq_raw_update(struct builtin *impl, float b0, float b1, float b2,
 		float a0, float a1, float a2)
 {
@@ -262,7 +287,8 @@ static void bq_raw_update(struct builtin *impl, float b0, float b1, float b2,
 	bq->b2 = impl->b2 * a0;
 	bq->a1 = impl->a1 * a0;
 	bq->a2 = impl->a2 * a0;
-	bq->x1 = bq->x2 = bq->y1 = bq->y2 = 0.0;
+	bq->x1 = bq->x2 = 0.0f;
+	bq->type = BQ_RAW;
 }
 
 /*
@@ -633,7 +659,7 @@ static const struct fc_descriptor bq_raw_desc = {
 /** convolve */
 struct convolver_impl {
 	unsigned long rate;
-	float *port[64];
+	float *port[2];
 
 	struct convolver *conv;
 };
@@ -674,7 +700,7 @@ static float *read_samples_from_sf(SNDFILE *f, SF_INFO info, float gain, int del
 }
 #endif
 
-static float *read_closest(char **filenames, float gain, int delay, int offset,
+static float *read_closest(char **filenames, float gain, float delay_sec, int offset,
 		int length, int channel, long unsigned *rate, int *n_samples)
 {
 #ifdef HAVE_SNDFILE
@@ -701,8 +727,9 @@ static float *read_closest(char **filenames, float gain, int delay, int offset,
 	}
 	if (fs[best] != NULL) {
 		pw_log_info("loading best rate:%u %s", infos[best].samplerate, filenames[best]);
-		samples = read_samples_from_sf(fs[best], infos[best], gain, delay,
-			offset, length, channel, rate, n_samples);
+		samples = read_samples_from_sf(fs[best], infos[best], gain,
+				(int) (delay_sec * infos[best].samplerate), offset, length,
+				channel, rate, n_samples);
 	} else {
 		char buf[PATH_MAX];
 		pw_log_error("Can't open any sample file (CWD %s):",
@@ -730,11 +757,12 @@ static float *read_closest(char **filenames, float gain, int delay, int offset,
 #endif
 }
 
-static float *create_hilbert(const char *filename, float gain, int delay, int offset,
+static float *create_hilbert(const char *filename, float gain, int rate, float delay_sec, int offset,
 		int length, int *n_samples)
 {
 	float *samples, v;
 	int i, n, h;
+	int delay = (int) (delay_sec * rate);
 
 	if (length <= 0)
 		length = 1024;
@@ -760,10 +788,11 @@ static float *create_hilbert(const char *filename, float gain, int delay, int of
 	return samples;
 }
 
-static float *create_dirac(const char *filename, float gain, int delay, int offset,
+static float *create_dirac(const char *filename, float gain, int rate, float delay_sec, int offset,
 		int length, int *n_samples)
 {
 	float *samples;
+	int delay = (int) (delay_sec * rate);
 	int n;
 
 	n = delay + 1;
@@ -867,9 +896,8 @@ static void * convolver_instantiate(const struct fc_descriptor * Descriptor,
 	char key[256], v[256];
 	char *filenames[MAX_RATES] = { 0 };
 	int blocksize = 0, tailsize = 0;
-	int delay = 0;
 	int resample_quality = RESAMPLE_DEFAULT_QUALITY;
-	float gain = 1.0f;
+	float gain = 1.0f, delay = 0.0f;
 	unsigned long rate;
 
 	errno = EINVAL;
@@ -903,7 +931,10 @@ static void * convolver_instantiate(const struct fc_descriptor * Descriptor,
 			}
 		}
 		else if (spa_streq(key, "delay")) {
-			if (spa_json_parse_int(val, len, &delay) <= 0) {
+			int delay_i;
+			if (spa_json_parse_int(val, len, &delay_i) > 0) {
+				delay = delay_i / (float)SampleRate;
+			} else if (spa_json_parse_float(val, len, &delay) <= 0) {
 				pw_log_error("convolver:delay requires a number");
 				return NULL;
 			}
@@ -957,16 +988,16 @@ static void * convolver_instantiate(const struct fc_descriptor * Descriptor,
 		return NULL;
 	}
 
-	if (delay < 0)
-		delay = 0;
+	if (delay < 0.0f)
+		delay = 0.0f;
 	if (offset < 0)
 		offset = 0;
 
 	if (spa_streq(filenames[0], "/hilbert")) {
-		samples = create_hilbert(filenames[0], gain, delay, offset,
+		samples = create_hilbert(filenames[0], gain, SampleRate, delay, offset,
 				length, &n_samples);
 	} else if (spa_streq(filenames[0], "/dirac")) {
-		samples = create_dirac(filenames[0], gain, delay, offset,
+		samples = create_dirac(filenames[0], gain, SampleRate, delay, offset,
 				length, &n_samples);
 	} else {
 		rate = SampleRate;
@@ -991,8 +1022,8 @@ static void * convolver_instantiate(const struct fc_descriptor * Descriptor,
 	if (tailsize <= 0)
 		tailsize = SPA_CLAMP(4096, blocksize, 32768);
 
-	pw_log_info("using n_samples:%u %d:%d blocksize", n_samples,
-			blocksize, tailsize);
+	pw_log_info("using n_samples:%u %d:%d blocksize delay:%f", n_samples,
+			blocksize, tailsize, delay);
 
 	impl = calloc(1, sizeof(*impl));
 	if (impl == NULL)
@@ -1048,11 +1079,13 @@ static void convolver_deactivate(void * Instance)
 static void convolve_run(void * Instance, unsigned long SampleCount)
 {
 	struct convolver_impl *impl = Instance;
-	convolver_run(impl->conv, impl->port[1], impl->port[0], SampleCount);
+	if (impl->port[1] != NULL && impl->port[0] != NULL)
+		convolver_run(impl->conv, impl->port[1], impl->port[0], SampleCount);
 }
 
 static const struct fc_descriptor convolve_desc = {
 	.name = "convolver",
+	.flags = FC_DESCRIPTOR_SUPPORTS_NULL_DATA,
 
 	.n_ports = 2,
 	.ports = convolve_ports,
@@ -1122,10 +1155,10 @@ static void *delay_instantiate(const struct fc_descriptor * Descriptor,
 		return NULL;
 
 	impl->rate = SampleRate;
-	impl->buffer_samples = (uint32_t)(max_delay * impl->rate);
+	impl->buffer_samples = SPA_ROUND_UP_N((uint32_t)(max_delay * impl->rate), 64);
 	pw_log_info("max-delay:%f seconds rate:%lu samples:%d", max_delay, impl->rate, impl->buffer_samples);
 
-	impl->buffer = calloc(impl->buffer_samples, sizeof(float));
+	impl->buffer = calloc(impl->buffer_samples * 2 + 64, sizeof(float));
 	if (impl->buffer == NULL) {
 		delay_cleanup(impl);
 		return NULL;
@@ -1147,27 +1180,13 @@ static void delay_run(void * Instance, unsigned long SampleCount)
 	struct delay_impl *impl = Instance;
 	float *in = impl->port[1], *out = impl->port[0];
 	float delay = impl->port[2][0];
-	unsigned long n;
-	uint32_t r, w;
 
 	if (delay != impl->delay) {
 		impl->delay_samples = SPA_CLAMP((uint32_t)(delay * impl->rate), 0u, impl->buffer_samples-1);
 		impl->delay = delay;
 	}
-	r = impl->ptr;
-	w = impl->ptr + impl->delay_samples;
-	if (w >= impl->buffer_samples)
-		w -= impl->buffer_samples;
-
-	for (n = 0; n < SampleCount; n++) {
-		impl->buffer[w] = in[n];
-		out[n] = impl->buffer[r];
-		if (++r >= impl->buffer_samples)
-			r = 0;
-		if (++w >= impl->buffer_samples)
-			w = 0;
-	}
-	impl->ptr = r;
+	dsp_ops_delay(dsp_ops, impl->buffer, &impl->ptr, impl->buffer_samples,
+			impl->delay_samples, out, in, SampleCount);
 }
 
 static struct fc_port delay_ports[] = {
@@ -1668,6 +1687,350 @@ static const struct fc_descriptor sine_desc = {
 	.cleanup = builtin_cleanup,
 };
 
+#define PARAM_EQ_MAX		64
+struct param_eq_impl {
+	unsigned long rate;
+	float *port[8*2];
+
+	uint32_t n_bq;
+	struct biquad bq[PARAM_EQ_MAX * 8];
+};
+
+static int load_eq_bands(const char *filename, int rate, struct biquad *bq, uint32_t max_bq, uint32_t *n_bq)
+{
+	FILE *f = NULL;
+	char *line = NULL;
+	ssize_t nread;
+	size_t linelen;
+	uint32_t freq, n = 0;
+	char filter_type[4];
+	char filter[4];
+	char q[7], gain[7];
+	float vg, vq;
+	int res = 0;
+
+	if ((f = fopen(filename, "r")) == NULL) {
+		res = -errno;
+		pw_log_error("failed to open param_eq file '%s': %m", filename);
+		goto exit;
+	}
+	/*
+	 * Read the Preamp gain line.
+	 * Example: Preamp: -6.8 dB
+	 *
+	 * When a pre-amp gain is required, which is usually the case when
+	 * applying EQ, we need to modify the first EQ band to apply a
+	 * bq_highshelf filter at frequency 0 Hz with the provided negative
+	 * gain.
+	 *
+	 * Pre-amp gain is always negative to offset the effect of possible
+	 * clipping introduced by the amplification resulting from EQ.
+	 */
+	nread = getline(&line, &linelen, f);
+	if (nread != -1 && sscanf(line, "%*s %6s %*s", gain) == 1) {
+		if (spa_json_parse_float(gain, strlen(gain), &vg)) {
+			pw_log_info("%d %s freq:0 q:1.0 gain:%f", n,
+					bq_name_from_type(BQ_HIGHSHELF), vg);
+			biquad_set(&bq[n++], BQ_HIGHSHELF, 0.0f, 1.0f, vg);
+		}
+	}
+	/* Read the filter bands */
+	while ((nread = getline(&line, &linelen, f)) != -1) {
+		if (n == PARAM_EQ_MAX) {
+			res = -ENOSPC;
+			goto exit;
+		}
+		/*
+		 * On field widths:
+		 * - filter can be ON or OFF
+		 * - filter type can be PK, LSC, HSC
+		 * - freq can be at most 5 decimal digits
+		 * - gain can be -xy.z
+		 * - Q can be x.y00
+		 *
+		 * Use a field width of 6 for gain and Q to account for any
+		 * possible zeros.
+		 */
+		if (sscanf(line, "%*s %*d: %3s %3s %*s %5d %*s %*s %6s %*s %*c %6s",
+					filter, filter_type, &freq, gain, q) == 5) {
+			if (strcmp(filter, "ON") == 0) {
+				int type;
+
+				if (spa_streq(filter_type, "PK"))
+					type = BQ_PEAKING;
+				else if (spa_streq(filter_type, "LSC"))
+					type = BQ_LOWSHELF;
+				else if (spa_streq(filter_type, "HSC"))
+					type = BQ_HIGHSHELF;
+				else
+					continue;
+
+				if (spa_json_parse_float(gain, strlen(gain), &vg) &&
+				    spa_json_parse_float(q, strlen(q), &vq)) {
+					pw_log_info("%d %s freq:%d q:%f gain:%f", n,
+							bq_name_from_type(type), freq, vq, vg);
+					biquad_set(&bq[n++], type, freq * 2.0f / rate, vq, vg);
+				}
+			}
+		}
+	}
+	*n_bq = n;
+exit:
+	if (f)
+		fclose(f);
+	return res;
+}
+
+
+
+/*
+ * [
+ *   { type=bq_peaking freq=21 gain=6.7 q=1.100 }
+ *   { type=bq_peaking freq=85 gain=6.9 q=3.000 }
+ *   { type=bq_peaking freq=110 gain=-2.6 q=2.700 }
+ *   { type=bq_peaking freq=210 gain=5.9 q=2.100 }
+ *   { type=bq_peaking freq=710 gain=-1.0 q=0.600 }
+ *   { type=bq_peaking freq=1600 gain=2.3 q=2.700 }
+ * ]
+ */
+static int parse_filters(struct spa_json *iter, int rate, struct biquad *bq, uint32_t max_bq, uint32_t *n_bq)
+{
+	struct spa_json it[1];
+	const char *val;
+	char key[256];
+	char type_str[17];
+	int len;
+	uint32_t n = 0;
+
+	while (spa_json_enter_object(iter, &it[0]) > 0) {
+		float freq = 0.0f, gain = 0.0f, q = 1.0f;
+		int type = BQ_NONE;
+
+		while ((len = spa_json_object_next(&it[0], key, sizeof(key), &val)) > 0) {
+			if (spa_streq(key, "type")) {
+				if (spa_json_parse_stringn(val, len, type_str, sizeof(type_str)) <= 0) {
+					pw_log_error("param_eq:type requires a string");
+					return -EINVAL;
+				}
+				type = bq_type_from_name(type_str);
+			}
+			else if (spa_streq(key, "freq")) {
+				if (spa_json_parse_float(val, len, &freq) <= 0) {
+					pw_log_error("param_eq:rate requires a number");
+					return -EINVAL;
+				}
+			}
+			else if (spa_streq(key, "q")) {
+				if (spa_json_parse_float(val, len, &q) <= 0) {
+					pw_log_error("param_eq:q requires a float");
+					return -EINVAL;
+				}
+			}
+			else if (spa_streq(key, "gain")) {
+				if (spa_json_parse_float(val, len, &gain) <= 0) {
+					pw_log_error("param_eq:gain requires a float");
+					return -EINVAL;
+				}
+			}
+			else {
+				pw_log_warn("param_eq: ignoring filter key: '%s'", key);
+			}
+		}
+		if (n == max_bq)
+			return -ENOSPC;
+
+		pw_log_info("%d %s freq:%f q:%f gain:%f", n,
+					bq_name_from_type(type), freq, q, gain);
+		biquad_set(&bq[n++], type, freq * 2 / rate, q, gain);
+	}
+	*n_bq = n;
+	return 0;
+}
+
+/*
+ * {
+ *   filename = "...",
+ *   filenameX = "...", # to load channel X
+ *   filters = [ ... ]
+ *   filtersX = [ ... ] # to load channel X
+ * }
+ */
+static void *param_eq_instantiate(const struct fc_descriptor * Descriptor,
+		unsigned long SampleRate, int index, const char *config)
+{
+	struct spa_json it[3];
+	const char *val;
+	char key[256], filename[PATH_MAX];
+	int len, res;
+	struct param_eq_impl *impl;
+	uint32_t i, n_bq = 0;
+
+	if (config == NULL) {
+		pw_log_error("param_eq: requires a config section");
+		errno = EINVAL;
+		return NULL;
+	}
+
+	if (spa_json_begin_object(&it[0], config, strlen(config)) <= 0) {
+		pw_log_error("param_eq: config must be an object");
+		return NULL;
+	}
+
+	impl = calloc(1, sizeof(*impl));
+	if (impl == NULL)
+		return NULL;
+
+	impl->rate = SampleRate;
+	for (i = 0; i < SPA_N_ELEMENTS(impl->bq); i++)
+		biquad_set(&impl->bq[i], BQ_NONE, 0.0f, 0.0f, 0.0f);
+
+	while ((len = spa_json_object_next(&it[0], key, sizeof(key), &val)) > 0) {
+		int32_t idx = 0;
+		struct biquad *bq = impl->bq;
+
+		if (spa_strstartswith(key, "filename")) {
+			if (spa_json_parse_stringn(val, len, filename, sizeof(filename)) <= 0) {
+				pw_log_error("param_eq: filename requires a string");
+				goto error;
+			}
+			if (spa_atoi32(key+8, &idx, 0))
+				bq = &impl->bq[(SPA_CLAMP(idx, 1, 8) - 1) * PARAM_EQ_MAX];
+
+			res = load_eq_bands(filename, impl->rate, bq, PARAM_EQ_MAX, &n_bq);
+			if (res < 0) {
+				pw_log_error("param_eq: failed to parse configuration from '%s'", filename);
+				goto error;
+			}
+			pw_log_info("loaded %d biquads for channel %d", n_bq, idx);
+			impl->n_bq = SPA_MAX(impl->n_bq, n_bq);
+		}
+		else if (spa_strstartswith(key, "filters")) {
+			if (!spa_json_is_array(val, len)) {
+				pw_log_error("param_eq:filters require an array");
+				goto error;
+			}
+			spa_json_enter(&it[0], &it[1]);
+
+			if (spa_atoi32(key+7, &idx, 0))
+				bq = &impl->bq[(SPA_CLAMP(idx, 1, 8) - 1) * PARAM_EQ_MAX];
+
+			res = parse_filters(&it[1], impl->rate, bq, PARAM_EQ_MAX, &n_bq);
+			if (res < 0) {
+				pw_log_error("param_eq: failed to parse configuration");
+				goto error;
+			}
+			pw_log_info("parsed %d biquads for channel %d", n_bq, idx);
+			impl->n_bq = SPA_MAX(impl->n_bq, n_bq);
+		} else {
+			pw_log_warn("param_eq: ignoring config key: '%s'", key);
+		}
+		if (idx == 0) {
+			for (i = 1; i < 8; i++)
+				memcpy(&impl->bq[i*PARAM_EQ_MAX], impl->bq,
+						sizeof(struct biquad) * PARAM_EQ_MAX);
+		}
+	}
+	return impl;
+error:
+	free(impl);
+	return NULL;
+}
+
+static void param_eq_connect_port(void * Instance, unsigned long Port,
+                        float * DataLocation)
+{
+	struct param_eq_impl *impl = Instance;
+	impl->port[Port] = DataLocation;
+}
+
+static void param_eq_run(void * Instance, unsigned long SampleCount)
+{
+	struct param_eq_impl *impl = Instance;
+	dsp_ops_biquadn_run(dsp_ops, impl->bq, impl->n_bq, PARAM_EQ_MAX,
+			&impl->port[8], (const float**)impl->port, 8, SampleCount);
+}
+
+static struct fc_port param_eq_ports[] = {
+	{ .index = 0,
+	  .name = "In 1",
+	  .flags = FC_PORT_INPUT | FC_PORT_AUDIO,
+	},
+	{ .index = 1,
+	  .name = "In 2",
+	  .flags = FC_PORT_INPUT | FC_PORT_AUDIO,
+	},
+	{ .index = 2,
+	  .name = "In 3",
+	  .flags = FC_PORT_INPUT | FC_PORT_AUDIO,
+	},
+	{ .index = 3,
+	  .name = "In 4",
+	  .flags = FC_PORT_INPUT | FC_PORT_AUDIO,
+	},
+	{ .index = 4,
+	  .name = "In 5",
+	  .flags = FC_PORT_INPUT | FC_PORT_AUDIO,
+	},
+	{ .index = 5,
+	  .name = "In 6",
+	  .flags = FC_PORT_INPUT | FC_PORT_AUDIO,
+	},
+	{ .index = 6,
+	  .name = "In 7",
+	  .flags = FC_PORT_INPUT | FC_PORT_AUDIO,
+	},
+	{ .index = 7,
+	  .name = "In 8",
+	  .flags = FC_PORT_INPUT | FC_PORT_AUDIO,
+	},
+
+	{ .index = 8,
+	  .name = "Out 1",
+	  .flags = FC_PORT_OUTPUT | FC_PORT_AUDIO,
+	},
+	{ .index = 9,
+	  .name = "Out 2",
+	  .flags = FC_PORT_OUTPUT | FC_PORT_AUDIO,
+	},
+	{ .index = 10,
+	  .name = "Out 3",
+	  .flags = FC_PORT_OUTPUT | FC_PORT_AUDIO,
+	},
+	{ .index = 11,
+	  .name = "Out 4",
+	  .flags = FC_PORT_OUTPUT | FC_PORT_AUDIO,
+	},
+	{ .index = 12,
+	  .name = "Out 5",
+	  .flags = FC_PORT_OUTPUT | FC_PORT_AUDIO,
+	},
+	{ .index = 13,
+	  .name = "Out 6",
+	  .flags = FC_PORT_OUTPUT | FC_PORT_AUDIO,
+	},
+	{ .index = 14,
+	  .name = "Out 7",
+	  .flags = FC_PORT_OUTPUT | FC_PORT_AUDIO,
+	},
+	{ .index = 15,
+	  .name = "Out 8",
+	  .flags = FC_PORT_OUTPUT | FC_PORT_AUDIO,
+	},
+};
+
+static const struct fc_descriptor param_eq_desc = {
+	.name = "param_eq",
+	.flags = FC_DESCRIPTOR_SUPPORTS_NULL_DATA,
+
+	.n_ports = SPA_N_ELEMENTS(param_eq_ports),
+	.ports = param_eq_ports,
+
+	.instantiate = param_eq_instantiate,
+	.connect_port = param_eq_connect_port,
+	.run = param_eq_run,
+	.cleanup = free,
+};
+
 static const struct fc_descriptor * builtin_descriptor(unsigned long Index)
 {
 	switch(Index) {
@@ -1713,6 +2076,8 @@ static const struct fc_descriptor * builtin_descriptor(unsigned long Index)
 		return &mult_desc;
 	case 20:
 		return &sine_desc;
+	case 21:
+		return &param_eq_desc;
 	}
 	return NULL;
 }
