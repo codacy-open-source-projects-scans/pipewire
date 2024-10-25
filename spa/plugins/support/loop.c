@@ -72,6 +72,7 @@ struct impl {
 
 	struct spa_source *wakeup;
 
+	int tss_ref;
 	tss_t queue_tss_id;
 	pthread_mutex_t queue_lock;
 	uint32_t count;
@@ -84,15 +85,17 @@ struct queue {
 	struct impl *impl;
 	struct spa_list link;
 
+	int ref;
+
 #define QUEUE_FLAG_NONE		(0)
 #define QUEUE_FLAG_ACK_FD	(1<<0)
+#define QUEUE_FLAG_IN_TSS	(1<<1)
 	uint32_t flags;
 	struct queue *overflow;
 
 	int ack_fd;
 	struct spa_ratelimit rate_limit;
 	bool destroyed;
-	bool in_tss;
 
 	struct spa_ringbuffer buffer;
 	uint8_t *buffer_data;
@@ -189,6 +192,7 @@ static struct queue *loop_create_queue(void *object, uint32_t flags)
 
 	queue->impl = impl;
 	queue->flags = flags;
+	queue->ref = 1;
 
 	queue->rate_limit.interval = 2 * SPA_NSEC_PER_SEC;
 	queue->rate_limit.burst = 1;
@@ -207,6 +211,8 @@ static struct queue *loop_create_queue(void *object, uint32_t flags)
 	} else {
 		queue->ack_fd = -1;
 	}
+	if (flags & QUEUE_FLAG_IN_TSS)
+		queue->ref++;
 
 	pthread_mutex_lock(&impl->queue_lock);
 	spa_list_append(&impl->queue_list, &queue->link);
@@ -222,6 +228,23 @@ error:
 	return NULL;
 }
 
+static inline void loop_queue_ref(struct queue *queue)
+{
+	SPA_ATOMIC_INC(queue->ref);
+}
+
+static bool loop_queue_unref(struct queue *queue)
+{
+	bool do_free;
+	struct impl *impl = queue->impl;
+
+	do_free = SPA_ATOMIC_DEC(queue->ref) == 0;
+	if (do_free) {
+		spa_log_debug(impl->log, "%p: free queue %p", impl, queue);
+		free(queue);
+	}
+	return do_free;
+}
 
 static inline int32_t item_compare(struct invoke_item *a, struct invoke_item *b)
 {
@@ -264,10 +287,14 @@ static void flush_all_queues(struct impl *impl)
 		 * might get overwritten. */
 		func = spa_steal_ptr(item->func);
 		if (func) {
+			loop_queue_ref(queue);
 			pthread_mutex_unlock(&impl->queue_lock);
-			item->res = func(&impl->loop, true, item->seq, item->data,
+			res = func(&impl->loop, true, item->seq, item->data,
 				item->size, item->user_data);
 			pthread_mutex_lock(&impl->queue_lock);
+			if (loop_queue_unref(queue))
+				continue;
+			item->res = res;
 		}
 
 		/* if this function did a recursive invoke, it now flushed the
@@ -413,9 +440,7 @@ static void loop_queue_destroy(void *data)
 	struct queue *queue = data;
 	struct impl *impl = queue->impl;
 
-	if (!queue->destroyed) {
-		queue->destroyed = true;
-
+	if (SPA_ATOMIC_CAS(queue->destroyed, false, true)) {
 		pthread_mutex_lock(&impl->queue_lock);
 		spa_list_remove(&queue->link);
 		pthread_mutex_unlock(&impl->queue_lock);
@@ -425,17 +450,18 @@ static void loop_queue_destroy(void *data)
 
 		if (queue->flags & QUEUE_FLAG_ACK_FD)
 			spa_system_close(impl->system, queue->ack_fd);
+
+		loop_queue_unref(queue);
 	}
-	if (!queue->in_tss)
-		free(queue);
 }
 
 static void loop_queue_destroy_tss(void *data)
 {
 	struct queue *queue = data;
 	if (queue) {
-		queue->in_tss = false;
+		SPA_ATOMIC_DEC(queue->impl->tss_ref);
 		loop_queue_destroy(queue);
+		loop_queue_unref(queue);
 	}
 }
 
@@ -447,10 +473,10 @@ static int loop_invoke(void *object, spa_invoke_func_t func, uint32_t seq,
 
 	local_queue = tss_get(impl->queue_tss_id);
 	if (local_queue == NULL) {
-		local_queue = loop_create_queue(impl, QUEUE_FLAG_ACK_FD);
+		local_queue = loop_create_queue(impl, QUEUE_FLAG_ACK_FD | QUEUE_FLAG_IN_TSS);
 		if (local_queue == NULL)
 			return -errno;
-		local_queue->in_tss = true;
+		SPA_ATOMIC_INC(impl->tss_ref);
 		tss_set(impl->queue_tss_id, local_queue);
 	}
 	return loop_queue_invoke(local_queue, func, seq, data, size, block, user_data);
@@ -1104,6 +1130,10 @@ static int impl_clear(struct spa_handle *handle)
 
 	spa_system_close(impl->system, impl->poll_fd);
 	pthread_mutex_destroy(&impl->queue_lock);
+
+	if (SPA_ATOMIC_DEC(impl->tss_ref) != 0)
+		spa_log_warn(impl->log, "%p: loop still has %d queues in TSS",
+				impl, impl->tss_ref);
 	tss_delete(impl->queue_tss_id);
 
 	return 0;
@@ -1200,6 +1230,7 @@ impl_init(const struct spa_handle_factory *factory,
 		spa_log_error(impl->log, "%p: can't create tss: %m", impl);
 		goto error_exit_free_wakeup;
 	}
+	impl->tss_ref = 1;
 
 	spa_log_debug(impl->log, "%p: initialized", impl);
 

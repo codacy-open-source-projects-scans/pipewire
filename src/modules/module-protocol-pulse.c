@@ -256,10 +256,12 @@
  * # Extra commands can be executed here.
  * #   load-module : loads a module with args and flags
  * #      args = "<module-name> <module-args>"
- * #      flags = [ "no-fail" ]
+ * #      ( flags = [ "no-fail" ] )
+ * #      ( condition = [ { <key1> = <value1>, ... } ... ] )
+ * # conditions will check the pulse.properties key/values.
  * pulse.cmd = [
  *     { cmd = "load-module" args = "module-always-sink" flags = [ ] }
- *     #{ cmd = "load-module" args = "module-switch-on-connect" }
+ *     #{ cmd = "load-module" args = "module-switch-on-connect" condition = [ { pulse.cmd.switch-on-connect = true } ]
  *     #{ cmd = "load-module" args = "module-gsettings" flags = [ "nofail" ] }
  * ]
  *\endcode
@@ -345,6 +347,13 @@
  *
  * Takes an object with the properties to update on the client. Common actions are to
  * tweak the quantum values.
+ *
+ * ### startup notification
+ *
+ * A newline will be written into the notification file descriptor when the server has
+ * started if the following environment variable is set:
+ *
+ * - PIPEWIRE_PULSE_NOTIFICATION_FD
  *
  * ## Example configuration
  *
