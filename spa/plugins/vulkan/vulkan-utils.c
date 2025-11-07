@@ -41,8 +41,9 @@ static int vkresult_to_errno(VkResult result)
 	case VK_EVENT_SET:
 	case VK_EVENT_RESET:
 		return 0;
-	case VK_NOT_READY:
 	case VK_INCOMPLETE:
+		return ENOSPC;
+	case VK_NOT_READY:
 	case VK_ERROR_NATIVE_WINDOW_IN_USE_KHR:
 		return EBUSY;
 	case VK_TIMEOUT:
@@ -244,11 +245,8 @@ int vulkan_write_pixels(struct vulkan_base *s, struct vulkan_write_pixels_info *
 	void *vmap;
 	VK_CHECK_RESULT(vkMapMemory(s->device, vk_sbuf->memory, 0, VK_WHOLE_SIZE, 0, &vmap));
 
-	char *map = (char *)vmap;
-
 	// upload data
-	const char *pdata = info->data;
-	memcpy(map, pdata, info->stride * info->size.height);
+	memcpy(vmap, info->data, info->stride * info->size.height);
 
 	info->copies[0] = (VkBufferImageCopy) {
 		.imageExtent.width = info->size.width,

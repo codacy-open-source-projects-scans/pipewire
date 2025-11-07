@@ -12,6 +12,7 @@
 #include <spa/utils/result.h>
 #include <spa/debug/log.h>
 
+#define PW_API_PROPERTIES SPA_EXPORT
 #include "pipewire/array.h"
 #include "pipewire/log.h"
 #include "pipewire/utils.h"
@@ -251,7 +252,8 @@ static int update_string(struct pw_properties *props, const char *str, size_t si
 				continue;
 			}
 			/* item changed or added, apply changes later */
-			if ((errno = -add_item(&changes, key, false, val, true) < 0)) {
+			if ((res = add_item(&changes, key, false, val, true)) < 0) {
+				errno = -res;
 				it[0].state = SPA_JSON_ERROR_FLAG;
 				break;
 			}

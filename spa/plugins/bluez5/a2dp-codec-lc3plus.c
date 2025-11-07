@@ -65,7 +65,7 @@ struct impl {
 };
 
 static int codec_fill_caps(const struct media_codec *codec, uint32_t flags,
-		uint8_t caps[A2DP_MAX_CAPS_SIZE])
+		const struct spa_dict *settings, uint8_t caps[A2DP_MAX_CAPS_SIZE])
 {
 	const a2dp_lc3plus_hr_t a2dp_lc3plus_hr = {
 		.info = codec->vendor,
@@ -175,7 +175,7 @@ static int codec_enum_config(const struct media_codec *codec, uint32_t flags,
 	a2dp_lc3plus_hr_t conf;
 	struct spa_pod_frame f[2];
 	struct spa_pod_choice *choice;
-	uint32_t position[SPA_AUDIO_MAX_CHANNELS];
+	uint32_t position[2];
 	uint32_t i = 0;
 
 	if (caps_size < sizeof(conf))
@@ -637,7 +637,8 @@ static SPA_UNUSED int codec_start_decode (void *data,
 	const struct rtp_payload *payload = SPA_PTROFF(src, sizeof(struct rtp_header), void);
 	size_t header_size = sizeof(struct rtp_header) + sizeof(struct rtp_payload);
 
-	spa_return_val_if_fail (src_size > header_size, -EINVAL);
+	if (src_size <= header_size)
+		return -EINVAL;
 
 	if (seqnum)
 		*seqnum = ntohs(header->sequence_number);
@@ -740,6 +741,7 @@ static int codec_increase_bitpool(void *data)
 
 const struct media_codec a2dp_codec_lc3plus_hr = {
 	.id = SPA_BLUETOOTH_AUDIO_CODEC_LC3PLUS_HR,
+	.kind = MEDIA_CODEC_A2DP,
 	.name = "lc3plus_hr",
 	.codec_id = A2DP_CODEC_VENDOR,
 	.vendor = { .vendor_id = LC3PLUS_HR_VENDOR_ID,

@@ -26,7 +26,7 @@
 
 #define SPA_TYPE_INTERFACE_Bluez5CodecMedia	SPA_TYPE_INFO_INTERFACE_BASE "Bluez5:Codec:Media:Private"
 
-#define SPA_VERSION_BLUEZ5_CODEC_MEDIA		9
+#define SPA_VERSION_BLUEZ5_CODEC_MEDIA		15
 
 struct spa_bluez5_codec_a2dp {
 	struct spa_interface iface;
@@ -60,6 +60,13 @@ enum {
 	NEED_FLUSH_FRAGMENT = 2,
 };
 
+enum media_codec_kind {
+        MEDIA_CODEC_A2DP,
+        MEDIA_CODEC_BAP,
+        MEDIA_CODEC_ASHA,
+        MEDIA_CODEC_HFP,
+};
+
 struct media_codec_audio_info {
 	uint32_t rate;
 	uint32_t channels;
@@ -67,10 +74,10 @@ struct media_codec_audio_info {
 
 struct media_codec {
 	enum spa_bluetooth_audio_codec id;
+	enum media_codec_kind kind;
+
 	uint8_t codec_id;
 	a2dp_vendor_codec_t vendor;
-
-	bool bap;
 
 	const char *name;
 	const char *description;
@@ -81,13 +88,17 @@ struct media_codec {
 
 	const struct media_codec *duplex_codec;	/**< Codec for non-standard A2DP duplex channel */
 
+	const bool stream_pkt;	/**< If true, socket data may contain multiple packets.
+				 * After successful decode, start_decode() should be
+				 * called again to parse the remaining data. */
+
 	int (*get_bis_config)(const struct media_codec *codec, uint8_t *caps,
 				uint8_t *caps_size,	struct spa_dict *settings,
 				struct bap_codec_qos *qos);
 
 	/** If fill_caps is NULL, no endpoint is registered (for sharing with another codec). */
 	int (*fill_caps) (const struct media_codec *codec, uint32_t flags,
-			uint8_t caps[A2DP_MAX_CAPS_SIZE]);
+			const struct spa_dict *settings, uint8_t caps[A2DP_MAX_CAPS_SIZE]);
 
 	int (*select_config) (const struct media_codec *codec, uint32_t flags,
 			const void *caps, size_t caps_size,
@@ -102,7 +113,7 @@ struct media_codec {
 	int (*get_qos)(const struct media_codec *codec,
 			const void *config, size_t config_size,
 			const struct bap_endpoint_qos *endpoint_qos,
-			struct bap_codec_qos *qos);
+			struct bap_codec_qos *qos, const struct spa_dict *settings);
 
 	/** qsort comparison sorting caps in order of preference for the codec.
 	 * Used in codec switching to select best remote endpoints.
@@ -195,10 +206,31 @@ struct media_codec {
 		void *dst, size_t dst_size,
 		size_t *dst_out);
 
+	/**
+	 * Generate audio data corresponding to one lost packet, using codec internal
+	 * packet loss concealment.
+	 *
+	 * NULL if not available.
+	 *
+	 * \return number of bytes produced, or < 0 for error
+	 */
+	int (*produce_plc) (void *data, void *dst, size_t dst_size);
+
 	int (*reduce_bitpool) (void *data);
 	int (*increase_bitpool) (void *data);
 
 	void (*set_log) (struct spa_log *global_log);
+
+	/**
+	 * Get codec internal delays, in samples at input/output rates.
+	 *
+	 * The delay does not include the duration of the PCM input/output
+	 * audio data, but is that internal to the codec.
+	 *
+	 * \param[out] encoder    Encoder delay in samples, or NULL
+	 * \param[out] decoder    Decoder delay in samples, or NULL
+	 */
+	void (*get_delay) (void *data, uint32_t *encoder, uint32_t *decoder);
 };
 
 struct media_codec_config {
@@ -206,6 +238,21 @@ struct media_codec_config {
 	int value;
 	unsigned int priority;
 };
+
+static inline const char *media_codec_kind_str(const struct media_codec *codec)
+{
+	switch (codec->kind) {
+	case MEDIA_CODEC_A2DP:
+		return "A2DP";
+	case MEDIA_CODEC_BAP:
+		return "BAP";
+	case MEDIA_CODEC_ASHA:
+		return "ASHA";
+	case MEDIA_CODEC_HFP:
+		return "HFP";
+	}
+	return "unknown";
+}
 
 int media_codec_select_config(const struct media_codec_config configs[], size_t n,
 	uint32_t cap, int preferred_value);

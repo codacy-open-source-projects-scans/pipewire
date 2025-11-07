@@ -21,6 +21,7 @@ context.properties = {
     #clock.power-of-two-quantum            = true
     #log.level                             = 2
     #cpu.zero.denormals                    = false
+    #rlimit.nofile                         = -1
 
     #loop.rt-prio = -1            # -1 = use module-rt prio, 0 disable rt
     #loop.class = data.rt
@@ -84,6 +85,7 @@ context.spa-libs = {
     api.jack.*      = jack/libspa-jack
     support.*       = support/libspa-support
     video.convert.* = videoconvert/libspa-videoconvert
+    #filter.graph    = filter-graph/libspa-filter-graph
     #videotestsrc   = videotestsrc/libspa-videotestsrc
     #audiotestsrc   = audiotestsrc/libspa-audiotestsrc
 }
@@ -199,7 +201,11 @@ context.modules = [
     }
 
     # Makes a factory for creating links between ports.
+    # use module.link-factory.args = { ... } to override the arguments.
     { name = libpipewire-module-link-factory
+        args = {
+            #allow.link.passive = false
+	}
         condition = [ { module.link-factory = !false } ]
     }
 

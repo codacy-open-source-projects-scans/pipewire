@@ -3,6 +3,8 @@
 /* SPDX-FileCopyrightText: Copyright © 2019 Red Hat Inc. */
 /* SPDX-License-Identifier: MIT */
 
+#include "config.h"
+
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
@@ -10,8 +12,6 @@
 #include <sys/stat.h>
 #include <fcntl.h>
 #include <unistd.h>
-
-#include "config.h"
 
 #include <dbus/dbus.h>
 
@@ -40,6 +40,19 @@
  * There are no module-specific options, all arguments are passed to
  * \ref page_module_jack_tunnel.
  *
+ * ## Config override
+ *
+ * A `module.jackdbus-detect.args` config section can be added
+ * to override the module arguments.
+ *
+ *\code{.unparsed}
+ * # ~/.config/pipewire/pipewire.conf.d/my-jack-dbus-detect-args.conf
+ *
+ * module.jackdbus-detect.args = {
+ *     #tunnel.mode    = duplex
+ * }
+ *\endcode
+ *
  * ## Example configuration
  *\code{.unparsed}
  * # ~/.config/pipewire/pipewire.conf.d/my-jack-dbus-detect.conf
@@ -60,17 +73,6 @@
  *      }
  *  }
  * ]
- *\endcode
-
- * ## Config override
- *
- * A `module.jackdbus-detect.args` config section can be added in the override directory
- * to override the module arguments.
- *
- *\code{.unparsed}
- * module.jackdbus-detect.args = {
- *     #tunnel.mode    = duplex
- * }
  *\endcode
  *
  */

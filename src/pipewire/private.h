@@ -7,10 +7,6 @@
 
 /** \privatesection */
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 #include <sys/socket.h>
 #include <sys/types.h> /* for pthread_t */
 
@@ -23,6 +19,10 @@ extern "C" {
 #include <spa/utils/ratelimit.h>
 #include <spa/utils/result.h>
 #include <spa/utils/type-info.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 #if defined(__FreeBSD__) || defined(__MidnightBSD__) || defined(__GNU__)
 struct ucred {
@@ -269,9 +269,6 @@ struct pw_impl_client {
 	unsigned int destroyed:1;
 
 	int refcount;
-
-	/* v2 compatibility data */
-	void *compat_v2;
 };
 
 #define pw_global_emit(o,m,v,...) spa_hook_list_call(&o->listener_list, struct pw_global_events, m, v, ##__VA_ARGS__)
@@ -343,18 +340,6 @@ pw_core_resource_errorf(struct pw_resource *resource, uint32_t id, int seq,
 	va_end(args);
 }
 
-struct pw_loop_callbacks {
-#define PW_VERSION_LOOP_CALLBACKS	0
-	uint32_t version;
-
-	int (*check) (void *data, struct pw_loop *loop);
-};
-
-void
-pw_loop_set_callbacks(struct pw_loop *loop, const struct pw_loop_callbacks *cb, void *data);
-
-int pw_loop_check(struct pw_loop *loop);
-
 #define ensure_loop(loop,...) ({							\
 	int res = pw_loop_check(loop);							\
 	if (res != 1) {									\
@@ -420,6 +405,7 @@ struct pw_context {
 	struct spa_thread_utils *thread_utils;
 	struct pw_loop *main_loop;		/**< main loop for control */
 	struct pw_work_queue *work_queue;	/**< work queue */
+	struct pw_timer_queue *timer_queue;	/**< timer queue */
 
 	struct spa_support support[16];	/**< support for spa plugins */
 	uint32_t n_support;		/**< number of support items */
@@ -445,6 +431,7 @@ struct pw_data_loop {
 	char *class;
 	char **classes;
 	int rt_prio;
+	bool reset_on_fork;
 	struct spa_hook_list listener_list;
 
 	struct spa_thread_utils *thread_utils;
@@ -539,7 +526,7 @@ struct pw_node_target {
 	struct pw_node_activation *activation;
 	struct spa_system *system;
 	int fd;
-	void (*trigger)(struct pw_node_target *t, uint64_t nsec);
+	int (*trigger)(struct pw_node_target *t, uint64_t nsec);
 	unsigned int active:1;
 	unsigned int added:1;
 };
@@ -610,7 +597,10 @@ struct pw_node_activation {
 	uint32_t segment_owner[16];			/* id of owners for each segment info struct.
 							 * nodes that want to update segment info need to
 							 * CAS their node id in this array. */
-	uint32_t padding[11];				/* must be 0 */
+	uint64_t prev_awake_time;
+	uint64_t prev_finish_time;
+	uint32_t padding[7];				/* must be 0 */
+
 	uint32_t client_version;			/* verions of client, see above */
 	uint32_t server_version;			/* verions of server, see above */
 
@@ -653,44 +643,53 @@ static inline uint64_t get_time_ns(struct spa_system *system)
 
 /* called from data-loop decrement the dependency counter of the target and when
  * there are no more dependencies, trigger the node. */
-static inline void trigger_target_v1(struct pw_node_target *t, uint64_t nsec)
+static inline int trigger_target_v1(struct pw_node_target *t, uint64_t nsec)
 {
 	struct pw_node_activation *a = t->activation;
 	struct pw_node_activation_state *state = &a->state[0];
 	int32_t pending = SPA_ATOMIC_DEC(state->pending);
+	int res = pending == 0, r;
 
 	pw_log_trace_fp("%p: (%s-%u) state:%p pending:%d/%d", t->node,
 				t->name, t->id, state, pending, state->required);
 
-	if (pending == 0) {
-		if (SPA_ATOMIC_CAS(a->status,
+	if (res) {
+		if (SPA_LIKELY(SPA_ATOMIC_CAS(a->status,
 					PW_NODE_ACTIVATION_NOT_TRIGGERED,
-					PW_NODE_ACTIVATION_TRIGGERED)) {
+					PW_NODE_ACTIVATION_TRIGGERED))) {
 			a->signal_time = nsec;
-			if (SPA_UNLIKELY(spa_system_eventfd_write(t->system, t->fd, 1) < 0))
-				pw_log_warn("%p: write failed %m", t->node);
+			if (SPA_UNLIKELY((r = spa_system_eventfd_write(t->system, t->fd, 1)) < 0)) {
+				pw_log_warn("%p: write failed %s", t->node, spa_strerror(r));
+				res = r;
+			}
 		} else {
 			pw_log_trace_fp("%p: (%s-%u) not ready %d", t->node,
 					t->name, t->id, a->status);
+			res = -EIO;
 		}
 	}
+	return res;
 }
 
-static inline void trigger_target_v0(struct pw_node_target *t, uint64_t nsec)
+static inline int trigger_target_v0(struct pw_node_target *t, uint64_t nsec)
 {
 	struct pw_node_activation *a = t->activation;
 	struct pw_node_activation_state *state = &a->state[0];
 	int32_t pending = SPA_ATOMIC_DEC(state->pending);
+	int res = pending == 0, r;
 
 	pw_log_trace_fp("%p: (%s-%u) state:%p pending:%d/%d", t->node,
 			t->name, t->id, state, pending, state->required);
 
-	if (pending == 0) {
+	if (res) {
 		SPA_ATOMIC_STORE(a->status, PW_NODE_ACTIVATION_TRIGGERED);
 		a->signal_time = nsec;
-		if (SPA_UNLIKELY(spa_system_eventfd_write(t->system, t->fd, 1) < 0))
-			pw_log_warn("%p: write failed %m", t->node);
+		if (SPA_UNLIKELY((r = spa_system_eventfd_write(t->system, t->fd, 1)) < 0)) {
+			res = r;
+			pw_log_warn("%p: write failed %s", t->node, spa_strerror(r));
+		}
 	}
+	return res;
 }
 
 struct pw_node_peer {
@@ -743,6 +742,9 @@ struct pw_impl_node {
 
 	char *name;				/** for debug */
 
+	uint32_t supports_lazy;		/**< lazy driver preference */
+	uint32_t supports_request;	/**< request follower preference */
+
 	uint32_t priority_driver;	/** priority for being driver */
 	char **groups;			/** groups to schedule this node in */
 	char **link_groups;		/** groups this node is linked to */
@@ -780,8 +782,13 @@ struct pw_impl_node {
 	unsigned int can_suspend:1;
 	unsigned int checked;		/**< for sorting */
 	unsigned int sync:1;		/**< the sync-groups are active */
-	unsigned int transport:1;	/**< the transport is active */
 	unsigned int async:1;		/**< async processing, one cycle latency */
+	unsigned int lazy:1;		/**< the graph is lazy scheduling */
+	unsigned int exclusive:1;	/**< ports can only be linked once */
+	unsigned int leaf:1;		/**< node only produces/consumes data */
+	unsigned int reliable:1;	/**< ports need reliable tee */
+
+	uint32_t transport;		/**< latest transport request */
 
 	uint32_t port_user_data_size;	/**< extra size for port user data */
 
@@ -955,12 +962,17 @@ struct pw_impl_port {
 	} rt;					/**< data only accessed from the data thread */
 	unsigned int destroying:1;
 	unsigned int passive:1;
+	unsigned int auto_path:1;		/* path was automatically generated */
+	unsigned int auto_name:1;		/* name was automatically generated */
+	unsigned int auto_alias:1;		/* alias was automatically generated */
 	int busy_count;
 
 	struct spa_latency_info latency[2];	/**< latencies */
 	unsigned int have_latency_param:1;
 	unsigned int ignore_latency:1;
 	unsigned int have_latency:1;
+	unsigned int exclusive:1;		/**< port can only be linked once */
+	unsigned int reliable:1;		/**< port needs reliable tee */
 
 	unsigned int have_tag_param:1;
 	struct spa_pod *tag[2];			/**< tags */
@@ -1019,6 +1031,7 @@ struct pw_impl_link {
 
 	void *user_data;
 
+	unsigned int async:1;
 	unsigned int registered:1;
 	unsigned int feedback:1;
 	unsigned int preparing:1;
@@ -1247,19 +1260,6 @@ struct pw_control {
 
 	void *user_data;
 };
-
-/** Find a good format between 2 ports */
-int pw_context_find_format(struct pw_context *context,
-			struct pw_impl_port *output,
-			uint32_t output_mix,
-			struct pw_impl_port *input,
-			uint32_t input_mix,
-			struct pw_properties *props,
-			uint32_t n_format_filters,
-			struct spa_pod **format_filters,
-			struct spa_pod **format,
-			struct spa_pod_builder *builder,
-			char **error);
 
 int pw_context_debug_port_params(struct pw_context *context,
 		struct spa_node *node, enum spa_direction direction,

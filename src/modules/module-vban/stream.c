@@ -2,6 +2,8 @@
 /* SPDX-FileCopyrightText: Copyright © 2023 Wim Taymans <wim.taymans@gmail.com> */
 /* SPDX-License-Identifier: MIT */
 
+#include "config.h"
+
 #include <sys/socket.h>
 #include <arpa/inet.h>
 
@@ -10,14 +12,13 @@
 #include <spa/utils/ringbuffer.h>
 #include <spa/utils/dll.h>
 #include <spa/param/audio/format-utils.h>
+#include <spa/param/audio/layout.h>
 #include <spa/param/audio/raw-json.h>
 #include <spa/control/control.h>
 #include <spa/control/ump-utils.h>
 #include <spa/debug/types.h>
 #include <spa/debug/mem.h>
 #include <spa/debug/log.h>
-
-#include "config.h"
 
 #include <pipewire/pipewire.h>
 #include <pipewire/impl.h>
@@ -64,12 +65,11 @@ struct impl {
 	struct spa_ringbuffer ring;
 	uint8_t buffer[BUFFER_SIZE];
 
-	struct spa_io_rate_match *io_rate_match;
 	struct spa_io_position *io_position;
 	struct spa_dll dll;
 	double corr;
 	uint32_t target_buffer;
-	float max_error;
+	double max_error;
 
 	float last_timestamp;
 	float last_time;
@@ -94,22 +94,19 @@ struct format_info {
 };
 
 static const struct format_info audio_format_info[] = {
-	{ SPA_MEDIA_SUBTYPE_raw, SPA_AUDIO_FORMAT_U8, 1, VBAN_DATATYPE_U8, },
+	{ SPA_MEDIA_SUBTYPE_raw, SPA_AUDIO_FORMAT_U8, 1, VBAN_DATATYPE_BYTE8, },
 	{ SPA_MEDIA_SUBTYPE_raw, SPA_AUDIO_FORMAT_S16_LE, 2, VBAN_DATATYPE_INT16, },
 	{ SPA_MEDIA_SUBTYPE_raw, SPA_AUDIO_FORMAT_S24_LE, 3, VBAN_DATATYPE_INT24, },
 	{ SPA_MEDIA_SUBTYPE_raw, SPA_AUDIO_FORMAT_S32_LE, 4, VBAN_DATATYPE_INT32, },
 	{ SPA_MEDIA_SUBTYPE_raw, SPA_AUDIO_FORMAT_F32_LE, 4, VBAN_DATATYPE_FLOAT32, },
 	{ SPA_MEDIA_SUBTYPE_raw, SPA_AUDIO_FORMAT_F64_LE, 8, VBAN_DATATYPE_FLOAT64, },
-	{ SPA_MEDIA_SUBTYPE_control, 0, 1, VBAN_SERIAL_MIDI | VBAN_DATATYPE_U8, },
+	{ SPA_MEDIA_SUBTYPE_control, 0, 1, VBAN_SERIAL_MIDI | VBAN_DATATYPE_BYTE8, },
 };
 
 static void stream_io_changed(void *data, uint32_t id, void *area, uint32_t size)
 {
 	struct impl *impl = data;
 	switch (id) {
-	case SPA_IO_RateMatch:
-		impl->io_rate_match = area;
-		break;
 	case SPA_IO_Position:
 		impl->io_position = area;
 		break;
@@ -188,9 +185,9 @@ static const struct format_info *find_audio_format_info(const struct spa_audio_i
 	return NULL;
 }
 
-static void parse_audio_info(const struct pw_properties *props, struct spa_audio_info_raw *info)
+static int parse_audio_info(const struct pw_properties *props, struct spa_audio_info_raw *info)
 {
-	spa_audio_info_raw_init_dict_keys(info,
+	return spa_audio_info_raw_init_dict_keys(info,
 			&SPA_DICT_ITEMS(
 				 SPA_DICT_ITEM(SPA_KEY_AUDIO_FORMAT, DEFAULT_FORMAT),
 				 SPA_DICT_ITEM(SPA_KEY_AUDIO_RATE, SPA_STRINGIFY(DEFAULT_RATE)),
@@ -199,12 +196,37 @@ static void parse_audio_info(const struct pw_properties *props, struct spa_audio
 			SPA_KEY_AUDIO_FORMAT,
 			SPA_KEY_AUDIO_RATE,
 			SPA_KEY_AUDIO_CHANNELS,
+			SPA_KEY_AUDIO_LAYOUT,
 			SPA_KEY_AUDIO_POSITION, NULL);
 }
 
 static uint32_t msec_to_samples(struct impl *impl, uint32_t msec)
 {
 	return msec * impl->rate / 1000;
+}
+
+static const struct spa_audio_layout_info layouts[] = {
+	{ SPA_AUDIO_LAYOUT_Mono },
+	{ SPA_AUDIO_LAYOUT_Stereo },
+	{ SPA_AUDIO_LAYOUT_2_1 },
+	{ SPA_AUDIO_LAYOUT_3_1 },
+	{ SPA_AUDIO_LAYOUT_5_0 },
+	{ SPA_AUDIO_LAYOUT_5_1 },
+	{ SPA_AUDIO_LAYOUT_7_0 },
+	{ SPA_AUDIO_LAYOUT_7_1 },
+};
+
+static void default_layout(uint32_t channels, uint32_t *position)
+{
+	SPA_FOR_EACH_ELEMENT_VAR(layouts, l) {
+		if (l->n_channels == channels) {
+			for (uint32_t i = 0; i < l->n_channels; i++)
+				position[i] = l->position[i];
+			return;
+		}
+	}
+	for (uint32_t i = 0; i < channels; i++)
+		position[i] = SPA_AUDIO_CHANNEL_AUX0 + i;
 }
 
 struct vban_stream *vban_stream_new(struct pw_core *core,
@@ -253,7 +275,14 @@ struct vban_stream *vban_stream_new(struct pw_core *core,
 
 	switch (impl->info.media_subtype) {
 	case SPA_MEDIA_SUBTYPE_raw:
-		parse_audio_info(props, &impl->info.info.raw);
+		if ((res = parse_audio_info(props, &impl->info.info.raw)) < 0) {
+			pw_log_error("can't parse format: %s", spa_strerror(res));
+			goto out;
+		}
+		if (SPA_FLAG_IS_SET(impl->info.info.raw.flags, SPA_AUDIO_FLAG_UNPOSITIONED)) {
+			default_layout(impl->info.info.raw.channels, impl->info.info.raw.position);
+			SPA_FLAG_CLEAR(impl->info.info.raw.flags, SPA_AUDIO_FLAG_UNPOSITIONED);
+		}
 		impl->stream_info = impl->info;
 		impl->format_info = find_audio_format_info(&impl->info);
 		if (impl->format_info == NULL) {
@@ -275,7 +304,7 @@ struct vban_stream *vban_stream_new(struct pw_core *core,
 		impl->header.format_bit = impl->format_info->format_bit;
 		if ((str = pw_properties_get(props, "sess.name")) == NULL)
 			str = "Stream1";
-		strcpy(impl->header.stream_name, str);
+		snprintf(impl->header.stream_name, sizeof(impl->header.stream_name), "%s", str);
 		break;
 	case SPA_MEDIA_SUBTYPE_control:
 		impl->stream_info = impl->info;
@@ -284,19 +313,19 @@ struct vban_stream *vban_stream_new(struct pw_core *core,
 			res = -EINVAL;
 			goto out;
 		}
-		pw_properties_set(props, PW_KEY_FORMAT_DSP, "32 bit raw UMP");
+		pw_properties_set(props, PW_KEY_FORMAT_DSP, "8 bit raw midi");
 		impl->stride = impl->format_info->size;
 		impl->rate = pw_properties_get_uint32(props, "midi.rate", 10000);
 		if (impl->rate == 0)
 			impl->rate = 10000;
 
-		impl->header.format_SR = (0x1 << 5) | 14; /* 115200 */
+		impl->header.format_SR = VBAN_PROTOCOL_SERIAL | VBAN_BPS_115200;
 		impl->header.format_nbs = 0;
 		impl->header.format_nbc = 0;
 		impl->header.format_bit = impl->format_info->format_bit;
 		if ((str = pw_properties_get(props, "sess.name")) == NULL)
 			str = "Midi1";
-		strcpy(impl->header.stream_name, str);
+		snprintf(impl->header.stream_name, sizeof(impl->header.stream_name), "%s", str);
 		break;
 	default:
 		spa_assert_not_reached();

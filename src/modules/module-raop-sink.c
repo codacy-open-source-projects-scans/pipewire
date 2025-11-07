@@ -2,6 +2,8 @@
 /* SPDX-FileCopyrightText: Copyright © 2021 Wim Taymans */
 /* SPDX-License-Identifier: MIT */
 
+#include "config.h"
+
 #include <string.h>
 #include <stdio.h>
 #include <errno.h>
@@ -27,8 +29,6 @@
 #include <openssl/md5.h>
 #include <openssl/evp.h>
 
-#include "config.h"
-
 #include <spa/utils/cleanup.h>
 #include <spa/utils/result.h>
 #include <spa/utils/string.h>
@@ -38,7 +38,6 @@
 #include <spa/pod/builder.h>
 #include <spa/param/audio/format-utils.h>
 #include <spa/param/audio/raw.h>
-#include <spa/param/latency-utils.h>
 
 #include <pipewire/impl.h>
 #include <pipewire/i18n.h>
@@ -83,6 +82,7 @@
  * - \ref PW_KEY_AUDIO_FORMAT
  * - \ref PW_KEY_AUDIO_RATE
  * - \ref PW_KEY_AUDIO_CHANNELS
+ * - \ref SPA_KEY_AUDIO_LAYOUT
  * - \ref SPA_KEY_AUDIO_POSITION
  * - \ref PW_KEY_NODE_NAME
  * - \ref PW_KEY_NODE_DESCRIPTION
@@ -159,6 +159,7 @@ PW_LOG_TOPIC(mod_topic, "mod." NAME);
 #define RAOP_LATENCY_MS		250
 #define DEFAULT_LATENCY_MS	1500
 
+#define MAX_CHANNELS		SPA_AUDIO_MAX_CHANNELS
 #define VOLUME_MAX		0.0
 #define VOLUME_MIN		-30.0
 #define VOLUME_MUTE		-144.0
@@ -197,6 +198,7 @@ enum {
 	CRYPTO_NONE,
 	CRYPTO_RSA,
 	CRYPTO_AUTH_SETUP,
+	CRYPTO_FP_SAP25,
 };
 enum {
 	CODEC_PCM,
@@ -212,6 +214,7 @@ struct impl {
 
 	struct pw_impl_module *module;
 	struct pw_loop *loop;
+	struct pw_timer_queue *timer_queue;
 
 	struct spa_hook module_listener;
 
@@ -245,7 +248,7 @@ struct impl {
 	uint16_t control_port;
 	int control_fd;
 	struct spa_source *control_source;
-	struct spa_source *feedback_timer;
+	struct pw_timer feedback_timer;
 
 	uint16_t timing_port;
 	int timing_fd;
@@ -270,9 +273,6 @@ struct impl {
 
 	bool mute;
 	float volume;
-
-	struct spa_latency_info latency_info;
-	struct spa_process_latency_info process_latency;
 
 	struct spa_ringbuffer ring;
 	uint8_t buffer[BUFFER_SIZE];
@@ -442,6 +442,7 @@ static int write_codec_pcm(void *dst, void *frames, uint32_t n_frames)
 		bit_writer(&bp, &bpos, *(d + 2), 8);
 		d += 4;
 	}
+	bit_writer(&bp, &bpos, 7, 3); /* end tag */
 	return bp - b + 1;
 }
 
@@ -515,16 +516,6 @@ static void stream_send_packet(void *data, struct iovec *iov, size_t iovlen)
 	pw_log_debug("raop sending %zu", out_vec[0].iov_len + out_vec[1].iov_len + out_vec[2].iov_len);
 
 	send_packet(impl->server_fd, &msg);
-}
-
-static inline void
-set_iovec(struct spa_ringbuffer *rbuf, void *buffer, uint32_t size,
-		uint32_t offset, struct iovec *iov, uint32_t len)
-{
-	iov[0].iov_len = SPA_MIN(len, size - offset);
-	iov[0].iov_base = SPA_PTROFF(buffer, offset, void);
-	iov[1].iov_len = len - iov[0].iov_len;
-	iov[1].iov_base = buffer;
 }
 
 static int create_udp_socket(struct impl *impl, uint16_t *port)
@@ -848,12 +839,16 @@ static int rtsp_send_volume(struct impl *impl)
 	return rtsp_send(impl, "SET_PARAMETER", "text/parameters", header, rtsp_log_reply_status);
 }
 
-static void rtsp_do_post_feedback(void *data, uint64_t expirations)
+static void rtsp_do_post_feedback(void *data)
 {
 	struct impl *impl = data;
 
 	pw_rtsp_client_url_send(impl->rtsp, "/feedback", "POST", &impl->headers->dict,
 					NULL, NULL, 0, rtsp_log_reply_status, impl);
+
+	pw_timer_queue_add(impl->timer_queue, &impl->feedback_timer,
+			&impl->feedback_timer.timeout, 2 * SPA_NSEC_PER_SEC,
+			rtsp_do_post_feedback, impl);
 }
 
 static uint32_t msec_to_samples(struct impl *impl, uint32_t msec)
@@ -861,31 +856,12 @@ static uint32_t msec_to_samples(struct impl *impl, uint32_t msec)
 	return (uint64_t) msec * impl->rate / 1000;
 }
 
-static void update_latency(struct impl *impl)
-{
-	uint32_t n_params = 0;
-	const struct spa_pod *params[3];
-	uint8_t buffer[1024];
-	struct spa_pod_builder b;
-	struct spa_latency_info latency;
-
-	spa_pod_builder_init(&b, buffer, sizeof(buffer));
-
-	latency = SPA_LATENCY_INFO(PW_DIRECTION_INPUT);
-
-	spa_process_latency_info_add(&impl->process_latency, &latency);
-	params[n_params++] = spa_latency_build(&b, SPA_PARAM_Latency, &latency);
-	params[n_params++] = spa_latency_build(&b, SPA_PARAM_Latency, &impl->latency_info);
-	params[n_params++] = spa_process_latency_build(&b, SPA_PARAM_ProcessLatency, &impl->process_latency);
-	rtp_stream_update_params(impl->stream, params, n_params);
-}
-
 static int rtsp_record_reply(void *data, int status, const struct spa_dict *headers, const struct pw_array *content)
 {
 	struct impl *impl = data;
 	const char *str;
 	char progress[128];
-	struct timespec timeout, interval;
+	struct spa_process_latency_info process_latency;
 
 	pw_log_info("record status: %d", status);
 	switch (status) {
@@ -896,16 +872,12 @@ static int rtsp_record_reply(void *data, int status, const struct spa_dict *head
 		return 0;
 	}
 
-	timeout.tv_sec = 2;
-	timeout.tv_nsec = 0;
-	interval.tv_sec = 2;
-	interval.tv_nsec = 0;
-
 	// feedback timer is only needed for auth_setup	encryption
-	if (impl->encryption == CRYPTO_AUTH_SETUP && !impl->feedback_timer) {
-
-		impl->feedback_timer = pw_loop_add_timer(impl->loop, rtsp_do_post_feedback, impl);
-		pw_loop_update_timer(impl->loop, impl->feedback_timer, &timeout, &interval, false);
+	if (impl->encryption == CRYPTO_FP_SAP25) {
+		pw_timer_queue_cancel(&impl->feedback_timer);
+		pw_timer_queue_add(impl->timer_queue, &impl->feedback_timer,
+				NULL, 2 * SPA_NSEC_PER_SEC,
+				rtsp_do_post_feedback, impl);
 	}
 
 	if ((str = spa_dict_lookup(headers, "Audio-Latency")) != NULL) {
@@ -913,14 +885,14 @@ static int rtsp_record_reply(void *data, int status, const struct spa_dict *head
 		if (spa_atou32(str, &l, 0))
 			impl->latency = SPA_MAX(l, impl->latency);
 	}
-	impl->process_latency.rate = impl->latency + msec_to_samples(impl, RAOP_LATENCY_MS);
+	spa_zero(process_latency);
+	process_latency.rate = impl->latency + msec_to_samples(impl, RAOP_LATENCY_MS);
 
-	update_latency(impl);
+	rtp_stream_update_process_latency(impl->stream, &process_latency);
 
 	rtp_stream_set_first(impl->stream);
 
 	impl->sync = 0;
-	impl->sync_period = impl->rate / (impl->mtu / impl->stride);
 	impl->recording = true;
 
 	rtsp_send_volume(impl);
@@ -1249,6 +1221,7 @@ static int rtsp_do_announce(struct impl *impl)
 
 	switch (impl->encryption) {
 	case CRYPTO_NONE:
+	case CRYPTO_FP_SAP25:
 		sdp = spa_aprintf("v=0\r\n"
 				"o=iTunes %s 0 IN IP%d %s\r\n"
 				"s=iTunes\r\n"
@@ -1262,6 +1235,7 @@ static int rtsp_do_announce(struct impl *impl)
 		if (!sdp)
 			return -errno;
 		break;
+
 	case CRYPTO_AUTH_SETUP:
 		sdp = spa_aprintf("v=0\r\n"
 				"o=iTunes %s 0 IN IP%d %s\r\n"
@@ -1341,10 +1315,12 @@ static int rtsp_post_auth_setup_reply(void *data, int status, const struct spa_d
 
 static int rtsp_do_post_auth_setup(struct impl *impl)
 {
-	static const unsigned char content[33] =
-		"\x01"
-		"\x59\x02\xed\xe9\x0d\x4e\xf2\xbd\x4c\xb6\x8a\x63\x30\x03\x82\x07"
-		"\xa9\x4d\xbd\x50\xd8\xaa\x46\x5b\x5d\x8c\x01\x2a\x0c\x7e\x1d\x4e";
+	static const uint8_t content[33] = {
+		0x01,
+		0x59, 0x02, 0xed, 0xe9, 0x0d, 0x4e, 0xf2, 0xbd,
+		0x4c, 0xb6, 0x8a, 0x63, 0x30, 0x03, 0x82, 0x07,
+		0xa9, 0x4d, 0xbd, 0x50, 0xd8, 0xaa, 0x46, 0x5b,
+		0x5d, 0x8c, 0x01, 0x2a, 0x0c, 0x7e, 0x1d, 0x4e };
 
 	return pw_rtsp_client_url_send(impl->rtsp, "/auth-setup", "POST", &impl->headers->dict,
 				       "application/octet-stream", content, sizeof(content),
@@ -1502,10 +1478,8 @@ static void connection_cleanup(struct impl *impl)
 		close(impl->timing_fd);
 		impl->timing_fd = -1;
 	}
-	if (impl->feedback_timer != NULL) {
-		pw_loop_destroy_source(impl->loop, impl->feedback_timer);
-		impl->feedback_timer = NULL;
-	}
+	pw_timer_queue_cancel(&impl->feedback_timer);
+
 	free(impl->auth_method);
 	impl->auth_method = NULL;
 	free(impl->realm);
@@ -1551,14 +1525,12 @@ static void stream_destroy(void *d)
 	impl->stream = NULL;
 }
 
-static void stream_state_changed(void *data, bool started, const char *error)
+static void stream_report_error(void *data, const char *error)
 {
 	struct impl *impl = data;
-
 	if (error) {
 		pw_log_error("stream error: %s", error);
 		pw_impl_module_schedule_destroy(impl->module);
-		return;
 	}
 }
 
@@ -1642,11 +1614,11 @@ static void stream_props_changed(struct impl *impl, uint32_t id, const struct sp
 		case SPA_PROP_channelVolumes:
 		{
 			uint32_t i, n_vols;
-			float vols[SPA_AUDIO_MAX_CHANNELS], volume;
-			float soft_vols[SPA_AUDIO_MAX_CHANNELS];
+			float vols[MAX_CHANNELS], volume;
+			float soft_vols[MAX_CHANNELS];
 
 			if ((n_vols = spa_pod_copy_array(&prop->value, SPA_TYPE_Float,
-					vols, SPA_AUDIO_MAX_CHANNELS)) > 0) {
+					vols, SPA_N_ELEMENTS(vols))) > 0) {
 				volume = 0.0f;
 				for (i = 0; i < n_vols; i++) {
 					volume += vols[i];
@@ -1677,32 +1649,6 @@ static void stream_props_changed(struct impl *impl, uint32_t id, const struct sp
 	rtp_stream_set_param(impl->stream, id, param);
 }
 
-static void param_latency_changed(struct impl *impl, const struct spa_pod *param)
-{
-	struct spa_latency_info latency;
-
-	if (param == NULL || spa_latency_parse(param, &latency) < 0)
-		return;
-	if (latency.direction == SPA_DIRECTION_OUTPUT)
-		impl->latency_info = latency;
-
-	update_latency(impl);
-}
-
-static void param_process_latency_changed(struct impl *impl, const struct spa_pod *param)
-{
-	struct spa_process_latency_info info;
-
-	if (param == NULL)
-		spa_zero(info);
-	else if (spa_process_latency_parse(param, &info) < 0)
-		return;
-	if (spa_process_latency_info_compare(&impl->process_latency, &info) == 0)
-		return;
-	impl->process_latency = info;
-	update_latency(impl);
-}
-
 static void stream_param_changed(void *data, uint32_t id, const struct spa_pod *param)
 {
 	struct impl *impl = data;
@@ -1718,12 +1664,6 @@ static void stream_param_changed(void *data, uint32_t id, const struct spa_pod *
 		if (param != NULL)
 			stream_props_changed(impl, id, param);
 		break;
-	case SPA_PARAM_Latency:
-		param_latency_changed(impl, param);
-		break;
-	case SPA_PARAM_ProcessLatency:
-		param_process_latency_changed(impl, param);
-		break;
 	default:
 		break;
 	}
@@ -1732,7 +1672,7 @@ static void stream_param_changed(void *data, uint32_t id, const struct spa_pod *
 static const struct rtp_stream_events stream_events = {
 	RTP_VERSION_STREAM_EVENTS,
 	.destroy = stream_destroy,
-	.state_changed = stream_state_changed,
+	.report_error = stream_report_error,
 	.param_changed = stream_param_changed,
 	.send_packet = stream_send_packet
 };
@@ -1852,8 +1792,7 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	impl->module = module;
 	impl->context = context;
 	impl->loop = pw_context_get_main_loop(context);
-
-	impl->latency_info = SPA_LATENCY_INFO(SPA_DIRECTION_OUTPUT);
+	impl->timer_queue = pw_context_get_timer_queue(context);
 
 	ip = pw_properties_get(props, "raop.ip");
 	port = pw_properties_get(props, "raop.port");
@@ -1885,6 +1824,8 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 		impl->encryption = CRYPTO_RSA;
 	else if (spa_streq(str, "auth_setup"))
 		impl->encryption = CRYPTO_AUTH_SETUP;
+	else if (spa_streq(str, "fp_sap25"))
+		impl->encryption = CRYPTO_FP_SAP25;
 	else {
 		pw_log_error( "can't handle encryption type %s", str);
 		res = -EINVAL;
@@ -1919,8 +1860,6 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	impl->rate = RAOP_RATE;
 	impl->latency = msec_to_samples(impl, RAOP_LATENCY_MS);
 	impl->stride = RAOP_STRIDE;
-	impl->mtu = impl->stride * impl->psamples;
-	impl->sync_period = impl->rate / impl->psamples;
 
 	if ((str = pw_properties_get(props, "raop.latency.ms")) == NULL)
 		str = SPA_STRINGIFY(DEFAULT_LATENCY_MS);
@@ -1946,10 +1885,8 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 		pw_properties_set(props, PW_KEY_NODE_VIRTUAL, "true");
 	if (pw_properties_get(props, PW_KEY_MEDIA_CLASS) == NULL)
 		pw_properties_set(props, PW_KEY_MEDIA_CLASS, "Audio/Sink");
-	if (pw_properties_get(props, PW_KEY_MEDIA_FORMAT) == NULL)
-		pw_properties_setf(props, PW_KEY_MEDIA_FORMAT, "%d", SPA_AUDIO_FORMAT_S16_LE);
 	if (pw_properties_get(props, "net.mtu") == NULL)
-		pw_properties_setf(props, "net.mtu", "%d", impl->mtu);
+		pw_properties_set(props, "net.mtu", "1448");
 	if (pw_properties_get(props, "rtp.sender-ts-offset") == NULL)
 		pw_properties_setf(props, "rtp.sender-ts-offset", "%d", 0);
 	if (pw_properties_get(props, "sess.ts-direct") == NULL)
@@ -1965,6 +1902,7 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	copy_props(impl, props, PW_KEY_AUDIO_FORMAT);
 	copy_props(impl, props, PW_KEY_AUDIO_RATE);
 	copy_props(impl, props, PW_KEY_AUDIO_CHANNELS);
+	copy_props(impl, props, SPA_KEY_AUDIO_LAYOUT);
 	copy_props(impl, props, SPA_KEY_AUDIO_POSITION);
 	copy_props(impl, props, PW_KEY_DEVICE_ICON_NAME);
 	copy_props(impl, props, PW_KEY_NODE_NAME);
@@ -1985,6 +1923,8 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	copy_props(impl, props, "sess.ts-refclk");
 	copy_props(impl, props, "sess.ts-direct");
 
+	impl->mtu = pw_properties_get_uint32(impl->props, "net.mtu", 1448);
+	impl->sync_period = impl->rate / (impl->mtu / impl->stride);
 	impl->core = pw_context_get_object(impl->context, PW_TYPE_INTERFACE_Core);
 	if (impl->core == NULL) {
 		str = pw_properties_get(props, PW_KEY_REMOTE_NAME);

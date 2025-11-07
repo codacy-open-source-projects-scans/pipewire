@@ -5,11 +5,6 @@
 #ifndef SPA_UTILS_JSON_H
 #define SPA_UTILS_JSON_H
 
-#ifdef __cplusplus
-extern "C" {
-#else
-#include <stdbool.h>
-#endif
 #include <stddef.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -19,6 +14,20 @@ extern "C" {
 
 #include <spa/utils/defs.h>
 #include <spa/utils/string.h>
+
+#ifdef __cplusplus
+extern "C" {
+#else
+#include <stdbool.h>
+#endif
+
+#ifndef SPA_API_JSON
+ #ifdef SPA_API_IMPL
+  #define SPA_API_JSON SPA_API_IMPL
+ #else
+  #define SPA_API_JSON static inline
+ #endif
+#endif
 
 /** \defgroup spa_json JSON
  * Relaxed JSON variant parsing
@@ -41,24 +50,43 @@ struct spa_json {
 
 #define SPA_JSON_INIT(data,size) ((struct spa_json) { (data), (data)+(size), NULL, 0, 0 })
 
-static inline void spa_json_init(struct spa_json * iter, const char *data, size_t size)
+SPA_API_JSON void spa_json_init(struct spa_json * iter, const char *data, size_t size)
 {
 	*iter =  SPA_JSON_INIT(data, size);
 }
+
+#define SPA_JSON_INIT_RELAX(type,data,size) \
+	((struct spa_json) { (data), (data)+(size), NULL, (uint32_t)((type) == '[' ? 0x10 : 0x0), 0 })
+
+SPA_API_JSON void spa_json_init_relax(struct spa_json * iter, char type, const char *data, size_t size)
+{
+	*iter =  SPA_JSON_INIT_RELAX(type, data, size);
+}
+
 #define SPA_JSON_ENTER(iter) ((struct spa_json) { (iter)->cur, (iter)->end, (iter), (iter)->state & 0xff0, 0 })
 
-static inline void spa_json_enter(struct spa_json * iter, struct spa_json * sub)
+SPA_API_JSON void spa_json_enter(struct spa_json * iter, struct spa_json * sub)
 {
 	*sub = SPA_JSON_ENTER(iter);
 }
 
 #define SPA_JSON_SAVE(iter) ((struct spa_json) { (iter)->cur, (iter)->end, NULL, (iter)->state, 0 })
 
+SPA_API_JSON void spa_json_save(struct spa_json * iter, struct spa_json * save)
+{
+	*save = SPA_JSON_SAVE(iter);
+}
+
 #define SPA_JSON_START(iter,p) ((struct spa_json) { (p), (iter)->end, NULL, 0, 0 })
+
+SPA_API_JSON void spa_json_start(struct spa_json * iter, struct spa_json * sub, const char *pos)
+{
+	*sub = SPA_JSON_START(iter,pos);
+}
 
 /** Get the next token. \a value points to the token and the return value
  * is the length. Returns -1 on parse error, 0 on end of input. */
-static inline int spa_json_next(struct spa_json * iter, const char **value)
+SPA_API_JSON int spa_json_next(struct spa_json * iter, const char **value)
 {
 	int utf8_remain = 0, err = 0;
 	enum {
@@ -250,6 +278,8 @@ static inline int spa_json_next(struct spa_json * iter, const char **value)
 				if (--utf8_remain == 0)
 					iter->state = __STRING | flag;
 				continue;
+			default:
+				break;
 			}
 			_SPA_ERROR(CHARACTERS_NOT_ALLOWED);
 		case __ESC:
@@ -258,12 +288,17 @@ static inline int spa_json_next(struct spa_json * iter, const char **value)
 			case 'n': case 'r': case 't': case 'u':
 				iter->state = __STRING | flag;
 				continue;
+			default:
+				break;
 			}
 			_SPA_ERROR(INVALID_ESCAPE);
 		case __COMMENT:
 			switch (cur) {
 			case '\n': case '\r':
 				iter->state = __STRUCT | flag;
+				break;
+			default:
+				break;
 			}
 			break;
 		default:
@@ -281,6 +316,8 @@ static inline int spa_json_next(struct spa_json * iter, const char **value)
 	case __COMMENT:
 		/* trailing comment */
 		return 0;
+	default:
+		break;
 	}
 
 	if ((iter->state & __SUB_FLAG) && (iter->state & __KEY_FLAG)) {
@@ -312,7 +349,7 @@ error:
  *
  * \since 1.1.0
  */
-static inline bool spa_json_get_error(struct spa_json *iter, const char *start,
+SPA_API_JSON bool spa_json_get_error(struct spa_json *iter, const char *start,
 		struct spa_error_location *loc)
 {
 	static const char *reasons[] = {
@@ -358,31 +395,31 @@ static inline bool spa_json_get_error(struct spa_json *iter, const char *start,
 	return true;
 }
 
-static inline int spa_json_is_container(const char *val, int len)
+SPA_API_JSON int spa_json_is_container(const char *val, int len)
 {
 	return len > 0 && (*val == '{'  || *val == '[');
 }
 
 /* object */
-static inline int spa_json_is_object(const char *val, int len)
+SPA_API_JSON int spa_json_is_object(const char *val, int len)
 {
 	return len > 0 && *val == '{';
 }
 
 /* array */
-static inline bool spa_json_is_array(const char *val, int len)
+SPA_API_JSON bool spa_json_is_array(const char *val, int len)
 {
 	return len > 0 && *val == '[';
 }
 
 /* null */
-static inline bool spa_json_is_null(const char *val, int len)
+SPA_API_JSON bool spa_json_is_null(const char *val, int len)
 {
 	return len == 4 && strncmp(val, "null", 4) == 0;
 }
 
 /* float */
-static inline int spa_json_parse_float(const char *val, int len, float *result)
+SPA_API_JSON int spa_json_parse_float(const char *val, int len, float *result)
 {
 	char buf[96];
 	char *end;
@@ -405,13 +442,13 @@ static inline int spa_json_parse_float(const char *val, int len, float *result)
 	return len > 0 && end == buf + len;
 }
 
-static inline bool spa_json_is_float(const char *val, int len)
+SPA_API_JSON bool spa_json_is_float(const char *val, int len)
 {
 	float dummy;
 	return spa_json_parse_float(val, len, &dummy);
 }
 
-static inline char *spa_json_format_float(char *str, int size, float val)
+SPA_API_JSON char *spa_json_format_float(char *str, int size, float val)
 {
 	if (SPA_UNLIKELY(!isnormal(val))) {
 		if (isinf(val))
@@ -423,7 +460,7 @@ static inline char *spa_json_format_float(char *str, int size, float val)
 }
 
 /* int */
-static inline int spa_json_parse_int(const char *val, int len, int *result)
+SPA_API_JSON int spa_json_parse_int(const char *val, int len, int *result)
 {
 	char buf[64];
 	char *end;
@@ -437,29 +474,29 @@ static inline int spa_json_parse_int(const char *val, int len, int *result)
 	*result = strtol(buf, &end, 0);
 	return len > 0 && end == buf + len;
 }
-static inline bool spa_json_is_int(const char *val, int len)
+SPA_API_JSON bool spa_json_is_int(const char *val, int len)
 {
 	int dummy;
 	return spa_json_parse_int(val, len, &dummy);
 }
 
 /* bool */
-static inline bool spa_json_is_true(const char *val, int len)
+SPA_API_JSON bool spa_json_is_true(const char *val, int len)
 {
 	return len == 4 && strncmp(val, "true", 4) == 0;
 }
 
-static inline bool spa_json_is_false(const char *val, int len)
+SPA_API_JSON bool spa_json_is_false(const char *val, int len)
 {
 	return len == 5 && strncmp(val, "false", 5) == 0;
 }
 
-static inline bool spa_json_is_bool(const char *val, int len)
+SPA_API_JSON bool spa_json_is_bool(const char *val, int len)
 {
 	return spa_json_is_true(val, len) || spa_json_is_false(val, len);
 }
 
-static inline int spa_json_parse_bool(const char *val, int len, bool *result)
+SPA_API_JSON int spa_json_parse_bool(const char *val, int len, bool *result)
 {
 	if ((*result = spa_json_is_true(val, len)))
 		return 1;
@@ -469,12 +506,12 @@ static inline int spa_json_parse_bool(const char *val, int len, bool *result)
 }
 
 /* string */
-static inline bool spa_json_is_string(const char *val, int len)
+SPA_API_JSON bool spa_json_is_string(const char *val, int len)
 {
 	return len > 1 && *val == '"';
 }
 
-static inline int spa_json_parse_hex(const char *p, int num, uint32_t *res)
+SPA_API_JSON int spa_json_parse_hex(const char *p, int num, uint32_t *res)
 {
 	int i;
 	*res = 0;
@@ -493,7 +530,7 @@ static inline int spa_json_parse_hex(const char *p, int num, uint32_t *res)
 	return 1;
 }
 
-static inline int spa_json_parse_stringn(const char *val, int len, char *result, int maxlen)
+SPA_API_JSON int spa_json_parse_stringn(const char *val, int len, char *result, int maxlen)
 {
 	const char *p;
 	if (maxlen <= len)
@@ -556,12 +593,12 @@ static inline int spa_json_parse_stringn(const char *val, int len, char *result,
 	return 1;
 }
 
-static inline int spa_json_parse_string(const char *val, int len, char *result)
+SPA_API_JSON int spa_json_parse_string(const char *val, int len, char *result)
 {
 	return spa_json_parse_stringn(val, len, result, len+1);
 }
 
-static inline int spa_json_encode_string(char *str, int size, const char *val)
+SPA_API_JSON int spa_json_encode_string(char *str, int size, const char *val)
 {
 	int len = 0;
 	static const char hex[] = { "0123456789abcdef" };

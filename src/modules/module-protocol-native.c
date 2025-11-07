@@ -26,7 +26,6 @@
 #include <sys/ucred.h>
 #endif
 
-#include <spa/pod/iter.h>
 #include <spa/pod/parser.h>
 #include <spa/pod/builder.h>
 #include <spa/utils/cleanup.h>
@@ -70,7 +69,7 @@ PW_LOG_TOPIC(mod_topic_connection, "conn." NAME);
  * a client and a server using unix local sockets.
  *
  * Normally this module is loaded in both client and server config files
- * so that they cam communicate.
+ * so that they can communicate.
  *
  * ## Module Name
  *
@@ -130,6 +129,22 @@ PW_LOG_TOPIC(mod_topic_connection, "conn." NAME);
  * local context. This can be done even when the server is not a daemon. It can
  * be used to treat a local context as if it was a server.
  *
+ * ## Config override
+ *
+ * A `module.protocol-native.args` config section can be added
+ * to override the module arguments.
+ *
+ *\code{.unparsed}
+ * # ~/.config/pipewire/pipewire.conf.d/my-protocol-native-args.conf
+ *
+ * module.protocol-native.args = {
+ *        sockets = [
+ *            { name = "pipewire-0" }
+ *            { name = "pipewire-0-manager" }
+ *        ]
+ * }
+ *\endcode
+ *
  * ## Example configuration
  *
  *\code{.unparsed}
@@ -174,7 +189,6 @@ static const struct spa_dict_item module_props[] = {
 #define LOCK_SUFFIXLEN  5
 
 void pw_protocol_native_init(struct pw_protocol *protocol);
-void pw_protocol_native0_init(struct pw_protocol *protocol);
 void *protocol_native_security_context_init(struct pw_impl_module *module, struct pw_protocol *protocol);
 void protocol_native_security_context_free(void *data);
 
@@ -255,8 +269,6 @@ struct client_data {
 
 	unsigned int busy:1;
 	unsigned int need_flush:1;
-
-	struct protocol_compat_v2 compat_v2;
 };
 
 static void debug_msg(const char *prefix, const struct pw_protocol_native_message *msg, bool hex)
@@ -520,8 +532,6 @@ static void client_free(void *data)
 		pw_loop_destroy_source(client->context->main_loop, this->source);
 	if (this->connection)
 		pw_protocol_native_connection_destroy(this->connection);
-
-	pw_map_clear(&this->compat_v2.types);
 }
 
 static const struct pw_impl_client_events client_events = {
@@ -550,9 +560,6 @@ static void on_start(void *data, uint32_t version)
 	if (pw_global_bind(pw_impl_core_get_global(client->core), client,
 			PW_PERM_ALL, version, 0) < 0)
 		return;
-
-	if (version == 0)
-		client->compat_v2 = &this->compat_v2;
 
 	return;
 }
@@ -671,7 +678,6 @@ static struct client_data *client_new(struct server *s, int fd)
 
 	this->server = s;
 	this->client = client;
-	pw_map_init(&this->compat_v2.types, 0, 32);
 
 	pw_impl_client_add_listener(client, &this->client_listener, &client_events, this);
 
@@ -730,7 +736,7 @@ static int init_socket_name(struct server *s, const char *name)
 	const char *runtime_dir;
 	bool path_is_absolute;
 
-	path_is_absolute = name[0] == '/';
+	path_is_absolute = name[0] == '/' || name[0] == '@';
 
 	runtime_dir = get_runtime_dir();
 
@@ -767,6 +773,9 @@ static int init_socket_name(struct server *s, const char *name)
 static int lock_socket(struct server *s)
 {
 	int res;
+
+	if (s->addr.sun_path[0] == '\0')
+		return 0;
 
 	snprintf(s->lock_addr, sizeof(s->lock_addr), "%s%s", s->addr.sun_path, LOCK_SUFFIX);
 
@@ -923,18 +932,24 @@ static int add_socket(struct pw_protocol *protocol, struct server *s, struct soc
 			res = -errno;
 			goto error;
 		}
-		if (stat(s->addr.sun_path, &socket_stat) < 0) {
-			if (errno != ENOENT) {
-				res = -errno;
-				pw_log_error("server %p: stat %s failed with error: %m",
-						s, s->addr.sun_path);
-				goto error_close;
+		if (s->addr.sun_path[0] == '@') {
+			s->addr.sun_path[0] = 0;
+			size = (socklen_t) (strlen(&s->addr.sun_path[1]) + 1);
+		} else {
+			if (stat(s->addr.sun_path, &socket_stat) < 0) {
+				if (errno != ENOENT) {
+					res = -errno;
+					pw_log_error("server %p: stat %s failed with error: %m",
+							s, s->addr.sun_path);
+					goto error_close;
+				}
+			} else if (socket_stat.st_mode & S_IWUSR || socket_stat.st_mode & S_IWGRP) {
+				unlink(s->addr.sun_path);
 			}
-		} else if (socket_stat.st_mode & S_IWUSR || socket_stat.st_mode & S_IWGRP) {
-			unlink(s->addr.sun_path);
+			size = (socklen_t) (strlen(s->addr.sun_path) + 1);
 		}
 
-		size = offsetof(struct sockaddr_un, sun_path) + strlen(s->addr.sun_path);
+		size += offsetof(struct sockaddr_un, sun_path);
 		if (bind(fd, (struct sockaddr *) &s->addr, size) < 0) {
 			res = -errno;
 			pw_log_error("server %p: bind() failed with error: %m", s);
@@ -1310,9 +1325,8 @@ impl_new_client(struct pw_protocol *protocol,
 
 	if (props) {
 		str = spa_dict_lookup(props, PW_KEY_REMOTE_INTENTION);
-		if (str == NULL &&
-		   (str = spa_dict_lookup(props, PW_KEY_REMOTE_NAME)) != NULL &&
-		    spa_streq(str, "internal"))
+		if ((str == NULL || spa_streq(str, "generic")) &&
+		   spa_streq(spa_dict_lookup(props, PW_KEY_REMOTE_NAME), "internal"))
 			str = "internal";
 	}
 	if (str == NULL)
@@ -1798,7 +1812,11 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args_str)
 		return -EEXIST;
 	}
 
-	args = args_str ? pw_properties_new_string(args_str) : NULL;
+	args = args_str ? pw_properties_new_string(args_str) : pw_properties_new(NULL, NULL);
+	if (!args)
+		return -errno;
+
+	pw_context_conf_update_props(context, "module."NAME".args", args);
 
 	this = pw_protocol_new(context, PW_TYPE_INFO_PROTOCOL_Native, sizeof(struct protocol_data));
 	if (this == NULL)
@@ -1808,7 +1826,6 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args_str)
 	this->extension = &protocol_ext_impl;
 
 	pw_protocol_native_init(this);
-	pw_protocol_native0_init(this);
 
 	pw_log_debug("%p: new", this);
 

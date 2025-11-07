@@ -5,12 +5,20 @@
 #ifndef SPA_TYPE_H
 #define SPA_TYPE_H
 
+#include <spa/utils/defs.h>
+#include <spa/utils/string.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
-#include <spa/utils/defs.h>
-#include <spa/utils/string.h>
+#ifndef SPA_API_TYPE
+ #ifdef SPA_API_IMPL
+  #define SPA_API_TYPE SPA_API_IMPL
+ #else
+  #define SPA_API_TYPE static inline
+ #endif
+#endif
 
 /** \defgroup spa_types Types
  * Data type information enumerations
@@ -124,12 +132,12 @@ struct spa_type_info {
 	const struct spa_type_info *values;
 };
 
-static inline bool spa_type_is_a(const char *type, const char *parent)
+SPA_API_TYPE bool spa_type_is_a(const char *type, const char *parent)
 {
 	return type != NULL && parent != NULL && strncmp(type, parent, strlen(parent)) == 0;
 }
 
-static inline const char *spa_type_short_name(const char *name)
+SPA_API_TYPE const char *spa_type_short_name(const char *name)
 {
 	const char *h;
 	if ((h = strrchr(name, ':')) != NULL)
@@ -137,7 +145,7 @@ static inline const char *spa_type_short_name(const char *name)
 	return name;
 }
 
-static inline uint32_t spa_type_from_short_name(const char *name,
+SPA_API_TYPE uint32_t spa_type_from_short_name(const char *name,
 		const struct spa_type_info *info, uint32_t unknown)
 {
 	int i;
@@ -147,7 +155,7 @@ static inline uint32_t spa_type_from_short_name(const char *name,
 	}
 	return unknown;
 }
-static inline const char * spa_type_to_name(uint32_t type,
+SPA_API_TYPE const char * spa_type_to_name(uint32_t type,
 		const struct spa_type_info *info, const char *unknown)
 {
 	int i;
@@ -158,7 +166,7 @@ static inline const char * spa_type_to_name(uint32_t type,
 	return unknown;
 }
 
-static inline const char * spa_type_to_short_name(uint32_t type,
+SPA_API_TYPE const char * spa_type_to_short_name(uint32_t type,
 		const struct spa_type_info *info, const char *unknown)
 {
 	const char *n = spa_type_to_name(type, info, unknown);

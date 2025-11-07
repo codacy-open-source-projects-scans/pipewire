@@ -125,7 +125,7 @@ sparesampledumpcoeffs_sources = [
 sparesampledumpcoeffs = executable(
   'spa-resample-dump-coeffs',
   sparesampledumpcoeffs_sources,
-  c_args : [ cc_flags_native, '-DRESAMPLE_DISABLE_PRECOMP' ],
+  c_args : [ '-DRESAMPLE_DISABLE_PRECOMP' ],
   dependencies : [ spa_dep, mathlib_native ],
   install : false,
   native : true,
@@ -185,6 +185,7 @@ test_apps = [
   'test-fmt-ops',
   'test-peaks',
   'test-resample',
+  'test-resample-delay',
   ]
 
 foreach a : test_apps

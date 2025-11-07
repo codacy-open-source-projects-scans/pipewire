@@ -30,7 +30,7 @@ PW_LOG_TOPIC_EXTERN(mod_topic);
 
 #define MAX_BUFFERS	64
 #define MAX_METAS	16u
-#define MAX_DATAS	64u
+#define MAX_DATAS	256u
 #define AREA_SLOT	(sizeof(struct spa_io_async_buffers))
 #define AREA_SIZE	(4096u / AREA_SLOT)
 #define MAX_AREAS	32
@@ -242,7 +242,11 @@ fail:
 
 static void clear_data(struct impl *impl, struct spa_data *d)
 {
-	switch (d->type) {
+	switch ((enum spa_data_type)d->type) {
+	case SPA_DATA_Invalid:
+	case SPA_DATA_MemPtr:
+	case _SPA_DATA_LAST:
+		break;
 	case SPA_DATA_MemId:
 	{
 		uint32_t id;
@@ -258,10 +262,9 @@ static void clear_data(struct impl *impl, struct spa_data *d)
 	}
 	case SPA_DATA_MemFd:
 	case SPA_DATA_DmaBuf:
+	case SPA_DATA_SyncObj:
 		pw_log_debug("%p: close fd:%d", impl, (int)d->fd);
 		close(d->fd);
-		break;
-	default:
 		break;
 	}
 }
@@ -1239,12 +1242,11 @@ static void client_node_resource_destroy(void *data)
 	spa_hook_remove(&impl->object_listener);
 
 	if (impl->data_source.fd != -1) {
-		spa_loop_invoke(impl->data_loop,
+		spa_loop_locked(impl->data_loop,
 				do_remove_source,
 				SPA_ID_INVALID,
 				NULL,
 				0,
-				true,
 				&impl->data_source);
 	}
 	if (this->node)

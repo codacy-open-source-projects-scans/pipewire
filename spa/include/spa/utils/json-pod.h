@@ -5,15 +5,23 @@
 #ifndef SPA_UTILS_JSON_POD_H
 #define SPA_UTILS_JSON_POD_H
 
-#ifdef __cplusplus
-extern "C" {
-#endif
-
 #include <spa/utils/string.h>
 #include <spa/utils/json.h>
 #include <spa/pod/pod.h>
 #include <spa/pod/builder.h>
 #include <spa/debug/types.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+#ifndef SPA_API_JSON_POD
+ #ifdef SPA_API_IMPL
+  #define SPA_API_JSON_POD SPA_API_IMPL
+ #else
+  #define SPA_API_JSON_POD static inline
+ #endif
+#endif
 
 /** \defgroup spa_json_pod JSON to POD
  * JSON to POD conversion
@@ -24,7 +32,7 @@ extern "C" {
  * \{
  */
 
-static inline int spa_json_to_pod_part(struct spa_pod_builder *b, uint32_t flags, uint32_t id,
+SPA_API_JSON_POD int spa_json_to_pod_part(struct spa_pod_builder *b, uint32_t flags, uint32_t id,
 		const struct spa_type_info *info, struct spa_json *iter, const char *value, int len)
 {
 	const struct spa_type_info *ti;
@@ -135,7 +143,7 @@ static inline int spa_json_to_pod_part(struct spa_pod_builder *b, uint32_t flags
 	return 0;
 }
 
-static inline int spa_json_to_pod_checked(struct spa_pod_builder *b, uint32_t flags,
+SPA_API_JSON_POD int spa_json_to_pod_checked(struct spa_pod_builder *b, uint32_t flags,
 		const struct spa_type_info *info, const char *value, int len,
 		struct spa_error_location *loc)
 {
@@ -157,7 +165,7 @@ error:
 	return res;
 }
 
-static inline int spa_json_to_pod(struct spa_pod_builder *b, uint32_t flags,
+SPA_API_JSON_POD int spa_json_to_pod(struct spa_pod_builder *b, uint32_t flags,
 		const struct spa_type_info *info, const char *value, int len)
 {
 	return spa_json_to_pod_checked(b, flags, info, value, len, NULL);
