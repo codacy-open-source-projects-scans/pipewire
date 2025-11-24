@@ -152,8 +152,10 @@ struct spa_bt_remote_endpoint {
 	char *uuid;
 	unsigned int codec;
 	struct spa_bt_device *device;
-	uint8_t capabilities[A2DP_MAX_CAPS_SIZE];
-	int capabilities_len;
+	uint8_t *capabilities;
+	size_t capabilities_len;
+	uint8_t *metadata;
+	size_t metadata_len;
 	bool delay_reporting;
 	bool acceptor;
 
@@ -693,7 +695,7 @@ static DBusHandlerResult endpoint_select_configuration(DBusConnection *conn, DBu
 		 * by codec switching.
 		  */
 		res = codec->select_config(codec, sink ? MEDIA_CODEC_FLAG_SINK : 0, cap, size, &monitor->default_audio_info,
-				&monitor->global_settings, config);
+				&monitor->global_settings, config, NULL);
 	else
 		res = -ENOTSUP;
 
@@ -878,8 +880,9 @@ static void parse_endpoint_qos(struct spa_bt_monitor *monitor, DBusMessageIter *
 }
 
 static int parse_endpoint_props(struct spa_bt_monitor *monitor, DBusMessageIter *iter,
-		uint8_t caps[A2DP_MAX_CAPS_SIZE], int *caps_size, const char **endpoint_path,
-		struct bap_endpoint_qos *qos)
+		uint8_t **caps, size_t *caps_size,
+		uint8_t **meta, size_t *meta_size,
+		const char **endpoint_path, struct bap_endpoint_qos *qos)
 {
 	DBusMessageIter dict_iter = *iter;
 	const char *key = NULL;
@@ -900,11 +903,24 @@ static int parse_endpoint_props(struct spa_bt_monitor *monitor, DBusMessageIter 
 
 		type = dbus_message_iter_get_arg_type(&it[1]);
 
-		if (spa_streq(key, "Capabilities")) {
-			uint8_t *buf;
+		if (spa_streq(key, "Capabilities") || spa_streq(key, "Metadata")) {
+			uint8_t **dest;
+			size_t *size;
+			uint8_t *data, *buf;
+			int n;
 
-			if (!caps)
+			if (spa_streq(key, "Capabilities")) {
+				dest = caps;
+				size = caps_size;
+			} else {
+				dest = meta;
+				size = meta_size;
+			}
+
+			if (!dest)
 				goto next;
+
+			spa_assert(dest && size);
 
 			if (type != DBUS_TYPE_ARRAY)
 				goto bad_property;
@@ -914,15 +930,19 @@ static int parse_endpoint_props(struct spa_bt_monitor *monitor, DBusMessageIter 
 			if (type != DBUS_TYPE_BYTE)
 				goto bad_property;
 
-			dbus_message_iter_get_fixed_array(&it[2], &buf, caps_size);
-			if (*caps_size > A2DP_MAX_CAPS_SIZE) {
-				spa_log_error(monitor->log, "%s size:%d too large", key, (int)*caps_size);
-				return -EINVAL;
-			}
-			memcpy(caps, buf, *caps_size);
+			dbus_message_iter_get_fixed_array(&it[2], &data, &n);
 
-			spa_log_info(monitor->log, "%p: %s size:%d", monitor, key, *caps_size);
-			spa_debug_log_mem(monitor->log, SPA_LOG_LEVEL_DEBUG, ' ', caps, (size_t)*caps_size);
+			buf = malloc(n);
+			if (!buf)
+				return -ENOMEM;
+
+			free(*dest);
+			*dest = buf;
+			*size = n;
+			memcpy(buf, data, n);
+
+			spa_log_info(monitor->log, "%p: %s size:%zu", monitor, key, *size);
+			spa_debug_log_mem(monitor->log, SPA_LOG_LEVEL_DEBUG, ' ', *dest, *size);
 		} else if (spa_streq(key, "Endpoint")) {
 			if (!endpoint_path)
 				goto next;
@@ -1012,8 +1032,12 @@ static DBusHandlerResult endpoint_select_properties(DBusConnection *conn, DBusMe
 
 	const char *endpoint_path = NULL;
 	uint8_t config[A2DP_MAX_CAPS_SIZE];
+	void *config_data = NULL;
 	char locations[64] = {0};
 	char channel_allocation[64] = {0};
+	char supported_context[64] = {0};
+	char available_context[64] = {0};
+	char metadata_len[64] = {0};
 	int conf_size;
 	DBusMessageIter dict;
 
@@ -1027,6 +1051,9 @@ static DBusHandlerResult endpoint_select_properties(DBusConnection *conn, DBusMe
 		return DBUS_HANDLER_RESULT_NOT_YET_HANDLED;
 
 	path = dbus_message_get_path(m);
+
+	if ((r = dbus_message_new_method_return(m)) == NULL)
+		return DBUS_HANDLER_RESULT_NEED_MEMORY;
 
 	/* TODO: for codecs with shared endpoint, this currently always picks the default
 	 * one. However, currently we don't have BAP codecs with shared endpoint, so
@@ -1043,7 +1070,7 @@ static DBusHandlerResult endpoint_select_properties(DBusConnection *conn, DBusMe
 
 	/* Find endpoint */
 	iter = props;
-	if (parse_endpoint_props(monitor, &iter, NULL, NULL, &endpoint_path, NULL) < 0)
+	if (parse_endpoint_props(monitor, &iter, NULL, NULL, NULL, NULL, &endpoint_path, NULL) < 0)
 		goto error_invalid;
 
 	ep = remote_endpoint_find(monitor, endpoint_path);
@@ -1059,13 +1086,18 @@ static DBusHandlerResult endpoint_select_properties(DBusConnection *conn, DBusMe
 
 	/* Parse endpoint properties */
 	iter = props;
-	if (parse_endpoint_props(monitor, &iter, ep->capabilities, &ep->capabilities_len, NULL, &ep->qos) < 0)
+	if (parse_endpoint_props(monitor, &iter, &ep->capabilities, &ep->capabilities_len,
+					&ep->metadata, &ep->metadata_len, NULL, &ep->qos) < 0)
 		goto error_invalid;
 
 	if (ep->qos.locations)
 		spa_scnprintf(locations, sizeof(locations), "%"PRIu32, ep->qos.locations);
 	if (ep->qos.channel_allocation)
 		spa_scnprintf(channel_allocation, sizeof(channel_allocation), "%"PRIu32, ep->qos.channel_allocation);
+
+	spa_scnprintf(supported_context, sizeof(supported_context), "%"PRIu16, ep->qos.supported_context);
+	spa_scnprintf(available_context, sizeof(available_context), "%"PRIu16, ep->qos.context);
+	spa_scnprintf(metadata_len, sizeof(metadata_len), "%zu", ep->metadata_len);
 
 	if (!ep->device->preferred_profiles)
 		ep->device->preferred_profiles = ep->device->profiles;
@@ -1075,16 +1107,20 @@ static DBusHandlerResult endpoint_select_properties(DBusConnection *conn, DBusMe
 	i = 0;
 	setting_items[i++] = SPA_DICT_ITEM_INIT("bluez5.bap.locations", locations);
 	setting_items[i++] = SPA_DICT_ITEM_INIT("bluez5.bap.channel-allocation", channel_allocation);
+	setting_items[i++] = SPA_DICT_ITEM_INIT("bluez5.bap.supported-context", supported_context);
+	setting_items[i++] = SPA_DICT_ITEM_INIT("bluez5.bap.available-context", available_context);
 	setting_items[i++] = SPA_DICT_ITEM_INIT("bluez5.bap.sink", sink ? "true" : "false");
 	setting_items[i++] = SPA_DICT_ITEM_INIT("bluez5.bap.duplex", duplex ? "true" : "false");
 	setting_items[i++] = SPA_DICT_ITEM_INIT("bluez5.bap.debug", "true");
+	setting_items[i++] = SPA_DICT_ITEM_INIT("bluez5.bap.metadata", (void *)ep->metadata);
+	setting_items[i++] = SPA_DICT_ITEM_INIT("bluez5.bap.metadata-len", metadata_len);
 	if (ep->device->settings)
 		for (j = 0; j < ep->device->settings->n_items && i < SPA_N_ELEMENTS(setting_items); ++i, ++j)
 			setting_items[i] = ep->device->settings->items[j];
 	settings = SPA_DICT_INIT(setting_items, i);
 
 	conf_size = codec->select_config(codec, 0, ep->capabilities, ep->capabilities_len,
-			&monitor->default_audio_info, &settings, config);
+			&monitor->default_audio_info, &settings, config, &config_data);
 	if (conf_size < 0) {
 		spa_log_error(monitor->log, "can't select config: %d (%s)",
 				conf_size, spa_strerror(conf_size));
@@ -1093,8 +1129,6 @@ static DBusHandlerResult endpoint_select_properties(DBusConnection *conn, DBusMe
 	spa_log_info(monitor->log, "%p: selected conf %d", monitor, conf_size);
 	spa_debug_log_mem(monitor->log, SPA_LOG_LEVEL_DEBUG, ' ', (uint8_t *)config, (size_t)conf_size);
 
-	if ((r = dbus_message_new_method_return(m)) == NULL)
-		return DBUS_HANDLER_RESULT_NEED_MEMORY;
 	dbus_message_iter_init_append(r, &iter);
 
 	dbus_message_iter_open_container(&iter, DBUS_TYPE_ARRAY,
@@ -1113,7 +1147,7 @@ static DBusHandlerResult endpoint_select_properties(DBusConnection *conn, DBusMe
 
 		spa_zero(qos);
 
-		res = codec->get_qos(codec, config, conf_size, &ep->qos, &qos, &settings);
+		res = codec->get_qos(codec, &ep->qos, config_data, &qos);
 		if (res < 0) {
 			spa_log_error(monitor->log, "can't select QOS config: %d (%s)",
 					res, spa_strerror(res));
@@ -1161,7 +1195,29 @@ static DBusHandlerResult endpoint_select_properties(DBusConnection *conn, DBusMe
 		dbus_message_iter_close_container(&dict, &entry);
 	}
 
+	if (codec->get_metadata) {
+		uint8_t meta[4096] = {};
+		size_t meta_size;
+
+		meta_size = res = codec->get_metadata(codec, config_data, meta, sizeof(meta));
+		if (res < 0) {
+			spa_log_error(monitor->log, "can't select metadata config: %d (%s)",
+					res, spa_strerror(res));
+			goto error_invalid;
+		}
+
+		if (meta_size) {
+			spa_log_info(monitor->log, "%p: selected metadata %d", monitor, (int)meta_size);
+			spa_debug_log_mem(monitor->log, SPA_LOG_LEVEL_DEBUG, ' ', meta, meta_size);
+
+			append_basic_array_variant_dict_entry(&dict, "Metadata", "ay", "y", DBUS_TYPE_BYTE, &meta, meta_size);
+		}
+	}
+
 	dbus_message_iter_close_container(&iter, &dict);
+
+	if (config_data && codec->free_config_data)
+		codec->free_config_data(codec, config_data);
 
 	if (!dbus_connection_send(conn, r, NULL))
 		return DBUS_HANDLER_RESULT_NEED_MEMORY;
@@ -1173,6 +1229,9 @@ error_invalid:
 	goto error;
 
 error:
+	if (config_data && codec->free_config_data)
+		codec->free_config_data(codec, config_data);
+
 	if (!reply_with_error(conn, m, "org.bluez.Error.InvalidArguments", err_msg))
 		return DBUS_HANDLER_RESULT_NEED_MEMORY;
 	return DBUS_HANDLER_RESULT_HANDLED;
@@ -2805,8 +2864,9 @@ static int remote_endpoint_update_props(struct spa_bt_remote_endpoint *remote_en
 	DBusMessageIter copy_iter = *props_iter;
 
 	parse_endpoint_props(monitor, &copy_iter,
-			remote_endpoint->capabilities, &remote_endpoint->capabilities_len, NULL,
-			&remote_endpoint->qos);
+			&remote_endpoint->capabilities, &remote_endpoint->capabilities_len,
+			&remote_endpoint->metadata, &remote_endpoint->metadata_len,
+			NULL, &remote_endpoint->qos);
 
 	while (dbus_message_iter_get_arg_type(props_iter) != DBUS_TYPE_INVALID) {
 		DBusMessageIter it[2];
@@ -2820,7 +2880,8 @@ static int remote_endpoint_update_props(struct spa_bt_remote_endpoint *remote_en
 
 		type = dbus_message_iter_get_arg_type(&it[1]);
 
-		if (spa_streq(key, "Capabilities") || spa_streq(key, "Locations") ||
+		if (spa_streq(key, "Capabilities") || spa_streq(key, "Metadata") ||
+				spa_streq(key, "Locations") ||
 				spa_streq(key, "QoS") || spa_streq(key, "Context") ||
 				spa_streq(key, "SupportedContext")) {
 			/* parsed by parse_endpoint_props */
@@ -2990,6 +3051,8 @@ static void remote_endpoint_free(struct spa_bt_remote_endpoint *remote_endpoint)
 	free(remote_endpoint->path);
 	free(remote_endpoint->transport_path);
 	free(remote_endpoint->uuid);
+	free(remote_endpoint->capabilities);
+	free(remote_endpoint->metadata);
 	free(remote_endpoint);
 }
 
@@ -4481,7 +4544,7 @@ static bool codec_switch_configure_a2dp(struct spa_bt_codec_switch *sw, const ch
 	}
 
 	res = codec->select_config(codec, sink ? MEDIA_CODEC_FLAG_SINK : 0, ep->capabilities, ep->capabilities_len,
-				   &monitor->default_audio_info, &monitor->global_settings, config);
+			&monitor->default_audio_info, &monitor->global_settings, config, NULL);
 	if (res < 0) {
 		spa_log_error(monitor->log, "media codec switch %p: incompatible capabilities (%d)",
 		              sw, res);
@@ -5816,6 +5879,7 @@ static void configure_bis(struct spa_bt_monitor *monitor,
 	int sync_cte_type = 0;
 	int sync_timeout = 2000;
 	int timeout = 2000;
+	int ret;
 
 	/* Configure each BIS from a BIG */
 	spa_list_for_each(metadata_entry, &bis->metadata_list, link) {
@@ -5839,7 +5903,12 @@ static void configure_bis(struct spa_bt_monitor *monitor,
 	setting_items[1] = SPA_DICT_ITEM_INIT("preset", bis->qos_preset);
 	settings = SPA_DICT_INIT(setting_items, 2);
 
-	codec->get_bis_config(codec, caps, &caps_size, &settings, &qos);
+	caps_size = sizeof(caps);
+	ret = codec->get_bis_config(codec, caps, &caps_size, &settings, &qos);
+	if (ret < 0) {
+		spa_log_warn(monitor->log, "Getting BIS config failed");
+		return;
+	}
 
 	msg = dbus_message_new_method_call(BLUEZ_SERVICE,
 				object_path,

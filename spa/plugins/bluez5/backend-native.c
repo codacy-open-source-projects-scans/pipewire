@@ -1307,7 +1307,7 @@ next_indicator:
 				type = INTERNATIONAL_NUMBER;
 			else
 				type = NATIONAL_NUMBER;
-			rfcomm_send_reply(rfcomm, "+CNUM: ,\"%s\",%u", backend->modem.own_number, type);
+			rfcomm_send_reply(rfcomm, "+CNUM: ,\"%s\",%u,,4", backend->modem.own_number, type);
 		}
 		rfcomm_send_reply(rfcomm, "OK");
 	} else if (spa_strstartswith(buf, "AT+COPS=")) {
@@ -2759,7 +2759,8 @@ static int sco_acquire_cb(void *data, bool optional)
 		goto fail;
 
 #ifdef HAVE_BLUEZ_5_BACKEND_HFP_NATIVE
-	rfcomm_hfp_ag_set_cind(td->rfcomm, true);
+	if (!mm_is_available(backend->modemmanager))
+		rfcomm_hfp_ag_set_cind(td->rfcomm, true);
 #endif
 
 	t->fd = sock;
@@ -2813,7 +2814,8 @@ static int sco_release_cb(void *data)
 	spa_bt_transport_set_state(t, SPA_BT_TRANSPORT_STATE_IDLE);
 
 #ifdef HAVE_BLUEZ_5_BACKEND_HFP_NATIVE
-	rfcomm_hfp_ag_set_cind(td->rfcomm, false);
+	if (!mm_is_available(backend->modemmanager))
+		rfcomm_hfp_ag_set_cind(td->rfcomm, false);
 #endif
 
 	sco_destroy_cb(t);
