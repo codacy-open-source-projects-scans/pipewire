@@ -2036,7 +2036,9 @@ static void recalc_headroom(struct state *state)
 	uint32_t latency;
 	uint32_t rate = 0;
 
-	if (state->position != NULL)
+	if (state->force_quantum && !state->following)
+		rate = state->rate;
+	else if (state->position != NULL)
 		rate = state->position->clock.target_rate.denom;
 
 	if (state->use_period_size_min_as_headroom)
@@ -2063,8 +2065,6 @@ static void recalc_headroom(struct state *state)
 		state->headroom = 0;
 
 	latency = SPA_MAX(state->min_delay, SPA_MIN(state->max_delay, state->headroom));
-	if (rate != 0 && state->rate != 0)
-		latency = SPA_SCALE32_UP(latency, rate, state->rate);
 
 	if (state->is_firewire) {
 		/* XXX: For ALSA FireWire drivers, unlike for other ALSA drivers, buffer size
@@ -2072,6 +2072,8 @@ static void recalc_headroom(struct state *state)
 		 */
 		latency += state->buffer_frames;
 	}
+	if (rate != 0 && state->rate != 0)
+		latency = SPA_SCALE32_UP(latency, rate, state->rate);
 
 	state->latency[state->port_direction].min_rate =
 		state->latency[state->port_direction].max_rate = latency;

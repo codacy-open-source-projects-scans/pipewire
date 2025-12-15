@@ -6,8 +6,11 @@
 #ifndef AVB_AECP_AEM_DESCRIPTORS_H
 #define AVB_AECP_AEM_DESCRIPTORS_H
 
-#include "internal.h"
+#include <stdint.h>
 
+/*
+* IEEE 1722.1-2021, Table 7-1 - Descriptor Types
+*/
 #define AVB_AEM_DESC_ENTITY			0x0000
 #define AVB_AEM_DESC_CONFIGURATION		0x0001
 #define AVB_AEM_DESC_AUDIO_UNIT			0x0002
@@ -49,6 +52,13 @@
 /** IEEE 1722.1-2021 Table-7 has up to descriptor 0x0029, reserved for future */
 #define AVB_AEM_DESC_LAST_RESERVED_17221 	0x0029
 #define AVB_AEM_DESC_INVALID			0xffff
+
+/* IEEE 1722.1-2021, Table 7-24 - Port Flags */
+// No flag is not defined in table
+#define AVB_AEM_PORT_FLAG_NO_FLAG 0x0000
+#define AVB_AEM_PORT_FLAG_CLOCK_SYNC_SOURCE 0x0001
+#define AVB_AEM_PORT_FLAG_ASYNC_SAMPLE_RATE_CONV 0x0002
+#define AVB_AEM_PORT_FLAG_SYNC_SAMPLE_RATE_CONV 0x0004
 
 struct avb_aem_desc_entity {
 	uint64_t entity_id;
@@ -130,6 +140,42 @@ struct avb_aem_desc_audio_unit {
 	struct avb_aem_desc_sampling_rate sampling_rates[0];
 } __attribute__ ((__packed__));
 
+/* IEEE 1722.1-2021, Table 7-28 - AUDIO_CLUSTER format values */
+#define AVB_AEM_AUDIO_CLUSTER_TYPE_IEC60958 0x00
+#define AVB_AEM_AUDIO_CLUSTER_TYPE_MBLA 	0x40
+#define AVB_AEM_AUDIO_CLUSTER_TYPE_MIDI 	0x80
+#define AVB_AEM_AUDIO_CLUSTER_TYPE_SMPTE 	0x88
+
+struct avb_aem_desc_audio_cluster {
+	char object_name[64];
+	uint16_t localized_description;
+
+	uint16_t signal_type;
+	uint16_t signal_index;
+	uint16_t signal_output;
+	uint32_t path_latency;
+	uint32_t block_latency;
+	uint16_t channel_count;
+	uint8_t  format;
+	uint8_t  aes3_data_type_ref;
+	uint16_t aes3_data_type;
+} __attribute__ ((__packed__));
+
+#define AVB_AEM_AUDIO_MAPPING_FORMAT_OFFSET (8)
+
+struct avb_aem_audio_mapping_format {
+	uint16_t mapping_stream_index;
+	uint16_t mapping_stream_channel;
+	uint16_t mapping_cluster_offset;
+	uint16_t mapping_cluster_channel;
+} __attribute__ ((__packed__));
+
+struct avb_aem_desc_audio_map {
+	uint16_t mapping_offset;
+	uint16_t number_of_mappings;
+	struct avb_aem_audio_mapping_format mappings[0];
+} __attribute__ ((__packed__));
+
 #define AVB_AEM_DESC_STREAM_FLAG_SYNC_SOURCE			(1u<<0)
 #define AVB_AEM_DESC_STREAM_FLAG_CLASS_A			(1u<<1)
 #define AVB_AEM_DESC_STREAM_FLAG_CLASS_B			(1u<<2)
@@ -200,6 +246,15 @@ struct avb_aem_desc_clock_source {
 	uint16_t clock_source_location_index;
 } __attribute__ ((__packed__));
 
+struct avb_aem_desc_clock_domain {
+	char object_name[64];
+	uint16_t localized_description;
+	uint16_t clock_source_index;
+	uint16_t descriptor_counts_offset;
+	uint16_t clock_sources_count;
+	uint16_t clock_sources[0];
+} __attribute__ ((__packed__));
+
 struct avb_aem_desc_locale {
 	char locale_identifier[64];
 	uint16_t number_of_strings;
@@ -225,6 +280,36 @@ struct avb_aem_desc_stream_port {
 	uint16_t base_cluster;
 	uint16_t number_of_maps;
 	uint16_t base_map;
+} __attribute__ ((__packed__));
+
+struct avb_aem_desc_value_format {
+	uint8_t minimum;
+	uint8_t maximum;
+	uint8_t step;
+	uint8_t default_value;
+	uint8_t current_value;
+	uint16_t unit;
+	uint16_t localized_description;
+} __attribute__ ((__packed__));
+
+struct avb_aem_desc_control {
+	char object_name[64];
+	uint16_t localized_description;
+
+	uint32_t block_latency;
+	uint32_t control_latency;
+	uint16_t control_domain;
+	uint16_t control_value_type;
+	uint64_t control_type;
+	uint32_t reset_time;
+
+	uint16_t descriptor_counts_offset;
+
+	uint16_t number_of_values;
+	uint16_t signal_type;
+	uint16_t signal_index;
+	uint16_t signal_output;
+	struct avb_aem_desc_value_format value_format[0];
 } __attribute__ ((__packed__));
 
 #endif /* AVB_AECP_AEM_DESCRIPTORS_H */
