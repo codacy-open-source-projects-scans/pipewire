@@ -21,12 +21,12 @@
 
 #include "media-codecs.h"
 #include "defs.h"
-#include "decode-buffer.h"
 
 SPA_LOG_TOPIC_DEFINE_STATIC(log_topic, "spa.bluez5.iso");
 #undef SPA_LOG_TOPIC_DEFAULT
 #define SPA_LOG_TOPIC_DEFAULT &log_topic
 
+#include "decode-buffer.h"
 #include "bt-latency.h"
 
 #define IDLE_TIME	(500 * SPA_NSEC_PER_MSEC)
@@ -80,6 +80,7 @@ struct stream {
 	int fd;
 	bool sink;
 	bool idle;
+	bool ready;
 
 	spa_bt_iso_io_pull_t pull;
 
@@ -269,6 +270,11 @@ static void group_on_timeout(struct spa_source *source)
 		return;
 
 	spa_list_for_each(stream, &group->streams, link) {
+		if (!stream->ready)
+			goto done;
+	}
+
+	spa_list_for_each(stream, &group->streams, link) {
 		if (!stream->sink) {
 			if (!stream->pull) {
 				/* Source not running: drop any incoming data */
@@ -343,7 +349,7 @@ done:
 	group->next += exp * group->duration_tx;
 
 	spa_list_for_each(stream, &group->streams, link) {
-		if (!stream->sink)
+		if (!stream->sink || !stream->ready)
 			continue;
 
 		if (resync)
@@ -576,6 +582,24 @@ void spa_bt_iso_io_destroy(struct spa_bt_iso_io *this)
 	free(stream);
 }
 
+static int do_ready(struct spa_loop *loop, bool async, uint32_t seq, const void *data, size_t size, void *user_data)
+{
+	struct stream *stream = user_data;
+
+	stream->ready = true;
+	return 0;
+}
+
+void spa_bt_iso_io_ready(struct spa_bt_iso_io *this)
+{
+	struct stream *stream = SPA_CONTAINER_OF(this, struct stream, this);
+	struct group *group = stream->group;
+	int res;
+
+	res = spa_loop_locked(group->data_loop, do_ready, 0, NULL, 0, stream);
+	spa_assert_se(res == 0);
+}
+
 static bool group_is_enabled(struct group *group)
 {
 	struct stream *stream;
@@ -658,9 +682,9 @@ void spa_bt_iso_io_set_source_buffer(struct spa_bt_iso_io *this, struct spa_bt_d
 	if (buffer) {
 		/* Take over buffer overrun handling */
 		buffer->no_overrun_drop = true;
-		buffer->buffering = false;
 		buffer->avg_period = ISO_BUFFERING_AVG_PERIOD;
 		buffer->rate_diff_max = ISO_BUFFERING_RATE_DIFF_MAX;
+		stream->this.need_resync = true;
 	}
 }
 
@@ -804,16 +828,44 @@ void spa_bt_iso_io_check_rx_sync(struct spa_bt_iso_io *this, uint64_t position)
 	if (!stream->source_buf)
 		return;
 
+	/* Act on pending resync */
+	target = stream->source_buf->target;
+
+	if (stream->source_buf && stream->this.need_resync) {
+		int32_t level;
+
+		stream->this.need_resync = false;
+
+		/* Resync level */;
+		spa_bt_decode_buffer_recover(stream->source_buf);
+		level = (int32_t)round(stream->source_buf->level +
+				(double)stream->source_buf->duration_ns * stream->source_buf->rate / SPA_NSEC_PER_SEC);
+
+		if (level > target) {
+			uint32_t drop = (level - target) * stream->source_buf->frame_size;
+			uint32_t avail = spa_bt_decode_buffer_get_size(stream->source_buf);
+
+			drop = SPA_MIN(drop, avail);
+
+			spa_log_debug(group->log, "%p: ISO overrun group:%u fd:%d level:%f target:%d drop:%u",
+					group, group->id, stream->fd,
+					stream->source_buf->level + stream->source_buf->prev_samples,
+					target,
+					drop/stream->source_buf->frame_size);
+
+			spa_bt_decode_buffer_read(stream->source_buf, drop);
+		}
+	}
+
 	/* Check sync after all input streams have completed process() on same cycle */
 	stream->position = position;
+
 	spa_list_for_each(s, &group->streams, link) {
 		if (!s->source_buf)
 			continue;
 		if (s->position != stream->position)
 			return;
 	}
-
-	target = stream->source_buf->target;
 
 	/* Rate match ISO clock */
 	corr = spa_bt_rate_control_update(&sync->dll, sync->avg_err, 0,
@@ -833,7 +885,7 @@ void spa_bt_iso_io_check_rx_sync(struct spa_bt_iso_io *this, uint64_t position)
 	sync->avg_err = 0;
 	sync->avg_num = 0;
 
-	/* Handle overrun (e.g. resyncs streams after initial buffering) */
+	/* Detect overrun */
 	spa_list_for_each(s, &group->streams, link) {
 		if (s->source_buf) {
 			double level = s->source_buf->level;
@@ -844,30 +896,10 @@ void spa_bt_iso_io_check_rx_sync(struct spa_bt_iso_io *this, uint64_t position)
 		}
 	}
 
-	if (!overrun)
-		return;
-
-	spa_list_for_each(s, &group->streams, link) {
-		if (!s->source_buf)
-			continue;
-
-		int32_t level = (int32_t)s->source_buf->level;
-
-		if (level > target) {
-			uint32_t drop = (level - target) * s->source_buf->frame_size;
-			uint32_t avail = spa_bt_decode_buffer_get_size(s->source_buf);
-
-			drop = SPA_MIN(drop, avail);
-
-			spa_log_debug(group->log, "%p: ISO overrun group:%u fd:%d level:%f target:%d drop:%u",
-					group, group->id, s->fd,
-					s->source_buf->level,
-					target,
-					drop/s->source_buf->frame_size);
-
-			spa_bt_decode_buffer_read(s->source_buf, drop);
+	if (overrun) {
+		spa_list_for_each(s, &group->streams, link) {
+			if (s->source_buf)
+				s->this.need_resync = true;
 		}
-
-		spa_bt_decode_buffer_recover(s->source_buf);
 	}
 }

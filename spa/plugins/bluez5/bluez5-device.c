@@ -162,6 +162,7 @@ struct impl {
 	unsigned int switching_codec:1;
 	unsigned int switching_codec_other:1;
 	unsigned int save_profile:1;
+	unsigned int autoswitch_routes:1;
 	uint32_t prev_bt_connected_profiles;
 
 	struct device_set device_set;
@@ -809,17 +810,10 @@ static void dynamic_node_volume_changed(void *data)
 	SPA_FLAG_CLEAR(id, DYNAMIC_NODE_ID_FLAG);
 
 	/* Remote device is the controller */
-	if (!node->transport || impl->profile != DEVICE_PROFILE_AG
-	    || !spa_bt_transport_volume_enabled(node->transport))
+	if (!node->transport || !spa_bt_transport_volume_enabled(node->transport))
 		return;
 
-	if (id == 0 || id == 2)
-		volume_id = SPA_BT_VOLUME_ID_RX;
-	else if (id == 1)
-		volume_id = SPA_BT_VOLUME_ID_TX;
-	else
-		return;
-
+	volume_id = get_volume_id(id);
 	t_volume = &node->transport->volumes[volume_id];
 	if (!t_volume->active)
 		return;
@@ -916,6 +910,55 @@ static void device_set_clear(struct impl *impl, struct device_set *set)
 		set->source[i].impl = impl;
 }
 
+static void device_set_volume_changed(void *data)
+{
+	struct device_set_member *member = data;
+	struct impl *impl = member->impl;
+	struct device_set *dset = &impl->device_set;
+	bool sink = (member->id & SINK_ID_FLAG);
+	int id = sink ? DEVICE_ID_SINK_SET : DEVICE_ID_SOURCE_SET;
+	struct node *node = &impl->nodes[id];
+	int volume_id = get_volume_id(member->id);
+	struct device_set_member *members = sink ? dset->sink : dset->source;
+	uint32_t n_members = sink ? dset->sinks : dset->sources;
+	struct spa_bt_transport_volume *t_volume;
+	float prev_hw_volume;
+	unsigned int i;
+
+	if (!node->active || !spa_bt_transport_volume_enabled(member->transport))
+		return;
+
+	t_volume = &member->transport->volumes[volume_id];
+	if (!t_volume->active)
+		return;
+
+	spa_log_debug(impl->log, "%p device set changed hw volume %d %f", impl, volume_id, t_volume->volume);
+
+	prev_hw_volume = node_get_hw_volume(node);
+
+	for (uint32_t i = 0; i < node->n_channels; ++i) {
+		node->volumes[i] = prev_hw_volume > 0.0f
+			? node->volumes[i] * t_volume->volume / prev_hw_volume
+			: t_volume->volume;
+	}
+
+	/* CAP v1.0.1 7.3.2.2: spread hw volume to other devices in set */
+	if (member->transport->bap_initiator) {
+		for (i = 0; i < n_members; ++i)
+			spa_bt_transport_set_volume(members[i].transport, volume_id, t_volume->volume);
+	}
+
+	node_update_soft_volumes(node, t_volume->volume);
+
+	node->save = true;
+
+	emit_volume(impl, node);
+
+	impl->info.change_mask |= SPA_DEVICE_CHANGE_MASK_PARAMS;
+	impl->params[IDX_Route].flags ^= SPA_PARAM_INFO_SERIAL;
+	emit_info(impl, false);
+}
+
 static void device_set_transport_destroy(void *data)
 {
 	struct device_set_member *member = data;
@@ -927,6 +970,7 @@ static void device_set_transport_destroy(void *data)
 static const struct spa_bt_transport_events device_set_transport_events = {
 	SPA_VERSION_BT_DEVICE_EVENTS,
 	.destroy = device_set_transport_destroy,
+	.volume_changed = device_set_volume_changed,
 };
 
 static void device_set_update_asha(struct impl *this, struct device_set *dset)
@@ -1763,7 +1807,7 @@ static uint32_t profile_direction_mask(struct impl *this, uint32_t index, enum s
 		media_codec = get_supported_media_codec(this, codec, NULL, device->connected_profiles);
 		if (media_codec && media_codec->duplex_codec)
 			have_input = true;
-		if (hfp_input_for_a2dp && this->nodes[DEVICE_ID_SOURCE].active)
+		if (hfp_input_for_a2dp && (device->connected_profiles & SPA_BT_PROFILE_HEADSET_HEAD_UNIT))
 			have_input = true;
 		break;
 	case DEVICE_PROFILE_BAP:
@@ -2074,6 +2118,9 @@ static struct spa_pod *build_profile(struct impl *this, struct spa_pod_builder *
 			}
 			priority = 128;
 		}
+
+		if (this->autoswitch_routes && (device->connected_profiles & SPA_BT_PROFILE_HEADSET_HEAD_UNIT))
+			n_source++;
 		break;
 	}
 	case DEVICE_PROFILE_BAP_SINK:
@@ -2522,7 +2569,7 @@ static struct spa_pod *build_route(struct impl *this, struct spa_pod_builder *b,
 		if (!profile_has_route(j, route))
 			continue;
 
-		profile_mask = profile_direction_mask(this, j, codec, false);
+		profile_mask = profile_direction_mask(this, j, codec, this->autoswitch_routes);
 		if (!(profile_mask & (1 << direction)))
 			continue;
 
@@ -2544,7 +2591,8 @@ static struct spa_pod *build_route(struct impl *this, struct spa_pod_builder *b,
 		struct node *node = &this->nodes[dev];
 		struct spa_bt_transport_volume *t_volume;
 
-		mask = profile_direction_mask(this, this->profile, this->props.codec, true);
+		mask = profile_direction_mask(this, this->profile, this->props.codec,
+				this->nodes[DEVICE_ID_SOURCE].active);
 		if (!(mask & (1 << direction)))
 			return NULL;
 
@@ -2690,6 +2738,8 @@ static struct spa_pod *build_props(struct impl *this, struct spa_pod_builder *b,
 	spa_pod_builder_push_struct(b, &f[1]);
 	spa_pod_builder_string(b, "bluez5.disable-dummy-call");
 	spa_pod_builder_bool(b, this->bt_dev->disable_dummy_call);
+	spa_pod_builder_string(b, "bluez5.autoswitch-routes");
+	spa_pod_builder_bool(b, this->autoswitch_routes);
 	spa_pod_builder_pop(b, &f[1]);
 
 	param = spa_pod_builder_pop(b, &f[0]);
@@ -2839,6 +2889,8 @@ static void device_set_update_volumes(struct node *node)
 		if (!t_volume || !t_volume->active)
 			goto soft_volume;
 	}
+
+	spa_log_info(impl->log, "%p device set set hw volume %d %f", impl, volume_id, hw_volume);
 
 	node_update_soft_volumes(node, hw_volume);
 	for (i = 0; i < n_members; ++i)
@@ -3058,6 +3110,19 @@ static int parse_prop_params(struct impl *this, struct spa_pod *params)
 			bool disable_dummy_call = SPA_POD_VALUE(struct spa_pod_bool, pod);
 			spa_log_info(this->log, "key:'%s' val:'%u'", name, disable_dummy_call);
 			this->bt_dev->disable_dummy_call = disable_dummy_call;
+		} else if (spa_streq(name, "bluez5.autoswitch-routes") && spa_pod_is_bool(pod)) {
+			bool autoswitch_routes = SPA_POD_VALUE(struct spa_pod_bool, pod);
+			spa_log_info(this->log, "key:'%s' val:'%u'", name, autoswitch_routes);
+
+			if (this->autoswitch_routes == autoswitch_routes)
+				continue;
+			this->autoswitch_routes = autoswitch_routes;
+
+			this->info.change_mask |= SPA_DEVICE_CHANGE_MASK_PARAMS;
+			this->params[IDX_Route].flags ^= SPA_PARAM_INFO_SERIAL;
+			this->params[IDX_EnumRoute].flags ^= SPA_PARAM_INFO_SERIAL;
+			this->params[IDX_Profile].flags ^= SPA_PARAM_INFO_SERIAL;
+			this->params[IDX_EnumProfile].flags ^= SPA_PARAM_INFO_SERIAL;
 		} else
 			continue;
 
@@ -3312,12 +3377,11 @@ impl_init(const struct spa_handle_factory *factory,
 				this->bt_dev->hw_volume_profiles = profiles;
 		}
 
-		if ((str = spa_dict_lookup(info, "bluez5.disable-dummy-call")) != NULL) {
-			bool value;
+		if ((str = spa_dict_lookup(info, "bluez5.disable-dummy-call")) != NULL)
+			this->bt_dev->disable_dummy_call = spa_atob(str);
 
-			if (spa_json_parse_bool(str, strlen(str), &value) > 0)
-					this->bt_dev->disable_dummy_call = value;
-		}
+		if ((str = spa_dict_lookup(info, "bluez5.autoswitch-routes")) != NULL)
+			this->autoswitch_routes = spa_atob(str);
 	}
 
 	this->device.iface = SPA_INTERFACE_INIT(
