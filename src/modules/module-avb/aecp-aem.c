@@ -11,6 +11,8 @@
 /* The headers including the command and response of the system  */
 #include "aecp-aem-cmds-resps/cmd-available.h"
 #include "aecp-aem-cmds-resps/cmd-get-set-configuration.h"
+#include "aecp-aem-cmds-resps/cmd-get-set-sampling-rate.h"
+#include "aecp-aem-cmds-resps/cmd-get-set-control.h"
 #include "aecp-aem-cmds-resps/cmd-lock-entity.h"
 #include "aecp-aem-cmds-resps/cmd-register-unsolicited-notifications.h"
 #include "aecp-aem-cmds-resps/cmd-deregister-unsolicited-notifications.h"
@@ -285,6 +287,9 @@ static const struct cmd_info cmd_info_avb_legacy[] = {
 	AECP_AEM_HANDLE_CMD(AVB_AECP_AEM_CMD_READ_DESCRIPTOR, true,
 		 handle_read_descriptor_common),
 
+	AECP_AEM_HANDLE_CMD(AVB_AECP_AEM_CMD_GET_SAMPLING_RATE, true,
+		handle_cmd_get_sampling_rate_common),
+
 	AECP_AEM_HANDLE_CMD(AVB_AECP_AEM_CMD_GET_AVB_INFO, true,
 		 handle_get_avb_info_common),
 };
@@ -335,6 +340,18 @@ static const struct cmd_info cmd_info_milan_v12[] = {
 
 	AECP_AEM_HANDLE_CMD(AVB_AECP_AEM_CMD_GET_CLOCK_SOURCE, true,
 		handle_cmd_get_clock_source_milan_v12),
+
+	AECP_AEM_HANDLE_CMD(AVB_AECP_AEM_CMD_SET_CONTROL, false,
+		handle_cmd_set_control_milan_v12),
+
+	AECP_AEM_HANDLE_CMD(AVB_AECP_AEM_CMD_GET_CONTROL, true,
+		handle_cmd_get_control_milan_v12),
+
+	AECP_AEM_HANDLE_CMD(AVB_AECP_AEM_CMD_SET_SAMPLING_RATE, false,
+		handle_cmd_set_sampling_rate_milan_v12),
+
+	AECP_AEM_HANDLE_CMD(AVB_AECP_AEM_CMD_GET_SAMPLING_RATE, true,
+		handle_cmd_get_sampling_rate_common),
 };
 
 static const struct {

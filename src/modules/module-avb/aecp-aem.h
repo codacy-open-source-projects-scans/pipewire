@@ -1,5 +1,6 @@
 /* AVB support */
 /* SPDX-FileCopyrightText: Copyright © 2022 Wim Taymans */
+/* SPDX-FileCopyrightText: Copyright © 2027 Alexandre Malki <alexandre.malki@kebag-logic.com> */
 /* SPDX-License-Identifier: MIT */
 
 #ifndef AVB_AEM_H
@@ -104,10 +105,18 @@ struct avb_packet_aecp_aem_setget_association_id {
 	uint64_t association_id;
 } __attribute__ ((__packed__));
 
+union avb_packet_aecp_aem_pull_frequency {
+	struct {
+		uint32_t frequency:29;
+		uint32_t pull:3;
+	};
+	uint32_t pull_frequency;
+}__attribute__ ((__packed__));
+
 struct avb_packet_aecp_aem_setget_sampling_rate {
 	uint16_t descriptor_type;
 	uint16_t descriptor_id;
-	uint32_t sampling_rate;
+	union avb_packet_aecp_aem_pull_frequency sampling_rate;
 } __attribute__ ((__packed__));
 
 struct avb_packet_aecp_aem_setget_clock_source {
@@ -120,6 +129,7 @@ struct avb_packet_aecp_aem_setget_clock_source {
 struct avb_packet_aecp_aem_setget_control {
 	uint16_t descriptor_type;
 	uint16_t descriptor_id;
+	uint8_t payload[0];
 } __attribute__ ((__packed__));
 
 struct avb_packet_aecp_aem_incdec_control {
@@ -228,6 +238,8 @@ struct avb_packet_aecp_aem {
 	uint8_t cmd2;
 	uint8_t payload[0];
 } __attribute__ ((__packed__));
+
+#define AVB_PACKET_MILAN_DEFAULT_MTU		(1500)
 
 #define AVB_PACKET_CONTROL_DATA_OFFSET		(12U)
 
