@@ -211,6 +211,12 @@ static const struct format_info {
 	{  "s32", SF_FORMAT_PCM_32, SPA_AUDIO_FORMAT_S32, 4 },
 	{  "f32", SF_FORMAT_FLOAT, SPA_AUDIO_FORMAT_F32, 4 },
 	{  "f64", SF_FORMAT_DOUBLE, SPA_AUDIO_FORMAT_F32, 8 },
+
+	{  "mp1", SF_FORMAT_MPEG_LAYER_I, SPA_AUDIO_FORMAT_F32, 1 },
+	{  "mp2", SF_FORMAT_MPEG_LAYER_II, SPA_AUDIO_FORMAT_F32, 1 },
+	{  "mp3", SF_FORMAT_MPEG_LAYER_III, SPA_AUDIO_FORMAT_F32, 1 },
+	{  "vorbis", SF_FORMAT_VORBIS, SPA_AUDIO_FORMAT_F32, 1 },
+	{  "opus", SF_FORMAT_OPUS, SPA_AUDIO_FORMAT_F32, 1 },
 };
 
 static const struct format_info *format_info_by_name(const char *str)
@@ -1678,12 +1684,6 @@ static void format_from_filename(SF_INFO *info, const char *filename)
 	int i, count = 0;
 	int format = -1;
 
-#if __BYTE_ORDER == __BIG_ENDIAN
-	info->format |= SF_ENDIAN_BIG;
-#else
-	info->format |= SF_ENDIAN_LITTLE;
-#endif
-
 	if (sf_command(NULL, SFC_GET_FORMAT_MAJOR_COUNT, &count, sizeof(int)) != 0)
 		count = 0;
 
@@ -1700,17 +1700,42 @@ static void format_from_filename(SF_INFO *info, const char *filename)
 			break;
 		}
 	}
+	if (format == -1) {
+		if (sf_command(NULL, SFC_GET_SIMPLE_FORMAT_COUNT, &count, sizeof(int)) != 0)
+			count = 0;
+
+		for (i = 0; i < count; i++) {
+			SF_FORMAT_INFO fi;
+
+			spa_zero(fi);
+			fi.format = i;
+			if (sf_command(NULL, SFC_GET_SIMPLE_FORMAT, &fi, sizeof(fi)) != 0)
+				continue;
+
+			if (spa_strendswith(filename, fi.extension)) {
+				format = fi.format;
+				info->format = 0;
+				break;
+			}
+		}
+	}
 	if (format == -1)
 		format = spa_streq(filename, "-") ? SF_FORMAT_AU : SF_FORMAT_WAV;
 	if (format == SF_FORMAT_WAV && info->channels > 2)
 		format = SF_FORMAT_WAVEX;
 
+	switch (format & SF_FORMAT_TYPEMASK) {
+	case SF_FORMAT_OGG:
+	case SF_FORMAT_FLAC:
+	case SF_FORMAT_MPEG:
+	case SF_FORMAT_AIFF:
+		info->format |= SF_ENDIAN_FILE;
+		break;
+	default:
+		info->format |= SF_ENDIAN_CPU;
+		break;
+	}
 	info->format |= format;
-
-	if (format == SF_FORMAT_OGG || format == SF_FORMAT_FLAC)
-		info->format = (info->format & ~SF_FORMAT_ENDMASK) | SF_ENDIAN_FILE;
-	if (format == SF_FORMAT_OGG)
-		info->format = (info->format & ~SF_FORMAT_SUBMASK) | SF_FORMAT_VORBIS;
 }
 
 #ifdef HAVE_PW_CAT_FFMPEG_INTEGRATION
