@@ -46,6 +46,7 @@ module_sources = [
   'module-vban-recv.c',
   'module-vban-send.c',
   'module-session-manager.c',
+  'module-scheduler-v1.c',
   'module-zeroconf-discover.c',
   'module-roc-source.c',
   'module-roc-sink.c',
@@ -532,6 +533,15 @@ pipewire_module_adapter = shared_library('pipewire-module-adapter',
   dependencies : [mathlib, dl_lib, rt_lib, pipewire_dep],
 )
 
+pipewire_module_scheduler_v1 = shared_library('pipewire-module-scheduler-v1',
+  [ 'module-scheduler-v1.c' ],
+  include_directories : [configinc],
+  install : true,
+  install_dir : modules_install_dir,
+  install_rpath: modules_install_dir,
+  dependencies : [mathlib, dl_lib, rt_lib, pipewire_dep],
+)
+
 pipewire_module_session_manager = shared_library('pipewire-module-session-manager',
   [ 'module-session-manager.c',
     'module-session-manager/client-endpoint/client-endpoint.c',
@@ -693,7 +703,7 @@ pipewire_module_vban_recv = shared_library('pipewire-module-vban-recv',
 build_module_roc = roc_dep.found()
 if build_module_roc
   pipewire_module_roc_sink = shared_library('pipewire-module-roc-sink',
-    [ 'module-roc-sink.c' ],
+    [ 'module-roc-sink.c', 'module-roc/common.c'],
     include_directories : [configinc],
     install : true,
     install_dir : modules_install_dir,
@@ -702,7 +712,7 @@ if build_module_roc
   )
 
   pipewire_module_roc_source = shared_library('pipewire-module-roc-source',
-    [ 'module-roc-source.c' ],
+    [ 'module-roc-source.c', 'module-roc/common.c' ],
     include_directories : [configinc],
     install : true,
     install_dir : modules_install_dir,

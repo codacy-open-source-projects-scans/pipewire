@@ -46,6 +46,9 @@
  * - `remote.repair.port = <str>`: remote receiver TCP/UDP port for receiver packets
  * - `remote.control.port = <str>`: remote receiver TCP/UDP port for control packets
  * - `fec.code = <str>`: Possible values: `disable`, `rs8m`, `ldpc`
+ * - `log.level = <str>`: log level for roc-toolkit. Possible values: `DEFAULT`,
+ *       `NONE`, `ERROR`, `INFO`, `DEBUG`, `TRACE`; `DEFAULT` follows the log
+ * level of the PipeWire context.
  *
  * ## General options
  *
@@ -75,6 +78,7 @@
  *             node.name = "roc-sink"
  *          }
  *          audio.position = [ FL FR ]
+ *          log.level = DEFAULT
  *      }
  *  }
  *]
@@ -84,8 +88,9 @@
 
 #define NAME "roc-sink"
 
-PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
+PW_LOG_TOPIC(mod_topic, "mod." NAME);
 #define PW_LOG_TOPIC_DEFAULT mod_topic
+PW_LOG_TOPIC_EXTERN(roc_log_topic);
 
 struct module_roc_sink_data {
 	struct pw_impl_module *module;
@@ -300,6 +305,8 @@ static int roc_sink_setup(struct module_roc_sink_data *data)
 
 	pw_properties_setf(data->capture_props, PW_KEY_NODE_RATE, "1/%d", info.rate);
 
+	pw_roc_log_init();
+
 	res = roc_sender_open(data->context, &sender_config, &data->sender);
 	if (res) {
 		pw_log_error("failed to create roc sender: %d", res);
@@ -396,6 +403,7 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	int res = 0;
 
 	PW_LOG_TOPIC_INIT(mod_topic);
+	PW_LOG_TOPIC_INIT(roc_log_topic);
 
 	data = calloc(1, sizeof(struct module_roc_sink_data));
 	if (data == NULL)

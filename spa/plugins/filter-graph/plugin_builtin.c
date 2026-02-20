@@ -21,6 +21,7 @@
 #include <spa/utils/cleanup.h>
 #include <spa/support/cpu.h>
 #include <spa/support/log.h>
+#include <spa/support/loop.h>
 #include <spa/plugins/audioconvert/resample.h>
 #include <spa/debug/log.h>
 
@@ -542,7 +543,12 @@ static void bq_run(void *Instance, unsigned long samples)
 	struct biquad *bq = &impl->bq;
 	float *out = impl->port[0];
 	float *in = impl->port[1];
+	spa_fga_dsp_biquad_run(impl->dsp, bq, 1, 0, &out, (const float **)&in, 1, samples);
+}
 
+static void bq_control_sync(void * Instance)
+{
+	struct builtin *impl = Instance;
 	if (impl->type == BQ_NONE) {
 		float b0, b1, b2, a0, a1, a2;
 		b0 = impl->port[5][0];
@@ -562,7 +568,6 @@ static void bq_run(void *Instance, unsigned long samples)
 		if (impl->freq != freq || impl->Q != Q || impl->gain != gain)
 			bq_freq_update(impl, impl->type, freq, Q, gain);
 	}
-	spa_fga_dsp_biquad_run(impl->dsp, bq, 1, 0, &out, (const float **)&in, 1, samples);
 }
 
 /** bq_lowpass */
@@ -574,6 +579,7 @@ static const struct spa_fga_descriptor bq_lowpass_desc = {
 
 	.instantiate = bq_instantiate,
 	.connect_port = builtin_connect_port,
+	.control_sync = bq_control_sync,
 	.activate = bq_activate,
 	.run = bq_run,
 	.cleanup = builtin_cleanup,
@@ -588,6 +594,7 @@ static const struct spa_fga_descriptor bq_highpass_desc = {
 
 	.instantiate = bq_instantiate,
 	.connect_port = builtin_connect_port,
+	.control_sync = bq_control_sync,
 	.activate = bq_activate,
 	.run = bq_run,
 	.cleanup = builtin_cleanup,
@@ -602,6 +609,7 @@ static const struct spa_fga_descriptor bq_bandpass_desc = {
 
 	.instantiate = bq_instantiate,
 	.connect_port = builtin_connect_port,
+	.control_sync = bq_control_sync,
 	.activate = bq_activate,
 	.run = bq_run,
 	.cleanup = builtin_cleanup,
@@ -616,6 +624,7 @@ static const struct spa_fga_descriptor bq_lowshelf_desc = {
 
 	.instantiate = bq_instantiate,
 	.connect_port = builtin_connect_port,
+	.control_sync = bq_control_sync,
 	.activate = bq_activate,
 	.run = bq_run,
 	.cleanup = builtin_cleanup,
@@ -630,6 +639,7 @@ static const struct spa_fga_descriptor bq_highshelf_desc = {
 
 	.instantiate = bq_instantiate,
 	.connect_port = builtin_connect_port,
+	.control_sync = bq_control_sync,
 	.activate = bq_activate,
 	.run = bq_run,
 	.cleanup = builtin_cleanup,
@@ -644,6 +654,7 @@ static const struct spa_fga_descriptor bq_peaking_desc = {
 
 	.instantiate = bq_instantiate,
 	.connect_port = builtin_connect_port,
+	.control_sync = bq_control_sync,
 	.activate = bq_activate,
 	.run = bq_run,
 	.cleanup = builtin_cleanup,
@@ -658,6 +669,7 @@ static const struct spa_fga_descriptor bq_notch_desc = {
 
 	.instantiate = bq_instantiate,
 	.connect_port = builtin_connect_port,
+	.control_sync = bq_control_sync,
 	.activate = bq_activate,
 	.run = bq_run,
 	.cleanup = builtin_cleanup,
@@ -673,6 +685,7 @@ static const struct spa_fga_descriptor bq_allpass_desc = {
 
 	.instantiate = bq_instantiate,
 	.connect_port = builtin_connect_port,
+	.control_sync = bq_control_sync,
 	.activate = bq_activate,
 	.run = bq_run,
 	.cleanup = builtin_cleanup,
@@ -687,6 +700,7 @@ static const struct spa_fga_descriptor bq_raw_desc = {
 
 	.instantiate = bq_instantiate,
 	.connect_port = builtin_connect_port,
+	.control_sync = bq_control_sync,
 	.activate = bq_activate,
 	.run = bq_run,
 	.cleanup = builtin_cleanup,

@@ -5,6 +5,7 @@
 #include <roc/endpoint.h>
 
 #include <spa/utils/string.h>
+#include <spa/support/log.h>
 
 #define PW_ROC_DEFAULT_IP "0.0.0.0"
 #define PW_ROC_DEFAULT_SOURCE_PORT 10001
@@ -17,6 +18,8 @@
 
 #define PW_ROC_MULTITRACK_ENCODING_ID 100
 #define PW_ROC_STEREO_POSITIONS "[ FL FR ]"
+
+void pw_roc_log_init(void);
 
 static inline int pw_roc_parse_fec_encoding(roc_fec_encoding *out, const char *str)
 {

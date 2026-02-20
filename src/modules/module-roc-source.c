@@ -56,6 +56,9 @@
  * - `fec.code = <str>`: Possible values: `default`, `disable`, `rs8m`, `ldpc`
  *
  * - `resampler.profile = <str>`: Deprecated, use roc.resampler.profile
+ * - `log.level = <str>`: log level for roc-toolkit. Possible values: `DEFAULT`,
+ *       `NONE`, `ERROR`, `INFO`, `DEBUG`, `TRACE`; `DEFAULT` follows the log
+ * level of the PipeWire context.
  *
  * ## General options
  *
@@ -89,6 +92,7 @@
  *             node.name = "roc-source"
  *          }
  *          audio.position = [ FL FR ]
+ *          log.level = DEFAULT
  *      }
  *  }
  *]
@@ -98,8 +102,9 @@
 
 #define NAME "roc-source"
 
-PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
+PW_LOG_TOPIC(mod_topic, "mod." NAME);
 #define PW_LOG_TOPIC_DEFAULT mod_topic
+PW_LOG_TOPIC_EXTERN(roc_log_topic);
 
 struct module_roc_source_data {
 	struct pw_impl_module *module;
@@ -332,6 +337,8 @@ static int roc_source_setup(struct module_roc_source_data *data)
 	 * https://roc-streaming.org/toolkit/docs/api/reference.html
 	 */
 	receiver_config.target_latency = (unsigned long long)data->sess_latency_msec * SPA_NSEC_PER_MSEC;
+
+	pw_roc_log_init();
 
 	res = roc_receiver_open(data->context, &receiver_config, &data->receiver);
 	if (res) {
