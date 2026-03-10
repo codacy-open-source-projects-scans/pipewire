@@ -425,19 +425,10 @@ SPA_API_JSON bool spa_json_is_null(const char *val, int len)
 /* float */
 SPA_API_JSON int spa_json_parse_float(const char *val, int len, float *result)
 {
-	char buf[96];
-	char *end;
-	int pos;
+	char buf[96], *end;
 
 	if (len <= 0 || len >= (int)sizeof(buf))
 		return 0;
-
-	for (pos = 0; pos < len; ++pos) {
-		switch (val[pos]) {
-		case '+': case '-': case '0' ... '9': case '.': case 'e': case 'E': break;
-		default: return 0;
-		}
-	}
 
 	memcpy(buf, val, len);
 	buf[len] = '\0';
@@ -466,8 +457,7 @@ SPA_API_JSON char *spa_json_format_float(char *str, int size, float val)
 /* int */
 SPA_API_JSON int spa_json_parse_int(const char *val, int len, int *result)
 {
-	char buf[64];
-	char *end;
+	char buf[64], *end;
 
 	if (len <= 0 || len >= (int)sizeof(buf))
 		return 0;
@@ -482,6 +472,33 @@ SPA_API_JSON bool spa_json_is_int(const char *val, int len)
 {
 	int dummy;
 	return spa_json_parse_int(val, len, &dummy);
+}
+
+SPA_API_JSON bool spa_json_is_json_number(const char *val, int len)
+{
+	static const int8_t trans[9][7] = {
+	/*      '1-9'  '0'  '-'  '+'  '.'  'eE'  other */
+	/* 0 */ {-1,  -1,   -1,  -1,   6,   7,   -1 },  /* after '0' */
+	/* 1 */ { 1,   1,   -1,  -1,   6,   7,   -1 },  /* in integer */
+	/* 2 */ { 2,   2,   -1,  -1,  -1,   7,   -1 },  /* in fraction */
+	/* 3 */ { 3,   3,   -1,  -1,  -1,  -1,   -1 },  /* in exponent */
+	/* 4 */ { 1,   0,    5,  -1,  -1,  -1,   -1 },  /* start */
+	/* 5 */ { 1,   0,   -1,  -1,  -1,  -1,   -1 },  /* after '-' */
+	/* 6 */ { 2,   2,   -1,  -1,  -1,  -1,   -1 },  /* after '.' */
+	/* 7 */ { 3,   3,    8,   8,  -1,  -1,   -1 },  /* after 'e'/'E' */
+	/* 8 */ { 3,   3,   -1,  -1,  -1,  -1,   -1 },  /* after exp sign */
+	};
+	int i, state = 4;
+
+	for (i = 0; i < len; i++) {
+		char v = val[i];
+		int cls = (v >= '1' && v <= '9') ? 0 : v == '0' ? 1 :
+		          v == '-' ? 2 : v == '+' ? 3 : v == '.' ? 4 :
+		          (v == 'e' || v == 'E') ? 5 : 6;
+		if ((state = trans[state][cls]) < 0)
+			return false;
+	}
+	return state < 4;
 }
 
 /* bool */

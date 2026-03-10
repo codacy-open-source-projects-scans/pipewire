@@ -708,27 +708,49 @@ PWTEST(json_float_check)
 	struct {
 		const char *str;
 		int res;
+		int jsonres;
 	} val[] = {
-		{ "0.0", 1 },
-		{ ".0", 1 },
-		{ "+.0E0", 1 },
-		{ "-.0e0", 1 },
+		{ "0.0", 1, 1},
+		{ ".0", 1, 0 },
+		{ "+.0E0", 1, 0 },
+		{ "-.0e0", 1, 0 },
 
-		{ "0,0", 0 },
-		{ "0.0.5", 0 },
-		{ "0x0", 0 },
-		{ "0x0.0", 0 },
-		{ "E10", 0 },
-		{ "e20", 0 },
-		{ " 0.0", 0 },
-		{ "0.0 ", 0 },
-		{ " 0.0 ", 0 },
+		{ "0,0", 0, 0 },
+		{ "0.0.5", 0, 0 },
+		{ "0x0", 1, 0 },
+		{ "0x0.0", 1, 0 },
+		{ "E10", 0, 0 },
+		{ "e20", 0, 0 },
+		{ " 0.0", 1, 0 },
+		{ "0.0 ", 0, 0 },
+		{ " 0.0 ", 0, 0 },
+
+		{ "+", 0, 0 },
+		{ "+0", 1, 0 },
+		{ "-", 0, 0 },
+		{ "-0", 1, 1 },
+		{ "-0", 1, 1 },
+		{ "-01", 1, 0 },
+		{ "-00", 1, 0 },
+		{ "-1", 1, 1 },
+		{ "-10", 1, 1 },
+		{ "-.", 0, 0 },
+		{ "-0.", 1, 0 },
+		{ "-01.", 1, 0 },
+		{ "-1.", 1, 0 },
+
+		{ "-.0", 1, 0 },
+		{ "-1E10", 1, 1 },
+
 	};
 	unsigned i;
 	float v;
 
 	for (i = 0; i < SPA_N_ELEMENTS(val); i++) {
 		pwtest_int_eq(spa_json_parse_float(val[i].str, strlen(val[i].str), &v), val[i].res);
+	}
+	for (i = 0; i < SPA_N_ELEMENTS(val); i++) {
+		pwtest_int_eq(spa_json_is_json_number(val[i].str, strlen(val[i].str)), val[i].jsonres);
 	}
 	return PWTEST_PASS;
 }
@@ -981,6 +1003,12 @@ PWTEST(json_data)
 		"n_number_-2..json",
 		"n_number_hex_1_digit.json",
 		"n_number_hex_2_digits.json",
+		"n_number_infinity.json",
+		"n_number_+Inf.json",
+		"n_number_Inf.json",
+		"n_number_minus_infinity.json",
+		"n_number_-NaN.json",
+		"n_number_NaN.json",
 		"n_number_neg_int_starting_with_zero.json",
 		"n_number_neg_real_without_int_part.json",
 		"n_number_real_without_fractional_part.json",
