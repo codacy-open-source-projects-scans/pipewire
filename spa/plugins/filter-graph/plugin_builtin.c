@@ -1467,6 +1467,7 @@ static struct spa_fga_port clamp_ports[] = {
 	{ .index = 3,
 	  .name = "Control",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
+	  .def = 0.0f, .min = -FLT_MAX, .max = FLT_MAX
 	},
 	{ .index = 4,
 	  .name = "Min",
@@ -1524,6 +1525,7 @@ static struct spa_fga_port linear_ports[] = {
 	{ .index = 3,
 	  .name = "Control",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
+	  .def = 0.0f, .min = -FLT_MAX, .max = FLT_MAX
 	},
 	{ .index = 4,
 	  .name = "Mult",
@@ -1591,6 +1593,7 @@ static struct spa_fga_port recip_ports[] = {
 	{ .index = 3,
 	  .name = "Control",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
+	  .def = 0.0f, .min = -FLT_MAX, .max = FLT_MAX
 	},
 };
 
@@ -1640,6 +1643,7 @@ static struct spa_fga_port exp_ports[] = {
 	{ .index = 3,
 	  .name = "Control",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
+	  .def = 0.0f, .min = -FLT_MAX, .max = FLT_MAX
 	},
 	{ .index = 4,
 	  .name = "Base",
@@ -1697,6 +1701,7 @@ static struct spa_fga_port log_ports[] = {
 	{ .index = 3,
 	  .name = "Control",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
+	  .def = 0.0f, .min = -FLT_MAX, .max = FLT_MAX
 	},
 	{ .index = 4,
 	  .name = "Base",
@@ -2486,10 +2491,12 @@ static struct spa_fga_port ramp_ports[] = {
 	{ .index = 1,
 	  .name = "Start",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
+	  .def = 0.0f, .min = -FLT_MAX, .max = FLT_MAX
 	},
 	{ .index = 2,
 	  .name = "Stop",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
+	  .def = 1.0f, .min = -FLT_MAX, .max = FLT_MAX
 	},
 	{ .index = 3,
 	  .name = "Current",
@@ -2498,6 +2505,7 @@ static struct spa_fga_port ramp_ports[] = {
 	{ .index = 4,
 	  .name = "Duration (s)",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
+	  .def = 1.0f, .min = 0.0f, .max = FLT_MAX
 	},
 };
 
@@ -2657,6 +2665,7 @@ static struct spa_fga_port debug_ports[] = {
 	{ .index = 2,
 	  .name = "Control",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
+	  .def = 0.0f, .min = -FLT_MAX, .max = FLT_MAX
 	},
 	{ .index = 3,
 	  .name = "Notify",
@@ -3003,7 +3012,7 @@ static struct spa_fga_port noisegate_ports[] = {
 	{ .index = 2,
 	  .name = "Level",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
-	  .def = NAN
+	  .def = NAN, .min = -FLT_MAX, .max = FLT_MAX
 	},
 	{ .index = 3,
 	  .name = "Open Threshold",
@@ -3244,6 +3253,7 @@ static struct spa_fga_port null_ports[] = {
 	{ .index = 1,
 	  .name = "Control",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
+	  .def = 0.0f, .min = -FLT_MAX, .max = FLT_MAX
 	},
 };
 
