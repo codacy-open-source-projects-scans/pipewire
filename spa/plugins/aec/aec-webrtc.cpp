@@ -39,7 +39,7 @@ struct impl_data {
 	std::unique_ptr<float *[]> play_buffer, rec_buffer, out_buffer;
 };
 
-SPA_LOG_TOPIC_DEFINE_STATIC(log_topic, "spa.eac.webrtc");
+SPA_LOG_TOPIC_DEFINE_STATIC(log_topic, "spa.aec.webrtc");
 #undef SPA_LOG_TOPIC_DEFAULT
 #define SPA_LOG_TOPIC_DEFAULT &log_topic
 
@@ -220,6 +220,11 @@ static int webrtc_init2(void *object, const struct spa_dict *args,
 		webrtc::StreamConfig(play_info->rate, play_info->channels), /* reverse output stream */
 	}};
 #endif
+
+	if (out_info->channels != 1 && rec_info->channels != out_info->channels) {
+		spa_log_error(impl->log, "Source channels must be equal to capture channels or 1");
+		return -EINVAL;
+	}
 
 #if defined(HAVE_WEBRTC)
 	auto apm = std::unique_ptr<webrtc::AudioProcessing>(webrtc::AudioProcessing::Create(config));

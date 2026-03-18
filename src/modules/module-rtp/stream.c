@@ -109,6 +109,7 @@ struct impl {
 	uint32_t mtu;
 	uint32_t header_size;
 	uint32_t payload_size;
+	uint32_t ts_align;
 
 	struct spa_ringbuffer ring;
 	uint8_t buffer[BUFFER_SIZE];
@@ -426,7 +427,7 @@ static int stream_stop(struct impl *impl)
 	 * because a stop involves closing the connection. If the timer is still
 	 * running, it needs an open connection for sending out remaining packets. */
 	if (!timer_running) {
-		int res;
+		int res = 0;
 		pw_log_info("closing connection as part of stopping the stream");
 		rtp_stream_emit_close_connection(impl, &res);
 		if (res > 0) {
