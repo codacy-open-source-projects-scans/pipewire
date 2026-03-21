@@ -44,6 +44,7 @@ struct channelmix {
 	uint32_t upmix;
 
 	struct spa_log *log;
+	uint32_t func_cpu_flags;
 	const char *func_name;
 
 #define CHANNELMIX_FLAG_ZERO		(1<<0)		/**< all zero components */
@@ -137,6 +138,10 @@ DEFINE_FUNCTION(f32_5p1_2, sse);
 DEFINE_FUNCTION(f32_5p1_3p1, sse);
 DEFINE_FUNCTION(f32_5p1_4, sse);
 DEFINE_FUNCTION(f32_7p1_4, sse);
+#endif
+
+#if defined (HAVE_AVX)
+DEFINE_FUNCTION(copy, avx);
 #endif
 
 #undef DEFINE_FUNCTION
