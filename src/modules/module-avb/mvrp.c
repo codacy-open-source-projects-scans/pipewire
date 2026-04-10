@@ -84,7 +84,7 @@ static int encode_vid(struct mvrp *mvrp, struct attr *a, void *m)
 	*d = a->attr.attr.vid;
 
 	ev = SPA_PTROFF(d, sizeof(*d), uint8_t);
-	*ev = a->attr.mrp->pending_send * 36;
+	*ev = (a->attr.mrp->pending_send - 1) * 36;
 
 	f = SPA_PTROFF(ev, sizeof(*ev), struct avb_packet_mrp_footer);
 	f->end_mark = 0;
@@ -171,7 +171,8 @@ static void mvrp_notify(void *data, uint64_t now, uint8_t notify)
 {
 	struct attr *a = data;
 	struct mvrp *mvrp = a->mvrp;
-	return dispatch[a->attr.type].notify(mvrp, now, a, notify);
+	if (dispatch[a->attr.type].notify)
+		dispatch[a->attr.type].notify(mvrp, now, a, notify);
 }
 
 static const struct avb_mrp_attribute_events mrp_attr_events = {

@@ -5,6 +5,8 @@
 #ifndef AVB_INTERNAL_H
 #define AVB_INTERNAL_H
 
+#include <sys/socket.h>
+
 #include <pipewire/pipewire.h>
 
 #ifdef __cplusplus
@@ -16,6 +18,22 @@ struct avb_mrp;
 
 #define AVB_TSN_ETH 0x22f0
 #define AVB_BROADCAST_MAC { 0x91, 0xe0, 0xf0, 0x01, 0x00, 0x00 };
+
+struct stream;
+
+struct avb_transport_ops {
+	int (*setup)(struct server *server);
+	int (*send_packet)(struct server *server, const uint8_t dest[6],
+			uint16_t type, void *data, size_t size);
+	int (*make_socket)(struct server *server, uint16_t type,
+			const uint8_t mac[6]);
+	void (*destroy)(struct server *server);
+
+	/* stream data plane ops */
+	int (*stream_setup_socket)(struct server *server, struct stream *stream);
+	ssize_t (*stream_send)(struct server *server, struct stream *stream,
+			struct msghdr *msg, int flags);
+};
 
 struct impl {
 	struct pw_loop *loop;
@@ -77,12 +95,16 @@ struct server {
 	uint64_t entity_id;
 	int ifindex;
 
+	const struct avb_transport_ops *transport;
+	void *transport_data;
+
 	struct spa_source *source;
 	struct pw_timer timer;
 
 	struct spa_hook_list listener_list;
 
 	struct spa_list descriptors;
+	struct spa_list streams;
 
 	unsigned debug_messages:1;
 
@@ -102,7 +124,6 @@ static inline void server_destroy_descriptors(struct server *server)
 	struct descriptor *d, *t;
 
         spa_list_for_each_safe(d, t, &server->descriptors, link) {
-		free(d->ptr);
 		spa_list_remove(&d->link);
 		free(d);
         }
@@ -145,10 +166,16 @@ void avdecc_server_free(struct server *server);
 void avdecc_server_add_listener(struct server *server, struct spa_hook *listener,
 		const struct server_events *events, void *data);
 
+extern const struct avb_transport_ops avb_transport_raw;
+
 int avb_server_make_socket(struct server *server, uint16_t type, const uint8_t mac[6]);
 
 int avb_server_send_packet(struct server *server, const uint8_t dest[6],
 		uint16_t type, void *data, size_t size);
+
+int avb_server_stream_setup_socket(struct server *server, struct stream *stream);
+ssize_t avb_server_stream_send(struct server *server, struct stream *stream,
+		struct msghdr *msg, int flags);
 
 struct aecp {
 	struct server *server;

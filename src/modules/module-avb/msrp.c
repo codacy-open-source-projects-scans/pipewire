@@ -91,7 +91,7 @@ static int encode_talker(struct msrp *msrp, struct attr *a, void *m)
 	*t = a->attr.attr.talker;
 
 	ev = SPA_PTROFF(t, sizeof(*t), uint8_t);
-	*ev = a->attr.mrp->pending_send * 6 * 6;
+	*ev = (a->attr.mrp->pending_send - 1) * 6 * 6;
 
 	f = SPA_PTROFF(ev, sizeof(*ev), struct avb_packet_mrp_footer);
 	f->end_mark = 0;
@@ -170,7 +170,7 @@ static int encode_listener(struct msrp *msrp, struct attr *a, void *m)
 	*l = a->attr.attr.listener;
 
 	ev = SPA_PTROFF(l, sizeof(*l), uint8_t);
-	*ev = a->attr.mrp->pending_send * 6 * 6;
+	*ev = (a->attr.mrp->pending_send - 1) * 6 * 6;
 
 	ev = SPA_PTROFF(ev, sizeof(*ev), uint8_t);
 	*ev = a->attr.param * 4 * 4 * 4;
@@ -226,7 +226,7 @@ static int encode_domain(struct msrp *msrp, struct attr *a, void *m)
 	*d = a->attr.attr.domain;
 
 	ev = SPA_PTROFF(d, sizeof(*d), uint8_t);
-	*ev = a->attr.mrp->pending_send * 36;
+	*ev = (a->attr.mrp->pending_send - 1) * 36;
 
 	f = SPA_PTROFF(ev, sizeof(*ev), struct avb_packet_mrp_footer);
 	f->end_mark = 0;
@@ -332,7 +332,8 @@ static void msrp_notify(void *data, uint64_t now, uint8_t notify)
 {
 	struct attr *a = data;
 	struct msrp *msrp = a->msrp;
-	return dispatch[a->attr.type].notify(msrp, now, a, notify);
+	if (dispatch[a->attr.type].notify)
+		dispatch[a->attr.type].notify(msrp, now, a, notify);
 }
 
 static const struct avb_mrp_attribute_events mrp_attr_events = {

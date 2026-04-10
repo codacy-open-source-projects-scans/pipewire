@@ -84,7 +84,7 @@ static void on_socket_data(void *data, int fd, uint32_t mask)
 	}
 }
 
-int avb_server_send_packet(struct server *server, const uint8_t dest[6],
+static int raw_send_packet(struct server *server, const uint8_t dest[6],
 		uint16_t type, void *data, size_t size)
 {
 	struct avb_ethernet_header *hdr = (struct avb_ethernet_header*)data;
@@ -99,6 +99,12 @@ int avb_server_send_packet(struct server *server, const uint8_t dest[6],
 		pw_log_warn("got send error: %m");
 	}
 	return res;
+}
+
+int avb_server_send_packet(struct server *server, const uint8_t dest[6],
+		uint16_t type, void *data, size_t size)
+{
+	return server->transport->send_packet(server, dest, type, data, size);
 }
 
 static int load_filter(int fd, uint16_t eth, const uint8_t dest[6], const uint8_t mac[6])
@@ -136,7 +142,7 @@ static int load_filter(int fd, uint16_t eth, const uint8_t dest[6], const uint8_
 	return 0;
 }
 
-int avb_server_make_socket(struct server *server, uint16_t type, const uint8_t mac[6])
+static int raw_make_socket(struct server *server, uint16_t type, const uint8_t mac[6])
 {
 	int fd, res;
 	struct ifreq req;
@@ -209,13 +215,20 @@ error_close:
 	return res;
 }
 
-static int setup_socket(struct server *server)
+int avb_server_make_socket(struct server *server, uint16_t type, const uint8_t mac[6])
+{
+	if (server->transport && server->transport->make_socket)
+		return server->transport->make_socket(server, type, mac);
+	return raw_make_socket(server, type, mac);
+}
+
+static int raw_transport_setup(struct server *server)
 {
 	struct impl *impl = server->impl;
 	int fd, res;
 	static const uint8_t bmac[6] = AVB_BROADCAST_MAC;
 
-	fd = avb_server_make_socket(server, AVB_TSN_ETH, bmac);
+	fd = raw_make_socket(server, AVB_TSN_ETH, bmac);
 	if (fd < 0)
 		return fd;
 
@@ -244,6 +257,119 @@ error_no_source:
 	return res;
 }
 
+static int raw_stream_setup_socket(struct server *server, struct stream *stream)
+{
+	int fd, res;
+	char buf[128];
+	struct ifreq req;
+
+	fd = socket(AF_PACKET, SOCK_RAW | SOCK_NONBLOCK, htons(ETH_P_ALL));
+	if (fd < 0) {
+		pw_log_error("socket() failed: %m");
+		return -errno;
+	}
+
+	spa_zero(req);
+	snprintf(req.ifr_name, sizeof(req.ifr_name), "%s", server->ifname);
+	res = ioctl(fd, SIOCGIFINDEX, &req);
+	if (res < 0) {
+		pw_log_error("SIOCGIFINDEX %s failed: %m", server->ifname);
+		res = -errno;
+		goto error_close;
+	}
+
+	spa_zero(stream->sock_addr);
+	stream->sock_addr.sll_family = AF_PACKET;
+	stream->sock_addr.sll_protocol = htons(ETH_P_TSN);
+	stream->sock_addr.sll_ifindex = req.ifr_ifindex;
+
+	if (stream->direction == SPA_DIRECTION_OUTPUT) {
+		struct sock_txtime txtime_cfg;
+
+		res = setsockopt(fd, SOL_SOCKET, SO_PRIORITY, &stream->prio,
+				sizeof(stream->prio));
+		if (res < 0) {
+			pw_log_error("setsockopt(SO_PRIORITY %d) failed: %m", stream->prio);
+			res = -errno;
+			goto error_close;
+		}
+
+		txtime_cfg.clockid = CLOCK_TAI;
+		txtime_cfg.flags = 0;
+		res = setsockopt(fd, SOL_SOCKET, SO_TXTIME, &txtime_cfg,
+				sizeof(txtime_cfg));
+		if (res < 0) {
+			pw_log_error("setsockopt(SO_TXTIME) failed: %m");
+			res = -errno;
+			goto error_close;
+		}
+	} else {
+		struct packet_mreq mreq;
+
+		res = bind(fd, (struct sockaddr *) &stream->sock_addr, sizeof(stream->sock_addr));
+		if (res < 0) {
+			pw_log_error("bind() failed: %m");
+			res = -errno;
+			goto error_close;
+		}
+
+		spa_zero(mreq);
+		mreq.mr_ifindex = req.ifr_ifindex;
+		mreq.mr_type = PACKET_MR_MULTICAST;
+		mreq.mr_alen = ETH_ALEN;
+		memcpy(&mreq.mr_address, stream->addr, ETH_ALEN);
+		res = setsockopt(fd, SOL_PACKET, PACKET_ADD_MEMBERSHIP,
+				&mreq, sizeof(struct packet_mreq));
+
+		pw_log_info("join %s", avb_utils_format_addr(buf, 128, stream->addr));
+
+		if (res < 0) {
+			pw_log_error("setsockopt(ADD_MEMBERSHIP) failed: %m");
+			res = -errno;
+			goto error_close;
+		}
+	}
+	return fd;
+
+error_close:
+	close(fd);
+	return res;
+}
+
+static ssize_t raw_stream_send(struct server *server, struct stream *stream,
+		struct msghdr *msg, int flags)
+{
+	return sendmsg(stream->source->fd, msg, flags);
+}
+
+int avb_server_stream_setup_socket(struct server *server, struct stream *stream)
+{
+	return server->transport->stream_setup_socket(server, stream);
+}
+
+ssize_t avb_server_stream_send(struct server *server, struct stream *stream,
+		struct msghdr *msg, int flags)
+{
+	return server->transport->stream_send(server, stream, msg, flags);
+}
+
+static void raw_transport_destroy(struct server *server)
+{
+	struct impl *impl = server->impl;
+	if (server->source)
+		pw_loop_destroy_source(impl->loop, server->source);
+	server->source = NULL;
+}
+
+const struct avb_transport_ops avb_transport_raw = {
+	.setup = raw_transport_setup,
+	.send_packet = raw_send_packet,
+	.make_socket = raw_make_socket,
+	.destroy = raw_transport_destroy,
+	.stream_setup_socket = raw_stream_setup_socket,
+	.stream_send = raw_stream_send,
+};
+
 struct server *avdecc_server_new(struct impl *impl, struct spa_dict *props)
 {
 	struct server *server;
@@ -266,10 +392,14 @@ struct server *avdecc_server_new(struct impl *impl, struct spa_dict *props)
 
 	spa_hook_list_init(&server->listener_list);
 	spa_list_init(&server->descriptors);
+	spa_list_init(&server->streams);
 
 	server->debug_messages = false;
 
-	if ((res = setup_socket(server)) < 0)
+	if (server->transport == NULL)
+		server->transport = &avb_transport_raw;
+
+	if ((res = server->transport->setup(server)) < 0)
 		goto error_free;
 
 
@@ -315,12 +445,10 @@ void avdecc_server_add_listener(struct server *server, struct spa_hook *listener
 
 void avdecc_server_free(struct server *server)
 {
-	struct impl *impl = server->impl;
-
 	server_destroy_descriptors(server);
 	spa_list_remove(&server->link);
-	if (server->source)
-		pw_loop_destroy_source(impl->loop, server->source);
+	if (server->transport)
+		server->transport->destroy(server);
 	pw_timer_queue_cancel(&server->timer);
 	spa_hook_list_clean(&server->listener_list);
 	free(server->ifname);
