@@ -50,12 +50,12 @@ void dsp_fft_run_##arch(void *obj, void *fft, int direction, \
 #define MAKE_FFT_CMUL_FUNC(arch) \
 void dsp_fft_cmul_##arch(void *obj, void *fft, \
 	float * SPA_RESTRICT dst, const float * SPA_RESTRICT a, \
-	const float * SPA_RESTRICT b, uint32_t len, const float scale)
+	const float * SPA_RESTRICT b, uint32_t len)
 #define MAKE_FFT_CMULADD_FUNC(arch) \
 void dsp_fft_cmuladd_##arch(void *obj, void *fft,		\
 	float * dst, const float * src,					\
 	const float * SPA_RESTRICT a, const float * SPA_RESTRICT b,	\
-	uint32_t len, const float scale)
+	uint32_t len)
 
 
 MAKE_CLEAR_FUNC(c);
@@ -79,14 +79,24 @@ MAKE_FFT_CMULADD_FUNC(c);
 #if defined (HAVE_SSE)
 MAKE_MIX_GAIN_FUNC(sse);
 MAKE_SUM_FUNC(sse);
+MAKE_LINEAR_FUNC(sse);
+MAKE_MULT_FUNC(sse);
 MAKE_BIQUAD_RUN_FUNC(sse);
 MAKE_DELAY_FUNC(sse);
+MAKE_FFT_MEMALLOC_FUNC(sse);
+MAKE_FFT_MEMCLEAR_FUNC(sse);
+MAKE_FFT_RUN_FUNC(sse);
 MAKE_FFT_CMUL_FUNC(sse);
 MAKE_FFT_CMULADD_FUNC(sse);
 #endif
 #if defined (HAVE_AVX2)
 MAKE_MIX_GAIN_FUNC(avx2);
 MAKE_SUM_FUNC(avx2);
+MAKE_LINEAR_FUNC(avx2);
+MAKE_MULT_FUNC(avx2);
+MAKE_FFT_MEMALLOC_FUNC(avx2);
+MAKE_FFT_MEMCLEAR_FUNC(avx2);
+MAKE_FFT_RUN_FUNC(avx2);
 MAKE_FFT_CMUL_FUNC(avx2);
 MAKE_FFT_CMULADD_FUNC(avx2);
 #endif

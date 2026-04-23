@@ -7,7 +7,6 @@
 #include "convolver.h"
 
 #include <math.h>
-#include <math.h>
 #include <pthread.h>
 #include <semaphore.h>
 #include <limits.h>
@@ -27,7 +26,6 @@ struct partition {
 	int time_size;
 	int freq_size;
 	void *fft;
-	void *ifft;
 	float *freq;
 
 	int n_segments;
@@ -39,14 +37,11 @@ struct partition {
 	struct ir *ir;
 	int time_idx;
 	int precalc_idx;
-
-	float scale;
 };
 
 struct convolver
 {
 	struct spa_fga_dsp *dsp;
-	struct convolver *conv;
 
 	int min_size;
 	int max_size;
@@ -116,8 +111,6 @@ static void partition_free(struct spa_fga_dsp *dsp, struct partition *part)
 	}
 	if (part->fft)
 		spa_fga_dsp_fft_free(dsp, part->fft);
-	if (part->ifft)
-		spa_fga_dsp_fft_free(dsp, part->ifft);
 	free(part->segments);
 	free(part->ir);
 	spa_fga_dsp_fft_memfree(dsp, part->freq);
@@ -148,9 +141,6 @@ static struct partition *partition_new(struct convolver *conv, int block,
 
 	part->fft = spa_fga_dsp_fft_new(dsp, part->time_size, true);
 	if (part->fft == NULL)
-		goto error;
-	part->ifft = spa_fga_dsp_fft_new(dsp, part->time_size, true);
-	if (part->ifft == NULL)
 		goto error;
 
 	part->segments = calloc(part->n_segments, sizeof(float*));
@@ -191,7 +181,6 @@ static struct partition *partition_new(struct convolver *conv, int block,
 		        spa_fga_dsp_fft_run(dsp, part->fft, 1, r->time_buffer[0], r->segments[j]);
 		}
 	}
-	part->scale = 1.0f / part->time_size;
 	partition_reset(dsp, part);
 
 	return part;
@@ -218,7 +207,7 @@ static int partition_run(struct spa_fga_dsp *dsp, struct partition *part, const 
 				part->freq,
 				part->segments[current],
 				r->segments[0],
-				part->freq_size, part->scale);
+				part->freq_size);
 
 		for (j = 1; j < part->n_segments; j++) {
 			if (++current == part->n_segments)
@@ -229,9 +218,9 @@ static int partition_run(struct spa_fga_dsp *dsp, struct partition *part, const 
 					part->freq,
 					part->segments[current],
 					r->segments[j],
-					part->freq_size, part->scale);
+					part->freq_size);
 		}
-		spa_fga_dsp_fft_run(dsp, part->ifft, -1, part->freq, r->time_buffer[idx]);
+		spa_fga_dsp_fft_run(dsp, part->fft, -1, part->freq, r->time_buffer[idx]);
 
 		dst = output ? output[i]: r->precalc[pc_idx];
 		if (dst)
@@ -440,7 +429,7 @@ int convolver_run_many(struct convolver *conv, const float *input, float *output
 		}
 		processed += processing;
 	}
-	return 0;
+	return processed;
 }
 
 int convolver_run(struct convolver *conv, const float *input, float *output, int length)
