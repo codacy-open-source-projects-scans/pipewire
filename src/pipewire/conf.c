@@ -358,8 +358,9 @@ int pw_conf_save_state(const char *prefix, const char *name, const struct pw_pro
 	if ((sfd = open_write_dir(path, sizeof(path), prefix)) < 0)
 		return sfd;
 
-	tmp_name = alloca(strlen(name)+5);
-	sprintf(tmp_name, "%s.tmp", name);
+	size_t tmp_name_size = strlen(name) + 5;
+	tmp_name = alloca(tmp_name_size);
+	snprintf(tmp_name, tmp_name_size, "%s.tmp", name);
 	if ((fd = openat(sfd, tmp_name,  O_CLOEXEC | O_CREAT | O_WRONLY | O_TRUNC, 0600)) < 0) {
 		res = -errno;
 		pw_log_error("can't open file '%s': %m", tmp_name);
@@ -367,6 +368,11 @@ int pw_conf_save_state(const char *prefix, const char *name, const struct pw_pro
 	}
 
 	f = fdopen(fd, "w");
+	if (f == NULL) {
+		res = -errno;
+		close(fd);
+		return res;
+	}
 	fprintf(f, "{");
 	count += pw_properties_serialize_dict(f, &conf->dict, PW_PROPERTIES_FLAG_NL);
 	fprintf(f, "%s}", count == 0 ? " " : "\n");

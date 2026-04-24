@@ -774,6 +774,9 @@ static int netjack2_recv_midi(struct netjack2_peer *peer, struct nj2_packet_head
 	sub_cycle = ntohl(header->sub_cycle);
 	peer->sync.num_packets = ntohl(header->num_packets);
 	max_size = peer->params.mtu - sizeof(*header);
+
+	if (sub_cycle > 0 && max_size > UINT32_MAX / sub_cycle)
+		return -EOVERFLOW;
 	offset = max_size * sub_cycle;
 
 	data += sizeof(*header);
@@ -782,7 +785,7 @@ static int netjack2_recv_midi(struct netjack2_peer *peer, struct nj2_packet_head
 	midi_data = peer->midi_data;
 	midi_size = peer->midi_size;
 
-	if (offset + len < midi_size)
+	if (offset <= midi_size && (size_t)len <= midi_size - offset)
 		memcpy(SPA_PTROFF(midi_data, offset, void), data, len);
 
 	if (++(*count) < peer->sync.num_packets)
@@ -796,7 +799,7 @@ static int netjack2_recv_midi(struct netjack2_peer *peer, struct nj2_packet_head
 		size_t used = sizeof(*mbuf)
 			+ mbuf->event_count * sizeof(struct nj2_midi_event)
 			+ mbuf->write_pos;
-		if (used > midi_size)
+		if (used < sizeof(*mbuf) || used > midi_size)
 			break;
 
 		if (i < n_info && info[i].data != NULL) {
@@ -821,7 +824,7 @@ static int netjack2_recv_float(struct netjack2_peer *peer, struct nj2_packet_hea
 		return -errno;
 
 	active_ports = ntohl(header->active_ports);
-	if (active_ports == 0)
+	if (active_ports == 0 || active_ports > MAX_CHANNELS)
 		return 0;
 
 	uint32_t max_size = PACKET_AVAILABLE_SIZE(peer->params.mtu);
@@ -830,11 +833,11 @@ static int netjack2_recv_float(struct netjack2_peer *peer, struct nj2_packet_hea
 	sub_period_size = SPA_MIN(period, (uint32_t)peer->sync.frames);
 	sub_period_bytes = sub_period_size * sizeof(float) + sizeof(int32_t);
 
-	if ((size_t)len < active_ports * sub_period_bytes + sizeof(*header))
+	if ((size_t)len < (size_t)active_ports * sub_period_bytes + sizeof(*header))
 		return 0;
 
 	sub_cycle = ntohl(header->sub_cycle);
-	if (sub_cycle * sub_period_size > peer->quantum_limit)
+	if (sub_period_size == 0 || sub_cycle > peer->quantum_limit / sub_period_size)
 		return 0;
 
 	for (i = 0; i < active_ports; i++) {

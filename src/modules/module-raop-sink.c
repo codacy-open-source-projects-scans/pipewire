@@ -707,8 +707,9 @@ static int MD5_hash(char hash[MD5_HASH_LENGTH+1], const char *fmt, ...)
 
 	size = MD5_DIGEST_LENGTH;
 	EVP_Digest(buffer, strlen(buffer), d, &size, EVP_md5(), NULL);
+	explicit_bzero(buffer, sizeof(buffer));
 	for (i = 0; i < MD5_DIGEST_LENGTH; i++)
-		sprintf(&hash[2*i], "%02x", (uint8_t) d[i]);
+		snprintf(&hash[2*i], 3, "%02x", (uint8_t) d[i]);
 	hash[MD5_HASH_LENGTH] = '\0';
 	return 0;
 }
@@ -725,6 +726,7 @@ static int rtsp_add_raop_auth_header(struct impl *impl, const char *method)
 		char enc[512];
 		spa_scnprintf(buf, sizeof(buf), "%s:%s", RAOP_AUTH_USER_NAME, impl->password);
 		pw_base64_encode((uint8_t*)buf, strlen(buf), enc, '=');
+		explicit_bzero(buf, sizeof(buf));
 		spa_scnprintf(auth, sizeof(auth), "Basic %s", enc);
 	}
 	else if (spa_streq(impl->auth_method, "Digest")) {
@@ -1332,6 +1334,8 @@ static int rtsp_do_options_auth(struct impl *impl, const struct spa_dict *header
 		return -EINVAL;
 
 	impl->auth_method = strdup(tokens[0]);
+	if (impl->auth_method == NULL)
+		return -ENOMEM;
 
 	if (spa_streq(impl->auth_method, "Digest")) {
 		realm = find_attr(tokens, "realm");
@@ -1341,6 +1345,8 @@ static int rtsp_do_options_auth(struct impl *impl, const struct spa_dict *header
 
 		impl->realm = strdup(realm);
 		impl->nonce = strdup(nonce);
+		if (impl->realm == NULL || impl->nonce == NULL)
+			return -ENOMEM;
 	}
 
 	return rtsp_send(impl, "OPTIONS", NULL, NULL, rtsp_options_auth_reply);
@@ -1667,7 +1673,10 @@ static void impl_destroy(struct impl *impl)
 	pw_properties_free(impl->headers);
 	pw_properties_free(impl->stream_props);
 	pw_properties_free(impl->props);
-	free(impl->password);
+	if (impl->password) {
+		explicit_bzero(impl->password, strlen(impl->password));
+		free(impl->password);
+	}
 	free(impl);
 }
 
