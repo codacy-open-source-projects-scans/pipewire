@@ -14,6 +14,7 @@
 #include <time.h>
 
 #include <spa/utils/json.h>
+#include <spa/utils/overflow.h>
 #include <spa/debug/log.h>
 
 #include <pipewire/array.h>
@@ -368,6 +369,11 @@ void* pw_reallocarray(void *ptr, size_t nmemb, size_t size)
 #ifdef HAVE_REALLOCARRAY
 	return reallocarray(ptr, nmemb, size);
 #else
-	return realloc(ptr, nmemb * size);
+	size_t total;
+	if (spa_overflow_mul(nmemb, size, &total)) {
+		errno = ENOMEM;
+		return NULL;
+	}
+	return realloc(ptr, total);
 #endif
 }

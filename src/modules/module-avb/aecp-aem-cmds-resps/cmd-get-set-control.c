@@ -3,6 +3,7 @@
 /* SPDX-FileCopyrightText: Copyright © 2026 Alexandre Malki <alexandre.malki@kebag-logic.com> */
 /* SPDX-License-Identifier: MIT */
 
+#include <errno.h>
 #include <limits.h>
 #include <inttypes.h>
 #include <stdbool.h>
@@ -44,6 +45,9 @@ static int send_unsol_control_milan_v12(struct aecp *aecp,
 	struct aecp_aem_base_info info = { 0 };
 	int rc = 0;
 
+	if (len > sizeof(unsol_buf))
+		return -EINVAL;
+
 	memcpy(unsol_buf, m, len);
 	/* Prepare a template packet */
 	info.controller_entity_id = htobe64(ctrler_id);
@@ -78,7 +82,13 @@ static int reply_control_badargs(struct aecp *aecp, const void *m, int len,
 			m, len);
 	}
 
+	if (len < 0 || (size_t)len > sizeof(buf))
+		return reply_status(aecp, AVB_AECP_AEM_STATUS_BAD_ARGUMENTS,
+			m, len);
+
 	memcpy(buf, m, len);
+	if (pkt_size > len)
+		memset(buf + len, 0, pkt_size - len);
 	ae_reply = (struct avb_packet_aecp_aem_setget_control *)p_reply->payload;
 
 	control_copy_payload(format, ae_reply->payload, type_sz, count);
@@ -102,11 +112,18 @@ static int handle_cmd_get_control_identify(struct aecp *aecp, struct descriptor 
 	ctrl_desc = desc->ptr;
 	desc_formats = ctrl_desc->value_format;
 
+	if (len < 0 || (size_t)len > sizeof(buf))
+		return reply_status(aecp, AVB_AECP_AEM_STATUS_BAD_ARGUMENTS,
+			m, len);
+
 	memcpy(buf, m, len);
         ae_reply = (struct avb_packet_aecp_aem_setget_control *)p_reply->payload;
 
 	// Idenfity only has one value element
 	pkt_size = sizeof(*h) + sizeof(*p_reply)+ CONTROL_LINEAR_UINT8_SIZE;
+
+	if (pkt_size > len)
+		memset(buf + len, 0, pkt_size - len);
 
 	control_copy_payload(desc_formats, ae_reply->payload,
 					CONTROL_LINEAR_UINT8_SIZE, 1);
@@ -132,6 +149,11 @@ static int handle_cmd_set_control_identify(struct aecp *aecp, struct descriptor 
 	desc_formats = ctrl_desc->value_format;
 	old_value_format = desc_formats;
 	value_req = (uint8_t *)control->payload;
+
+	if (len < 0 || (size_t)len < sizeof(*h) + sizeof(*p) +
+			sizeof(*control) + CONTROL_LINEAR_UINT8_SIZE)
+		return reply_status(aecp, AVB_AECP_AEM_STATUS_BAD_ARGUMENTS,
+			m, len);
 
 	if (*value_req == desc_formats->current_value) {
 		return reply_success(aecp, m, len);

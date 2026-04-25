@@ -1,5 +1,6 @@
 
 #include <spa/utils/endian.h>
+#include <spa/utils/overflow.h>
 #include <spa/control/ump-utils.h>
 
 #ifdef HAVE_OPUS_CUSTOM
@@ -135,26 +136,48 @@ struct netjack2_peer {
 static int netjack2_init(struct netjack2_peer *peer)
 {
 	int res = 0;
+	uint32_t max_midi_ch, max_audio_ch;
 
-	peer->empty = calloc(peer->quantum_limit, sizeof(float));
+	if ((peer->empty = calloc(peer->quantum_limit, sizeof(float))) == NULL)
+		goto error_errno;
 
-	peer->midi_size = peer->params.period_size * sizeof(float) *
-		SPA_MAX(peer->params.send_midi_channels, peer->params.recv_midi_channels);
-	peer->midi_data = calloc(1, peer->midi_size);
+	max_midi_ch = SPA_MAX(peer->params.send_midi_channels, peer->params.recv_midi_channels);
+	if (max_midi_ch > MAX_CHANNELS ||
+	    spa_overflow_mul(peer->params.period_size, (uint32_t)sizeof(float), &peer->midi_size) ||
+	    spa_overflow_mul(peer->midi_size, max_midi_ch, &peer->midi_size)) {
+		errno = EINVAL;
+		goto error_errno;
+	}
+	if ((peer->midi_data = calloc(1, peer->midi_size)) == NULL && peer->midi_size > 0)
+		goto error_errno;
+
+	max_audio_ch = SPA_MAX(peer->params.send_audio_channels, peer->params.recv_audio_channels);
+	if (max_audio_ch > MAX_CHANNELS) {
+		errno = EINVAL;
+		goto error_errno;
+	}
 
 	if (peer->params.sample_encoder == NJ2_ENCODER_INT) {
-		peer->max_encoded_size = peer->params.period_size * sizeof(int16_t);
-		peer->encoded_size = peer->max_encoded_size *
-			SPA_MAX(peer->params.send_audio_channels, peer->params.recv_audio_channels);
+		if (spa_overflow_mul(peer->params.period_size, (uint32_t)sizeof(int16_t), &peer->max_encoded_size) ||
+		    spa_overflow_mul(peer->max_encoded_size, max_audio_ch, &peer->encoded_size)) {
+			errno = EINVAL;
+			goto error_errno;
+		}
 		if ((peer->encoded_data = calloc(1, peer->encoded_size)) == NULL)
 			goto error_errno;
 	} else if (peer->params.sample_encoder == NJ2_ENCODER_OPUS) {
 #ifdef HAVE_OPUS_CUSTOM
 		int32_t i;
-		peer->max_encoded_size = (peer->params.kbps * peer->params.period_size * 1024) /
+		if (peer->params.sample_rate == 0) {
+			errno = EINVAL;
+			goto error_errno;
+		}
+		peer->max_encoded_size = ((uint64_t)peer->params.kbps * peer->params.period_size * 1024) /
 			(peer->params.sample_rate * 8) + sizeof(uint16_t);
-		peer->encoded_size = peer->max_encoded_size *
-			SPA_MAX(peer->params.send_audio_channels, peer->params.recv_audio_channels);
+		if (spa_overflow_mul(peer->max_encoded_size, max_audio_ch, &peer->encoded_size)) {
+			errno = EINVAL;
+			goto error_errno;
+		}
 		if ((peer->encoded_data = calloc(1, peer->encoded_size)) == NULL)
 			goto error_errno;
 		if ((peer->opus_config = opus_custom_mode_create(peer->params.sample_rate,
@@ -775,9 +798,8 @@ static int netjack2_recv_midi(struct netjack2_peer *peer, struct nj2_packet_head
 	peer->sync.num_packets = ntohl(header->num_packets);
 	max_size = peer->params.mtu - sizeof(*header);
 
-	if (sub_cycle > 0 && max_size > UINT32_MAX / sub_cycle)
+	if (spa_overflow_mul(max_size, sub_cycle, &offset))
 		return -EOVERFLOW;
-	offset = max_size * sub_cycle;
 
 	data += sizeof(*header);
 	len -= sizeof(*header);

@@ -2,6 +2,7 @@
 /* SPDX-FileCopyrightText: Copyright © 2025 Alexandre Malki <alexandre.malki@kebag-logic.com> */
 /* SPDX-License-Identifier: MIT */
 
+#include <errno.h>
 #include <limits.h>
 #include <stdbool.h>
 #include <inttypes.h>
@@ -73,6 +74,9 @@ static int send_unsol_name(struct aecp *aecp,
 	uint8_t unsol_buf[512];
 	struct aecp_aem_base_info info = { 0 };
 
+	if (len < 0 || (size_t)len > sizeof(unsol_buf))
+		return -EINVAL;
+
 	memcpy(unsol_buf, msg, len);
 	info.controller_entity_id = htobe64(p->aecp.controller_guid);
 	info.expire_timeout = INT64_MAX;
@@ -98,6 +102,12 @@ int handle_cmd_get_name_common(struct aecp *aecp, int64_t now,
 	struct descriptor *desc;
 	uint16_t desc_type, desc_id, name_index;
 	char *name_ptr;
+	size_t reply_len;
+
+	if (len < 0 || (size_t)len > sizeof(buf) ||
+	    (size_t)len < sizeof(*h) + sizeof(*p) + sizeof(*cmd))
+		return reply_status(aecp,
+				AVB_AECP_AEM_STATUS_BAD_ARGUMENTS, m, len);
 
 	cmd = (const struct avb_packet_aecp_aem_setget_name *)p->payload;
 	desc_type = ntohs(cmd->descriptor_type);
@@ -114,7 +124,9 @@ int handle_cmd_get_name_common(struct aecp *aecp, int64_t now,
 		return reply_status(aecp,
 				AVB_AECP_AEM_STATUS_BAD_ARGUMENTS, m, len);
 
-	memcpy(buf, m, len);
+	reply_len = sizeof(*h) + sizeof(*p) + sizeof(*cmd);
+
+	memcpy(buf, m, reply_len);
 	h_reply = (struct avb_ethernet_header *)buf;
 	p_reply = SPA_PTROFF(h_reply, sizeof(*h_reply), void);
 	reply = (struct avb_packet_aecp_aem_setget_name *)p_reply->payload;
@@ -126,7 +138,7 @@ int handle_cmd_get_name_common(struct aecp *aecp, int64_t now,
 	 */
 	memcpy(reply->name, name_ptr, 64);
 
-	return reply_success(aecp, buf, len);
+	return reply_success(aecp, buf, reply_len);
 }
 
 
@@ -159,6 +171,10 @@ int handle_cmd_set_name_common(struct aecp *aecp, int64_t now,
 
 	name_ptr = get_name_ptr(desc_type, desc->ptr, name_index);
 	if (name_ptr == NULL)
+		return reply_status(aecp,
+				AVB_AECP_AEM_STATUS_BAD_ARGUMENTS, m, len);
+
+	if (len < 0 || (size_t)len < sizeof(*h) + sizeof(*p) + sizeof(*cmd))
 		return reply_status(aecp,
 				AVB_AECP_AEM_STATUS_BAD_ARGUMENTS, m, len);
 
