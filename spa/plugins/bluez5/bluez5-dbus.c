@@ -1035,13 +1035,14 @@ static int parse_endpoint_props(struct spa_bt_monitor *monitor, DBusMessageIter 
 			dbus_message_iter_recurse(&it[1], &it[2]);
 			dbus_message_iter_get_fixed_array(&it[2], &data, &n);
 
-			if (n) {
+			if (n > 0) {
 				buf = malloc(n);
 				if (!buf)
 					return -ENOMEM;
 				memcpy(buf, data, n);
 			} else {
 				buf = NULL;
+				n = 0;
 			}
 
 			free(*dest);
@@ -3834,16 +3835,16 @@ static int transport_update_props(struct spa_bt_transport *transport,
 			dbus_message_iter_recurse(&it[1], &iter);
 			dbus_message_iter_get_fixed_array(&iter, &value, &len);
 
-			spa_log_debug(monitor->log, "transport %p: %s=%d", transport, key, len);
-			spa_debug_log_mem(monitor->log, SPA_LOG_LEVEL_DEBUG, 2, value, (size_t)len);
-
 			free(transport->configuration);
 			transport->configuration_len = 0;
 
-			if (!len) {
+			if (len <= 0) {
 				transport->configuration = NULL;
 				goto next;
 			}
+
+			spa_log_debug(monitor->log, "transport %p: %s=%d", transport, key, len);
+			spa_debug_log_mem(monitor->log, SPA_LOG_LEVEL_DEBUG, 2, value, (size_t)len);
 
 			transport->configuration = malloc(len);
 			if (transport->configuration) {
@@ -6215,7 +6216,8 @@ static void configure_bis(struct spa_bt_monitor *monitor,
 
 	/* Configure each BIS from a BIG */
 	spa_list_for_each(metadata_entry, &bis->metadata_list, link) {
-		if ((metadata_size + metadata_entry->length + 1) > METADATA_MAX_LEN) {
+		if (metadata_entry->length < 1 ||
+		    (metadata_size + metadata_entry->length + 1) > METADATA_MAX_LEN) {
 			spa_log_warn(monitor->log, "Metadata configured for the BIS exceeds the maximum metadata size");
 			return;
 		}
@@ -7117,9 +7119,9 @@ static void parse_broadcast_source_config(struct spa_bt_monitor *monitor, const 
 			if (spa_streq(key, "broadcast_code")) {
 				if (spa_json_get_string(&it[0], bcode, sizeof(bcode)) <= 0)
 						goto parse_failed;
-				if (strlen(bcode) > BROADCAST_CODE_LEN)
+				if (strlen(bcode) >= BROADCAST_CODE_LEN)
 					goto parse_failed;
-				memcpy(big_entry->broadcast_code, bcode, strlen(bcode));
+				memcpy(big_entry->broadcast_code, bcode, strlen(bcode) + 1);
 				spa_log_debug(monitor->log, "big_entry->broadcast_code %s", big_entry->broadcast_code);
 			} else if (spa_streq(key, "adapter")) {
 				if (spa_json_get_string(&it[0], big_entry->adapter, sizeof(big_entry->adapter)) <= 0)

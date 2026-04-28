@@ -62,7 +62,11 @@ int handle_cmd_get_stream_format_milan_v12(struct aecp *aecp, int64_t now,
 		return reply_status(aecp,
 				AVB_AECP_AEM_STATUS_BAD_ARGUMENTS, m, len);
 
-	stream_desc = (struct avb_aem_desc_stream *)desc->ptr;
+	stream_desc = (struct avb_aem_desc_stream *)descriptor_body(desc);
+
+	if (len < 0 || (size_t)len > sizeof(buf))
+		return reply_status(aecp,
+				AVB_AECP_AEM_STATUS_BAD_ARGUMENTS, m, len);
 
 	memcpy(buf, m, len);
 	h_reply = (struct avb_ethernet_header *)buf;
@@ -96,7 +100,6 @@ int handle_cmd_set_stream_format_milan_v12(struct aecp *aecp, int64_t now,
 	int i;
 	int rc;
 	bool found = false;
-	void *stream;
 
 	set_cmd = (const struct avb_packet_aecp_aem_setget_stream_format *)p->payload;
 	desc_type = ntohs(set_cmd->descriptor_type);
@@ -109,22 +112,15 @@ int handle_cmd_set_stream_format_milan_v12(struct aecp *aecp, int64_t now,
 				AVB_AECP_AEM_STATUS_NO_SUCH_DESCRIPTOR, m, len);
 
 	if (desc_type == AVB_AEM_DESC_STREAM_INPUT) {
-		struct aecp_aem_stream_input_state *state =
-			(struct aecp_aem_stream_input_state *)desc->ptr;
-		stream = &state->stream;
 		// TODO check if the stream is bound
 	} else if (desc_type == AVB_AEM_DESC_STREAM_OUTPUT) {
-		struct aecp_aem_stream_output_state *state =
-			(struct aecp_aem_stream_output_state *)desc->ptr;
-		stream = &state->stream;
 		// TODO check if the stream is STREAM_RUNNING
 	} else {
 		return reply_status(aecp,
 				AVB_AECP_AEM_STATUS_BAD_ARGUMENTS, m, len);
 	}
 
-	(void)stream;
-	stream_desc = (struct avb_aem_desc_stream *)desc->ptr;
+	stream_desc = (struct avb_aem_desc_stream *)descriptor_body(desc);
 	for (i = 0; i < ntohs(stream_desc->number_of_formats); i++) {
 		if (stream_desc->stream_formats[i] == new_format) {
 			found = true;
@@ -132,6 +128,10 @@ int handle_cmd_set_stream_format_milan_v12(struct aecp *aecp, int64_t now,
 		}
 	}
 
+
+	if (len < 0 || (size_t)len > sizeof(buf))
+		return reply_status(aecp,
+				AVB_AECP_AEM_STATUS_BAD_ARGUMENTS, m, len);
 
 	memcpy(buf, m, len);
 	h_reply = (struct avb_ethernet_header *)buf;
@@ -146,6 +146,15 @@ int handle_cmd_set_stream_format_milan_v12(struct aecp *aecp, int64_t now,
 	}
 
 	stream_desc->current_format = new_format;
+
+	if (desc_type == AVB_AEM_DESC_STREAM_INPUT) {
+		struct aecp_aem_stream_input_state *si = desc->ptr;
+		si->common.stream.format = new_format;
+	} else {
+		struct aecp_aem_stream_output_state *so = desc->ptr;
+		so->common.stream.format = new_format;
+	}
+
 	rc = reply_success(aecp, buf, len);
 	if (rc < 0)
 		return rc;

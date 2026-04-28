@@ -14,6 +14,7 @@
 #include <pipewire/log.h>
 
 #include "../aecp.h"
+#include "../aecp-aem.h"
 
 static inline int reply_status(struct aecp *aecp, int status, const void *m, int len)
 {
@@ -50,6 +51,10 @@ static inline int direct_reply_entiy_locked(struct aecp *aecp, int64_t now,
 	return reply_entity_locked(aecp, m, len);
 }
 
+/* IEEE 1722.1-2021 Section 9.2.1.1.5: non-success AEM responses keep the success
+ * response's payload format; only the status field changes. Echo the inbound
+ * command back with status=NOT_IMPLEMENTED so the response payload size
+ * matches what the controller validates against. */
 static inline int reply_not_implemented(struct aecp *aecp, const void *m, int len)
 {
 	pw_log_warn("reply not implementing");

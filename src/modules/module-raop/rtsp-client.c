@@ -253,8 +253,8 @@ static int process_status(struct pw_rtsp_client *client, char *buf)
 	if (s == NULL)
 		return -EPROTO;
 
-	client->status = atoi(s);
-	if (client->status == 0)
+	client->status = strtol(s, NULL, 10);
+	if (client->status < 100 || client->status > 599)
 		return -EPROTO;
 
 	s = pw_split_walk(buf, " ", &len, &state);
@@ -319,9 +319,14 @@ static int process_header(struct pw_rtsp_client *client, char *buf)
 	else {
 		const struct spa_dict_item *it;
 		spa_dict_for_each(it, &client->headers->dict)
-			pw_log_info(" %s: %s", it->key, it->value);
+			pw_log_debug(" %s: %s", it->key, it->value);
 
 		client->content_length = pw_properties_get_uint32(client->headers, "Content-Length", 0);
+		if (client->content_length > 64 * 1024) {
+			pw_log_error("Content-Length %zu exceeds maximum",
+					client->content_length);
+			return -EOVERFLOW;
+		}
 		if (client->content_length > 0)
 			client->recv_state = CLIENT_RECV_CONTENT;
 		else
@@ -351,6 +356,8 @@ static int process_content(struct pw_rtsp_client *client)
 		}
 
 		void *p = pw_array_add(&client->content, res);
+		if (p == NULL)
+			return -ENOMEM;
 		memcpy(p, buf, res);
 
 		spa_assert((size_t) res <= client->content_length);
@@ -411,7 +418,7 @@ static int flush_output(struct pw_rtsp_client *client)
 			data = SPA_PTROFF(msg->data, msg->offset, void);
 			size = msg->len - msg->offset;
 		} else {
-			pw_log_info("sent: %s", (char *)msg->data);
+			pw_log_debug("sent: %s", (char *)msg->data);
 			spa_list_remove(&msg->link);
 			if (msg->reply != NULL)
 				spa_list_append(&client->pending, &msg->link);

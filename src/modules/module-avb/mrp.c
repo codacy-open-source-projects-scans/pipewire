@@ -55,6 +55,10 @@ struct mrp {
 	uint64_t periodic_timeout;
 	struct fsm_leave_all_timer lva_timer;
 	uint64_t join_timeout;
+
+	/* IEEE 802.1Q-2014 Section 10.7.6.3 lva bit: true while the next outgoing
+	 * vector header must carry lva=1 (local LeaveAll being transmitted). */
+	bool lva_tx_pending;
 };
 
 static void mrp_destroy(void *data)
@@ -107,6 +111,7 @@ static void mrp_periodic(void *data, uint64_t now)
 		/* 802.1Q-2014 Table 10-5 */
 		mrp->lva_timer.state = FSM_LVA_ACTIVE;
 		if (mrp->lva_timer.leave_all_timeout > 0) {
+			mrp->lva_tx_pending = true;
 			global_event(mrp, now, AVB_MRP_EVENT_RX_LVA);
 			leave_all = true;
 		}
@@ -118,6 +123,7 @@ static void mrp_periodic(void *data, uint64_t now)
 			global_event(mrp, now, event);
 		}
 		mrp->join_timeout = now + MRP_JOINTIMER_MS * SPA_NSEC_PER_MSEC;
+		mrp->lva_tx_pending = false;
 	}
 
 	spa_list_for_each(a, &mrp->attributes, link) {
@@ -139,10 +145,16 @@ static const struct server_events server_events = {
 int avb_mrp_parse_packet(struct avb_mrp *mrp, uint64_t now, const void *pkt, int len,
 		const struct avb_mrp_parse_info *info, void *data)
 {
-	uint8_t *e = SPA_PTROFF(pkt, len, uint8_t);
-	uint8_t *m = SPA_PTROFF(pkt, sizeof(struct avb_packet_mrp), uint8_t);
+	uint8_t *e, *m;
 
-	while (m < e && (m[0] != 0 || m[1] != 0)) {
+	if (len < 0 || (size_t)len < sizeof(struct avb_packet_mrp))
+		return -EPROTO;
+
+	e = SPA_PTROFF(pkt, len, uint8_t);
+	m = SPA_PTROFF(pkt, sizeof(struct avb_packet_mrp), uint8_t);
+
+	while (m + sizeof(struct avb_packet_mrp_hdr) <= e &&
+	       (m[0] != 0 || m[1] != 0)) {
 		const struct avb_packet_mrp_hdr *hdr = (const struct avb_packet_mrp_hdr*)m;
 		uint8_t attr_type = hdr->attribute_type;
 		uint8_t attr_len = hdr->attribute_length;
@@ -152,9 +164,12 @@ int avb_mrp_parse_packet(struct avb_mrp *mrp, uint64_t now, const void *pkt, int
 		if (!info->check_header(data, hdr, &hdr_size, &has_param))
 			return -EINVAL;
 
+		if (hdr_size > (size_t)(e - m))
+			return -EPROTO;
 		m += hdr_size;
 
-		while (m < e && (m[0] != 0 || m[1] != 0)) {
+		while (m + sizeof(struct avb_packet_mrp_vector) <= e &&
+		       (m[0] != 0 || m[1] != 0)) {
 			const struct avb_packet_mrp_vector *v =
 				(const struct avb_packet_mrp_vector*)m;
 			uint16_t i, num_values = AVB_MRP_VECTOR_GET_NUM_VALUES(v);
@@ -352,6 +367,18 @@ void avb_mrp_attribute_add_listener(struct avb_mrp_attribute *attr, struct spa_h
 	spa_hook_list_append(&a->listener_list, listener, events, data);
 }
 
+uint8_t avb_mrp_attribute_get_applicant_state(const struct avb_mrp_attribute *attr)
+{
+	const struct attribute *a = SPA_CONTAINER_OF(attr, const struct attribute, attr);
+	return a->applicant_state;
+}
+
+uint8_t avb_mrp_attribute_get_registrar_state(const struct avb_mrp_attribute *attr)
+{
+	const struct attribute *a = SPA_CONTAINER_OF(attr, const struct attribute, attr);
+	return a->registrar_state;
+}
+
 void avb_mrp_attribute_update_state(struct avb_mrp_attribute *attr, uint64_t now,
 		int event)
 {
@@ -391,7 +418,10 @@ void avb_mrp_attribute_update_state(struct avb_mrp_attribute *attr, uint64_t now
 		}
 		state = AVB_MRP_IN;
 		break;
+	/* IEEE 802.1Q-2014 Table 10-4: RX_IN transitions registrar to IN
+	 * the same way as RX_JOININ. */
 	case AVB_MRP_EVENT_RX_JOININ:
+	case AVB_MRP_EVENT_RX_IN:
 	case AVB_MRP_EVENT_RX_JOINMT:
 		switch (state) {
 		case AVB_MRP_LV:
@@ -439,10 +469,10 @@ void avb_mrp_attribute_update_state(struct avb_mrp_attribute *attr, uint64_t now
 	}
 
 	if (a->registrar_state != state || notify) {
-		pw_log_debug("REG: attr %p: %s %s %s -> %s %s notify? %s", a, a->attr.name,
+		pw_log_debug("REG: attr %p: %s %s %s -> %s notify=%s", a, a->attr.name,
 			avb_mrp_event_name(event), avb_registrar_state_name(a->registrar_state),
-			avb_registrar_state_name(state), avb_mrp_send_name(notify),
-			notify ? "YES":"NO");
+			avb_registrar_state_name(state),
+			notify ? avb_mrp_notify_name(notify) : "none");
 		a->registrar_state = state;
 	}
 
@@ -713,6 +743,11 @@ void avb_mrp_attribute_leave(struct avb_mrp_attribute *attr, uint64_t now)
 	struct attribute *a = SPA_CONTAINER_OF(attr, struct attribute, attr);
 	avb_mrp_attribute_update_state(attr, now, AVB_MRP_EVENT_LV);
 	a->joined = false;
+}
+
+bool avb_mrp_lva_tx_pending(const struct avb_mrp *m)
+{
+	return ((const struct mrp *)m)->lva_tx_pending;
 }
 
 void avb_mrp_destroy(struct avb_mrp *mrp)

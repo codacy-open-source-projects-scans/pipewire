@@ -11,6 +11,7 @@
 
 #include "aecp.h"
 #include "aecp-aem.h"
+#include "aecp-vendor-unique-milan-v12.h"
 #include "internal.h"
 
 static const uint8_t mac[6] = AVB_BROADCAST_MAC;
@@ -37,6 +38,24 @@ static int reply_not_implemented(struct aecp *aecp, const void *p, int len)
 	return avb_server_send_packet(server, h->src, AVB_TSN_ETH, buf, len);
 }
 
+/* Milan v1.2 Section 5.4.3 / Section 5.4.4 VENDOR_UNIQUE_COMMAND dispatcher. */
+static int handle_vendor_unique_command(struct aecp *aecp,
+		const void *m, int len)
+{
+	struct server *server = aecp->server;
+	int rc;
+
+	if (server->avb_mode != AVB_MODE_MILAN_V12)
+		return reply_not_implemented(aecp, m, len);
+
+	rc = aecp_vendor_unique_milan_v12_handle_command(aecp, m, len);
+	if (rc < 0)
+		return rc;
+	if (rc == 0)
+		return reply_not_implemented(aecp, m, len);
+	return 0;
+}
+
 static const struct msg_info msg_info[] = {
 	{ AVB_AECP_MESSAGE_TYPE_AEM_COMMAND, "aem-command", avb_aecp_aem_handle_command, },
 	{ AVB_AECP_MESSAGE_TYPE_AEM_RESPONSE, "aem-response", avb_aecp_aem_handle_response, },
@@ -44,7 +63,7 @@ static const struct msg_info msg_info[] = {
 	{ AVB_AECP_MESSAGE_TYPE_ADDRESS_ACCESS_RESPONSE, "address-access-response", NULL, },
 	{ AVB_AECP_MESSAGE_TYPE_AVC_COMMAND, "avc-command", NULL, },
 	{ AVB_AECP_MESSAGE_TYPE_AVC_RESPONSE, "avc-response", NULL, },
-	{ AVB_AECP_MESSAGE_TYPE_VENDOR_UNIQUE_COMMAND, "vendor-unique-command", NULL, },
+	{ AVB_AECP_MESSAGE_TYPE_VENDOR_UNIQUE_COMMAND, "vendor-unique-command", handle_vendor_unique_command, },
 	{ AVB_AECP_MESSAGE_TYPE_VENDOR_UNIQUE_RESPONSE, "vendor-unique-response", NULL, },
 	{ AVB_AECP_MESSAGE_TYPE_EXTENDED_COMMAND, "extended-command", NULL, },
 	{ AVB_AECP_MESSAGE_TYPE_EXTENDED_RESPONSE, "extended-response", NULL, },

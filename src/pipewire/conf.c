@@ -25,6 +25,7 @@
 #endif
 
 #include <spa/utils/cleanup.h>
+#include <spa/utils/overflow.h>
 #include <spa/utils/result.h>
 #include <spa/utils/string.h>
 #include <spa/utils/json.h>
@@ -359,6 +360,8 @@ int pw_conf_save_state(const char *prefix, const char *name, const struct pw_pro
 		return sfd;
 
 	size_t tmp_name_size = strlen(name) + 5;
+	if (tmp_name_size > PATH_MAX)
+		return -EINVAL;
 	tmp_name = alloca(tmp_name_size);
 	snprintf(tmp_name, tmp_name_size, "%s.tmp", name);
 	if ((fd = openat(sfd, tmp_name,  O_CLOEXEC | O_CREAT | O_WRONLY | O_TRUNC, 0600)) < 0) {
@@ -927,8 +930,10 @@ static char **pw_strv_insert_at(char **strv, int len, int pos, const char *str)
 	if (pos < 0 || pos > len)
 		pos = len;
 
-	n = realloc(strv, sizeof(char*) * (len + 2));
-	if (n == NULL) {
+	size_t alloc_size;
+	if (spa_overflow_add((size_t)len, (size_t)2, &alloc_size) ||
+	    spa_overflow_mul(alloc_size, sizeof(char*), &alloc_size) ||
+	    (n = realloc(strv, alloc_size)) == NULL) {
 		pw_free_strv(strv);
 		return NULL;
 	}

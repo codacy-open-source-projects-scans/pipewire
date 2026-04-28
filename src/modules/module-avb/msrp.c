@@ -12,11 +12,15 @@
 
 #include "utils.h"
 #include "msrp.h"
+#include "acmp.h"
+#include "stream.h"
+#include "aecp-aem.h"
+#include "aecp-aem-state.h"
 
 static const uint8_t msrp_mac[6] = AVB_MSRP_MAC;
 
 struct attr {
-	struct avb_msrp_attribute attr;
+	struct avb_msrp_attribute *attr;
 	struct msrp *msrp;
 	struct spa_hook listener;
 	struct spa_list link;
@@ -51,10 +55,57 @@ static void debug_msrp_talker(const struct avb_packet_msrp_talker *t)
 	debug_msrp_talker_common(t);
 }
 
+/* IEEE 802.1Q Section 35.2.2.4.4: Listener may declare Ready only once the matching
+ * Talker Advertise is registered; otherwise it stays in AskingFailed. */
 static void notify_talker(struct msrp *msrp, uint64_t now, struct attr *attr, uint8_t notify)
 {
-	pw_log_info("> notify talker: %s", avb_mrp_notify_name(notify));
-	debug_msrp_talker(&attr->attr.attr.talker);
+	struct stream_common *sc;
+	char label[64];
+
+	pw_log_info("> notify talker advertise: %s", avb_mrp_notify_name(notify));
+	snprintf(label, sizeof(label), "MSRP talker-adv %s", avb_mrp_notify_name(notify));
+	avb_log_state(msrp->server, label);
+	if (msrp->server->avb_mode == AVB_MODE_MILAN_V12) {
+		uint64_t stream_id = be64toh(attr->attr->attr.talker.stream_id);
+		if (notify == AVB_MRP_NOTIFY_NEW || notify == AVB_MRP_NOTIFY_JOIN)
+			handle_evt_tk_discovered(msrp->server->acmp, stream_id, now);
+		else if (notify == AVB_MRP_NOTIFY_LEAVE)
+			handle_evt_tk_departed(msrp->server->acmp, stream_id, now);
+	}
+
+	sc = SPA_CONTAINER_OF(attr->attr, struct stream_common, tastream_attr);
+	if (sc->stream.direction == SPA_DIRECTION_INPUT) {
+		if (notify == AVB_MRP_NOTIFY_NEW || notify == AVB_MRP_NOTIFY_JOIN)
+			sc->lstream_attr.param = AVB_MSRP_LISTENER_PARAM_READY;
+		else if (notify == AVB_MRP_NOTIFY_LEAVE)
+			sc->lstream_attr.param = AVB_MSRP_LISTENER_PARAM_ASKING_FAILED;
+		/* Milan Table 5.10: TA registrar state flips flags_ex.REGISTERING
+		 * in the listener-side GET_STREAM_INFO answer — emit an unsol. */
+		avb_aecp_aem_mark_stream_info_dirty(msrp->server,
+				AVB_AEM_DESC_STREAM_INPUT, sc->stream.index);
+	}
+}
+
+static void notify_talker_failed(struct msrp *msrp, uint64_t now, struct attr *attr, uint8_t notify)
+{
+	struct stream_common *sc;
+	char label[64];
+
+	pw_log_info("> notify talker failed: %s", avb_mrp_notify_name(notify));
+	snprintf(label, sizeof(label), "MSRP talker-fail %s", avb_mrp_notify_name(notify));
+	avb_log_state(msrp->server, label);
+
+	if (msrp->server->avb_mode == AVB_MODE_MILAN_V12) {
+		if (notify == AVB_MRP_NOTIFY_NEW || notify == AVB_MRP_NOTIFY_JOIN)
+			handle_evt_tk_registration_failed(msrp->server->acmp, attr->attr, now);
+	}
+
+	/* Milan Table 5.10: TF registrar state also flips flags_ex.REGISTERING
+	 * on the listener side; emit an unsol when it changes. */
+	sc = SPA_CONTAINER_OF(attr->attr, struct stream_common, tfstream_attr);
+	if (sc->stream.direction == SPA_DIRECTION_INPUT)
+		avb_aecp_aem_mark_stream_info_dirty(msrp->server,
+				AVB_AEM_DESC_STREAM_INPUT, sc->stream.index);
 }
 
 static int process_talker(struct msrp *msrp, uint64_t now, uint8_t attr_type,
@@ -62,12 +113,17 @@ static int process_talker(struct msrp *msrp, uint64_t now, uint8_t attr_type,
 {
 	const struct avb_packet_msrp_talker *t = m;
 	struct attr *a;
-	spa_list_for_each(a, &msrp->attributes, link)
-		if (a->attr.type == attr_type &&
-		    a->attr.attr.talker.stream_id == t->stream_id) {
-			a->attr.attr.talker = *t;
-			avb_mrp_attribute_rx_event(a->attr.mrp, now, event);
+
+	debug_msrp_talker(t);
+
+	spa_list_for_each(a, &msrp->attributes, link) {
+		if (a->attr->type == attr_type &&
+		    a->attr->attr.talker.stream_id == t->stream_id) {
+			a->attr->attr.talker = *t;
+			avb_mrp_attribute_rx_event(a->attr->mrp, now, event);
 		}
+	}
+
 	return 0;
 }
 static int encode_talker(struct msrp *msrp, struct attr *a, void *m)
@@ -84,14 +140,14 @@ static int encode_talker(struct msrp *msrp, struct attr *a, void *m)
 	msg->attribute_list_length = htons(attr_list_length);
 
 	v = (struct avb_packet_mrp_vector *)msg->attribute_list;
-	v->lva = 0;
+	v->lva = avb_mrp_lva_tx_pending(msrp->server->mrp) ? 1 : 0;
 	AVB_MRP_VECTOR_SET_NUM_VALUES(v, 1);
 
 	t = (struct avb_packet_msrp_talker *)v->first_value;
-	*t = a->attr.attr.talker;
+	*t = a->attr->attr.talker;
 
 	ev = SPA_PTROFF(t, sizeof(*t), uint8_t);
-	*ev = (a->attr.mrp->pending_send - 1) * 6 * 6;
+	*ev = (a->attr->mrp->pending_send - 1) * 6 * 6;
 
 	f = SPA_PTROFF(ev, sizeof(*ev), struct avb_packet_mrp_footer);
 	f->end_mark = 0;
@@ -118,9 +174,9 @@ static int process_talker_fail(struct msrp *msrp, uint64_t now, uint8_t attr_typ
 	debug_msrp_talker_fail(t);
 
 	spa_list_for_each(a, &msrp->attributes, link)
-		if (a->attr.type == attr_type &&
-		    a->attr.attr.talker_fail.talker.stream_id == t->talker.stream_id)
-			avb_mrp_attribute_rx_event(a->attr.mrp, now, event);
+		if (a->attr->type == attr_type &&
+		    a->attr->attr.talker_fail.talker.stream_id == t->talker.stream_id)
+			avb_mrp_attribute_rx_event(a->attr->mrp, now, event);
 	return 0;
 }
 
@@ -134,19 +190,75 @@ static void debug_msrp_listener(const struct avb_packet_msrp_listener *l, uint8_
 
 static void notify_listener(struct msrp *msrp, uint64_t now, struct attr *attr, uint8_t notify)
 {
+	struct stream_common *sc;
+	struct stream *s;
+	char label[64];
+
 	pw_log_info("> notify listener: %s", avb_mrp_notify_name(notify));
-	debug_msrp_listener(&attr->attr.attr.listener, attr->attr.param);
+	debug_msrp_listener(&attr->attr->attr.listener, attr->attr->param);
+	snprintf(label, sizeof(label), "MSRP listener %s", avb_mrp_notify_name(notify));
+	avb_log_state(msrp->server, label);
+
+	if (msrp->server->avb_mode != AVB_MODE_MILAN_V12)
+		return;
+
+	 /* Milan Section 4.3.3.1 second condition: a Listener attribute
+	 * matching the Stream Output's stream_id is registered. */
+	sc = SPA_CONTAINER_OF(attr->attr, struct stream_common, lstream_attr);
+	s = &sc->stream;
+
+	if (s->direction == SPA_DIRECTION_INPUT) {
+		if (notify == AVB_MRP_NOTIFY_NEW || notify == AVB_MRP_NOTIFY_JOIN)
+			handle_evt_tk_registered(msrp->server->acmp, attr->attr, now);
+		else if (notify == AVB_MRP_NOTIFY_LEAVE)
+			handle_evt_tk_unregistered(msrp->server->acmp, attr->attr, now);
+	} else {
+		struct aecp_aem_stream_output_state *stream_out =
+			SPA_CONTAINER_OF(sc, struct aecp_aem_stream_output_state, common);
+		bool prev = stream_out->listener_observed;
+
+		if (notify == AVB_MRP_NOTIFY_NEW || notify == AVB_MRP_NOTIFY_JOIN)
+			stream_out->listener_observed = true;
+		else if (notify == AVB_MRP_NOTIFY_LEAVE)
+			stream_out->listener_observed = false;
+
+		if (prev != stream_out->listener_observed) {
+			/* listener_observed flips flags_ex.REGISTERING in the
+			 * GET_STREAM_INFO answer (Milan Table 5.12). Hint AECP
+			 * to re-emit so controllers see the update. */
+			avb_aecp_aem_mark_stream_info_dirty(msrp->server,
+					AVB_AEM_DESC_STREAM_OUTPUT, s->index);
+
+			/* Milan Section 4.3.3.1: a foreign Listener registration is the
+			 * "matching declaration" condition for starting AVTP TX.
+			 * Activate the data plane on false→true; tear it down on
+			 * true→false. The internal source/!source guards make the
+			 * calls idempotent against the listener_observed bit, so a
+			 * spurious flip won't double-start. */
+			if (stream_out->listener_observed) {
+				if (s->source == NULL)
+					stream_activate(s, s->index, now);
+			} else {
+				if (s->source != NULL)
+					stream_deactivate(s, now);
+			}
+		}
+	}
 }
 
+/* IEEE 802.1Q Section 35.2.2.4.4: capture the rx 4-pack Listener Declaration Type. */
 static int process_listener(struct msrp *msrp, uint64_t now, uint8_t attr_type,
 		const void *m, uint8_t event, uint8_t param, int num)
 {
 	const struct avb_packet_msrp_listener *l = m;
 	struct attr *a;
 	spa_list_for_each(a, &msrp->attributes, link)
-		if (a->attr.type == attr_type &&
-		    a->attr.attr.listener.stream_id == l->stream_id)
-			avb_mrp_attribute_rx_event(a->attr.mrp, now, event);
+		if (a->attr->type == attr_type &&
+		    a->attr->attr.listener.stream_id == l->stream_id) {
+			a->attr->attr.listener = *l;
+			a->attr->param = param;
+			avb_mrp_attribute_rx_event(a->attr->mrp, now, event);
+		}
 	return 0;
 }
 static int encode_listener(struct msrp *msrp, struct attr *a, void *m)
@@ -163,17 +275,17 @@ static int encode_listener(struct msrp *msrp, struct attr *a, void *m)
 	msg->attribute_list_length = htons(attr_list_length);
 
 	v = (struct avb_packet_mrp_vector *)msg->attribute_list;
-	v->lva = 0;
+	v->lva = avb_mrp_lva_tx_pending(msrp->server->mrp) ? 1 : 0;
 	AVB_MRP_VECTOR_SET_NUM_VALUES(v, 1);
 
 	l = (struct avb_packet_msrp_listener *)v->first_value;
-	*l = a->attr.attr.listener;
+	*l = a->attr->attr.listener;
 
 	ev = SPA_PTROFF(l, sizeof(*l), uint8_t);
-	*ev = (a->attr.mrp->pending_send - 1) * 6 * 6;
+	*ev = (a->attr->mrp->pending_send - 1) * 6 * 6;
 
 	ev = SPA_PTROFF(ev, sizeof(*ev), uint8_t);
-	*ev = a->attr.param * 4 * 4 * 4;
+	*ev = a->attr->param * 4 * 4 * 4;
 
 	f = SPA_PTROFF(ev, sizeof(*ev), struct avb_packet_mrp_footer);
 	f->end_mark = 0;
@@ -192,16 +304,41 @@ static void debug_msrp_domain(const struct avb_packet_msrp_domain *d)
 static void notify_domain(struct msrp *msrp, uint64_t now, struct attr *attr, uint8_t notify)
 {
 	pw_log_info("> notify domain: %s", avb_mrp_notify_name(notify));
-	debug_msrp_domain(&attr->attr.attr.domain);
+	debug_msrp_domain(&attr->attr->attr.domain);
 }
 
 static int process_domain(struct msrp *msrp, uint64_t now, uint8_t attr_type,
 		const void *m, uint8_t event, uint8_t param, int num)
 {
 	struct attr *a;
-	spa_list_for_each(a, &msrp->attributes, link)
-		if (a->attr.type == attr_type)
-			avb_mrp_attribute_rx_event(a->attr.mrp, now, event);
+	const struct avb_packet_msrp_domain *d = m;
+
+	spa_list_for_each(a, &msrp->attributes, link) {
+		if (a->attr->type != attr_type) {
+			continue;
+		}
+
+		if (msrp->server->avb_mode == AVB_MODE_MILAN_V12)
+		{
+			/** Milan V1.2 Section 4.2.7.2.1:
+			    The endstation shall re-adjust the domain according
+			    to the from the MSRPDU received on its interface */
+			bool mismatch = (a->attr->attr.domain.sr_class_id != d->sr_class_id
+				|| a->attr->attr.domain.sr_class_priority != d->sr_class_priority
+				|| a->attr->attr.domain.sr_class_vid  != d->sr_class_vid);
+
+			if (mismatch) {
+				pw_log_info("Domain mismatch re-adjusting");
+				a->attr->attr.domain = *d;
+				avb_mrp_attribute_leave(a->attr->mrp, now);
+				avb_mrp_attribute_begin(a->attr->mrp, now);
+				avb_mrp_attribute_join(a->attr->mrp, now, true);
+			}
+		}
+
+		avb_mrp_attribute_rx_event(a->attr->mrp, now, event);
+	}
+
 	return 0;
 }
 
@@ -219,14 +356,14 @@ static int encode_domain(struct msrp *msrp, struct attr *a, void *m)
 	msg->attribute_list_length = htons(attr_list_length);
 
 	v = (struct avb_packet_mrp_vector *)msg->attribute_list;
-	v->lva = 0;
+	v->lva = avb_mrp_lva_tx_pending(msrp->server->mrp) ? 1 : 0;
 	AVB_MRP_VECTOR_SET_NUM_VALUES(v, 1);
 
 	d = (struct avb_packet_msrp_domain *)v->first_value;
-	*d = a->attr.attr.domain;
+	*d = a->attr->attr.domain;
 
 	ev = SPA_PTROFF(d, sizeof(*d), uint8_t);
-	*ev = (a->attr.mrp->pending_send - 1) * 36;
+	*ev = (a->attr->mrp->pending_send - 1) * 36;
 
 	f = SPA_PTROFF(ev, sizeof(*ev), struct avb_packet_mrp_footer);
 	f->end_mark = 0;
@@ -242,7 +379,7 @@ static const struct {
 	void (*notify) (struct msrp *msrp, uint64_t now, struct attr *attr, uint8_t notify);
 } dispatch[] = {
 	[AVB_MSRP_ATTRIBUTE_TYPE_TALKER_ADVERTISE] = { "talker", process_talker, encode_talker, notify_talker, },
-	[AVB_MSRP_ATTRIBUTE_TYPE_TALKER_FAILED] = { "talker-fail", process_talker_fail, NULL, NULL },
+	[AVB_MSRP_ATTRIBUTE_TYPE_TALKER_FAILED] = { "talker-fail", process_talker_fail, NULL, notify_talker_failed, },
 	[AVB_MSRP_ATTRIBUTE_TYPE_LISTENER] = { "listener", process_listener, encode_listener, notify_listener },
 	[AVB_MSRP_ATTRIBUTE_TYPE_DOMAIN] = { "domain", process_domain, encode_domain, notify_domain, },
 };
@@ -265,8 +402,8 @@ static int msrp_attr_event(void *data, uint64_t now, uint8_t attribute_type, uin
 	struct msrp *msrp = data;
 	struct attr *a;
 	spa_list_for_each(a, &msrp->attributes, link)
-		if (a->attr.type == attribute_type)
-			avb_mrp_attribute_update_state(a->attr.mrp, now, event);
+		if (a->attr->type == attribute_type)
+			avb_mrp_attribute_update_state(a->attr->mrp, now, event);
 	return 0;
 }
 
@@ -332,8 +469,9 @@ static void msrp_notify(void *data, uint64_t now, uint8_t notify)
 {
 	struct attr *a = data;
 	struct msrp *msrp = a->msrp;
-	if (dispatch[a->attr.type].notify)
-		dispatch[a->attr.type].notify(msrp, now, a, notify);
+
+	if (dispatch[a->attr->type].notify)
+		dispatch[a->attr->type].notify(msrp, now, a, notify);
 }
 
 static const struct avb_mrp_attribute_events mrp_attr_events = {
@@ -341,7 +479,7 @@ static const struct avb_mrp_attribute_events mrp_attr_events = {
 	.notify = msrp_notify,
 };
 
-struct avb_msrp_attribute *avb_msrp_attribute_new(struct avb_msrp *m,
+int avb_msrp_attribute_new(struct avb_msrp *m, struct avb_msrp_attribute *msrp_attr,
 		uint8_t type)
 {
 	struct msrp *msrp = (struct msrp*)m;
@@ -349,16 +487,22 @@ struct avb_msrp_attribute *avb_msrp_attribute_new(struct avb_msrp *m,
 	struct attr *a;
 
 	attr = avb_mrp_attribute_new(msrp->server->mrp, sizeof(struct attr));
+	if (!attr) {
+		pw_log_error("MSRP attribute allocation failed");
+		return -1;
+	}
 
 	a = attr->user_data;
 	a->msrp = msrp;
-	a->attr.mrp = attr;
-	a->attr.type = type;
+	a->attr = msrp_attr;
+	a->attr->mrp = attr;
+	a->attr->type = type;
+	a->attr->mrp = attr;
 	attr->name = "MSRP";
 	spa_list_append(&msrp->attributes, &a->link);
 	avb_mrp_attribute_add_listener(attr, &a->listener, &mrp_attr_events, a);
 
-	return &a->attr;
+	return 0;
 }
 
 static void msrp_event(void *data, uint64_t now, uint8_t event)
@@ -375,17 +519,20 @@ static void msrp_event(void *data, uint64_t now, uint8_t event)
 	p->version = AVB_MRP_PROTOCOL_VERSION;
 
 	spa_list_for_each(a, &msrp->attributes, link) {
-		if (!a->attr.mrp->pending_send)
+		if (!a->attr->mrp->pending_send)
 			continue;
-		if (dispatch[a->attr.type].encode == NULL)
+		if (dispatch[a->attr->type].encode == NULL)
 			continue;
 
-		pw_log_debug("send %s %s", dispatch[a->attr.type].name,
-				avb_mrp_send_name(a->attr.mrp->pending_send));
+		pw_log_info("MSRP encode %s %s",
+				dispatch[a->attr->type].name,
+				avb_mrp_send_name(a->attr->mrp->pending_send));
 
-		len = dispatch[a->attr.type].encode(msrp, a, msg);
+		len = dispatch[a->attr->type].encode(msrp, a, msg);
 		if (len < 0)
 			break;
+
+		a->attr->mrp->pending_send = 0;
 
 		count++;
 		msg = SPA_PTROFF(msg, len, void);
@@ -394,15 +541,83 @@ static void msrp_event(void *data, uint64_t now, uint8_t event)
 	f = (struct avb_packet_mrp_footer *)msg;
 	f->end_mark = 0;
 
-	if (count > 0)
+	if (count > 0) {
+		pw_log_info("MSRP send: %d attribute(s), %zu bytes", count, total);
 		avb_server_send_packet(msrp->server, msrp_mac, AVB_MSRP_ETH,
 				buffer, total);
+	}
 }
 
 static const struct avb_mrp_events mrp_events = {
 	AVB_VERSION_MRP_EVENTS,
 	.event = msrp_event,
 };
+
+
+static const char *msrp_attr_type_name(uint8_t type)
+{
+	switch (type) {
+	case AVB_MSRP_ATTRIBUTE_TYPE_TALKER_ADVERTISE: return "talker-adv";
+	case AVB_MSRP_ATTRIBUTE_TYPE_TALKER_FAILED:    return "talker-fail";
+	case AVB_MSRP_ATTRIBUTE_TYPE_LISTENER:         return "listener";
+	case AVB_MSRP_ATTRIBUTE_TYPE_DOMAIN:           return "domain";
+	default:                                       return "?";
+	}
+}
+
+void avb_msrp_log_state(struct server *server, const char *label)
+{
+	struct msrp *msrp = (struct msrp *)server->msrp;
+	struct attr *a;
+	char buf[64];
+	int n = 0;
+
+	if (msrp == NULL)
+		return;
+
+	spa_list_for_each(a, &msrp->attributes, link)
+		n++;
+	pw_log_debug("[%s] MSRP: %d attribute%s", label, n, n == 1 ? "" : "s");
+
+	spa_list_for_each(a, &msrp->attributes, link) {
+		uint8_t app_st = avb_mrp_attribute_get_applicant_state(a->attr->mrp);
+		uint8_t reg_st = avb_mrp_attribute_get_registrar_state(a->attr->mrp);
+		switch (a->attr->type) {
+		case AVB_MSRP_ATTRIBUTE_TYPE_TALKER_ADVERTISE:
+		case AVB_MSRP_ATTRIBUTE_TYPE_TALKER_FAILED:
+			pw_log_debug("[%s]   %-11s stream_id=%s app=%s reg=%s",
+					label, msrp_attr_type_name(a->attr->type),
+					avb_utils_format_id(buf, sizeof(buf),
+						be64toh(a->attr->attr.talker.stream_id)),
+					avb_applicant_state_name(app_st),
+					avb_registrar_state_name(reg_st));
+			break;
+		case AVB_MSRP_ATTRIBUTE_TYPE_LISTENER:
+			pw_log_debug("[%s]   %-11s stream_id=%s param=%u app=%s reg=%s",
+					label, msrp_attr_type_name(a->attr->type),
+					avb_utils_format_id(buf, sizeof(buf),
+						be64toh(a->attr->attr.listener.stream_id)),
+					a->attr->param,
+					avb_applicant_state_name(app_st),
+					avb_registrar_state_name(reg_st));
+			break;
+		case AVB_MSRP_ATTRIBUTE_TYPE_DOMAIN:
+			pw_log_debug("[%s]   %-11s class_id=%u prio=%u vid=%u app=%s reg=%s",
+					label, msrp_attr_type_name(a->attr->type),
+					a->attr->attr.domain.sr_class_id,
+					a->attr->attr.domain.sr_class_priority,
+					ntohs(a->attr->attr.domain.sr_class_vid),
+					avb_applicant_state_name(app_st),
+					avb_registrar_state_name(reg_st));
+			break;
+		default:
+			pw_log_debug("[%s]   type=%u app=%s reg=%s", label, a->attr->type,
+					avb_applicant_state_name(app_st),
+					avb_registrar_state_name(reg_st));
+			break;
+		}
+	}
+}
 
 struct avb_msrp *avb_msrp_register(struct server *server)
 {

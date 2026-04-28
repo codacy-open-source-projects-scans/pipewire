@@ -21,6 +21,12 @@
 #include "aecp-aem-cmds-resps/cmd-get-set-stream-format.h"
 #include "aecp-aem-cmds-resps/cmd-get-set-clock-source.h"
 #include "aecp-aem-cmds-resps/cmd-lock-entity.h"
+#include "aecp-aem-cmds-resps/cmd-get-dynamic-info.h"
+#include "aecp-aem-cmds-resps/cmd-get-set-stream-info.h"
+#include "aecp-aem-cmds-resps/cmd-start-stop-streaming.h"
+#include "aecp-aem-cmds-resps/cmd-get-counters.h"
+#include "aecp-aem-cmds-resps/cmd-get-as-path.h"
+#include "aecp-aem-cmds-resps/cmd-get-set-max-transit-time.h"
 
 
 /* ACQUIRE_ENTITY */
@@ -111,7 +117,7 @@ static int handle_read_descriptor_common(struct aecp *aecp, int64_t now, const v
 
 	memcpy(buf, m, len);
 
-	memcpy(buf + size, desc->ptr, desc->size);
+	memcpy(buf + size, descriptor_body(desc), desc->size);
 	size += desc->size;
 	psize += desc->size;
 
@@ -151,7 +157,10 @@ static int handle_get_avb_info_common(struct aecp *aecp, int64_t now,
 	if (desc_type != AVB_AEM_DESC_AVB_INTERFACE || desc_id != 0)
 		return reply_not_implemented(aecp, m, len);
 
-	avb_interface = desc->ptr;
+	if (len < 0 || (size_t)len > sizeof(buf))
+		return reply_status(aecp, AVB_AECP_AEM_STATUS_BAD_ARGUMENTS, m, len);
+
+	avb_interface = descriptor_body(desc);
 
 	memcpy(buf, m, len);
 
@@ -168,7 +177,10 @@ static int handle_get_avb_info_common(struct aecp *aecp, int64_t now,
 	i->gptp_grandmaster_id = avb_interface->clock_identity;
 	i->propagation_delay = htonl(0);
 	i->gptp_domain_number = avb_interface->domain_number;
-	i->flags = 0;
+	/* IEEE 1722.1-2021 Section 7.4.40: GPTP_ENABLED / GPTP_GRANDMASTER_SUPPORTED
+	 * stay 0 until the gPTP interface lands. SRP_ENABLED is on because
+	 * MSRP is running on every AVB interface this module manages. */
+	i->flags = AVB_AEM_AVB_INFO_FLAG_SRP_ENABLED;
 	i->msrp_mappings_count = htons(0);
 
 	return avb_server_send_packet(server, h->src, AVB_TSN_ETH, buf, size);
@@ -227,7 +239,35 @@ static const char * const cmd_names[] = {
 	[AVB_AECP_AEM_CMD_GET_VIDEO_MAP] = "get-video-map",
 	[AVB_AECP_AEM_CMD_ADD_VIDEO_MAPPINGS] = "add-video-mappings",
 	[AVB_AECP_AEM_CMD_REMOVE_VIDEO_MAPPINGS] = "remove-video-mappings",
-	[AVB_AECP_AEM_CMD_GET_SENSOR_MAP] = "get-sensor-map"
+	[AVB_AECP_AEM_CMD_GET_SENSOR_MAP] = "get-sensor-map",
+	[AVB_AECP_AEM_CMD_ADD_SENSOR_MAPPINGS] = "add-sensor-mappings",
+	[AVB_AECP_AEM_CMD_REMOVE_SENSOR_MAPPINGS] = "remove-sensor-mappings",
+	[AVB_AECP_AEM_CMD_START_OPERATION] = "start-operation",
+	[AVB_AECP_AEM_CMD_ABORT_OPERATION] = "abort-operation",
+	[AVB_AECP_AEM_CMD_OPERATION_STATUS] = "operation-status",
+	[AVB_AECP_AEM_CMD_AUTH_ADD_KEY] = "auth-add-key",
+	[AVB_AECP_AEM_CMD_AUTH_DELETE_KEY] = "auth-delete-key",
+	[AVB_AECP_AEM_CMD_AUTH_GET_KEY_LIST] = "auth-get-key-list",
+	[AVB_AECP_AEM_CMD_AUTH_GET_KEY] = "auth-get-key",
+	[AVB_AECP_AEM_CMD_AUTH_ADD_KEY_TO_CHAIN] = "auth-add-key-to-chain",
+	[AVB_AECP_AEM_CMD_AUTH_DELETE_KEY_FROM_CHAIN] = "auth-delete-key-from-chain",
+	[AVB_AECP_AEM_CMD_AUTH_GET_KEYCHAIN_LIST] = "auth-get-keychain-list",
+	[AVB_AECP_AEM_CMD_AUTH_GET_IDENTITY] = "auth-get-identity",
+	[AVB_AECP_AEM_CMD_AUTH_ADD_TOKEN] = "auth-add-token",
+	[AVB_AECP_AEM_CMD_AUTH_DELETE_TOKEN] = "auth-delete-token",
+	[AVB_AECP_AEM_CMD_AUTHENTICATE] = "authenticate",
+	[AVB_AECP_AEM_CMD_DEAUTHENTICATE] = "deauthenticate",
+	[AVB_AECP_AEM_CMD_ENABLE_TRANSPORT_SECURITY] = "enable-transport-security",
+	[AVB_AECP_AEM_CMD_DISABLE_TRANSPORT_SECURITY] = "disable-transport-security",
+	[AVB_AECP_AEM_CMD_ENABLE_STREAM_ENCRYPTION] = "enable-stream-encryption",
+	[AVB_AECP_AEM_CMD_DISABLE_STREAM_ENCRYPTION] = "disable-stream-encryption",
+	[AVB_AECP_AEM_CMD_SET_MEMORY_OBJECT_LENGTH] = "set-memory-object-length",
+	[AVB_AECP_AEM_CMD_GET_MEMORY_OBJECT_LENGTH] = "get-memory-object-length",
+	[AVB_AECP_AEM_CMD_SET_STREAM_BACKUP] = "set-stream-backup",
+	[AVB_AECP_AEM_CMD_GET_STREAM_BACKUP] = "get-stream-backup",
+	[AVB_AECP_AEM_CMD_GET_DYNAMIC_INFO] = "get-dynamic-info",
+	[AVB_AECP_AEM_CMD_SET_MAX_TRANSIT_TIME] = "set-max-transit-time",
+	[AVB_AECP_AEM_CMD_GET_MAX_TRANSIT_TIME] = "get-max-transit-time",
 };
 
 /* AEM_COMMAND */
@@ -361,6 +401,40 @@ static const struct cmd_info cmd_info_milan_v12[] = {
 
 	AECP_AEM_HANDLE_CMD(AVB_AECP_AEM_CMD_GET_SAMPLING_RATE, true,
 		handle_cmd_get_sampling_rate_common),
+
+	AECP_AEM_HANDLE_CMD(AVB_AECP_AEM_CMD_GET_DYNAMIC_INFO, true,
+		 handle_cmd_get_dynamic_info_milan_v12),
+
+	/* Milan v1.2 Section 5.4.2.9 / Section 5.4.2.10 */
+	AECP_AEM_HANDLE_CMD(AVB_AECP_AEM_CMD_GET_STREAM_INFO, true,
+		 handle_cmd_get_stream_info_milan_v12),
+	AECP_AEM_HANDLE_CMD(AVB_AECP_AEM_CMD_SET_STREAM_INFO, false,
+		 handle_cmd_set_stream_info_milan_v12),
+
+	/* Milan v1.2 Section 5.4.2.19 / Section 5.4.2.20 */
+	AECP_AEM_HANDLE_CMD(AVB_AECP_AEM_CMD_START_STREAMING, false,
+		 handle_cmd_start_streaming_milan_v12),
+	AECP_AEM_HANDLE_CMD(AVB_AECP_AEM_CMD_STOP_STREAMING, false,
+		 handle_cmd_stop_streaming_milan_v12),
+
+	/* Milan v1.2 Section 5.4.2.25 */
+	AECP_AEM_HANDLE_CMD(AVB_AECP_AEM_CMD_GET_COUNTERS, true,
+		 handle_cmd_get_counters_milan_v12),
+
+	/* IEEE 1722.1-2021 Section 7.4.41. Returns NOT_IMPLEMENTED until gPTP lands;
+	 * dispatched here so the response payload size matches what the
+	 * controller computed (4-byte command echo). */
+	AECP_AEM_HANDLE_CMD(AVB_AECP_AEM_CMD_GET_AS_PATH, true,
+		 handle_cmd_get_as_path_milan_v12),
+
+	/* SET_MAX_TRANSIT_TIME = 0x004C, GET_MAX_TRANSIT_TIME = 0x004D
+	 * (relocated from IEEE 1722.1-2021 originals 0x004B/0x004C because
+	 * 0x004B is GET_DYNAMIC_INFO in this stack). GET reflects the MSRP
+	 * accumulated_latency floor; SET rejects values below it. */
+	AECP_AEM_HANDLE_CMD(AVB_AECP_AEM_CMD_SET_MAX_TRANSIT_TIME, false,
+		 handle_cmd_set_max_transit_time_milan_v12),
+	AECP_AEM_HANDLE_CMD(AVB_AECP_AEM_CMD_GET_MAX_TRANSIT_TIME, true,
+		 handle_cmd_get_max_transit_time_milan_v12),
 };
 
 static const struct {
@@ -427,14 +501,16 @@ int avb_aecp_aem_handle_command(struct aecp *aecp, const void *m, int len)
 
 	cmd_type = AVB_PACKET_AEM_GET_COMMAND_TYPE(p);
 
-	pw_log_info("mode: %s aem command %s",
-		get_avb_mode_str(server->avb_mode), cmd_names[cmd_type]);
-
 	if (cmd_info_modes[server->avb_mode].count <= cmd_type) {
-		pw_log_warn("Too many %d vs exp. %zu\n", cmd_type,
+		pw_log_warn("unknown aem command %d (max %zu)\n", cmd_type,
 			cmd_info_modes[server->avb_mode].count);
 		return reply_not_implemented(aecp, m, len);
 	}
+
+	pw_log_info("mode: %s aem command %s",
+		get_avb_mode_str(server->avb_mode),
+		cmd_type < SPA_N_ELEMENTS(cmd_names) && cmd_names[cmd_type]
+			? cmd_names[cmd_type] : "unknown");
 
 	info = &cmd_info_modes[server->avb_mode].cmd_info[cmd_type];
 	if (!info || !info->handle_command )
@@ -453,8 +529,7 @@ int avb_aecp_aem_handle_command(struct aecp *aecp, const void *m, int len)
 	 * commands are always allowed regardless of lock state.
 	 */
 	if (!info->is_readonly && check_locked(aecp, now, p)) {
-		pw_log_info("aem command %s rejected: entity locked",
-			cmd_names[cmd_type]);
+		pw_log_info("aem command %d rejected: entity locked", cmd_type);
 		return reply_entity_locked(aecp, m, len);
 	}
 
@@ -469,6 +544,75 @@ void avb_aecp_aem_periodic(struct aecp *aecp, int64_t now)
 		return;
 
 	handle_cmd_lock_entity_expired_milan_v12(aecp, now);
+
+	/* Milan Section 5.4.5: emit unsolicited GET_COUNTERS when any counter is
+	 * updated, max once per descriptor per second. The dirty/rate-limit
+	 * is enforced per descriptor inside this function — no outer gate. */
+	cmd_get_counters_periodic_milan_v12(aecp, now);
+
+	{
+		struct server *srv = aecp->server;
+		uint16_t i;
+		for (i = 0; i < UINT16_MAX; i++) {
+			struct descriptor *d = server_find_descriptor(srv,
+					AVB_AEM_DESC_STREAM_INPUT, i);
+			struct aecp_aem_stream_input_state *si;
+			if (d == NULL)
+				break;
+			si = d->ptr;
+			if (si->stream_info_dirty) {
+				cmd_get_stream_info_emit_unsol_milan_v12(srv,
+						AVB_AEM_DESC_STREAM_INPUT, i);
+				si->stream_info_dirty = false;
+			}
+		}
+		for (i = 0; i < UINT16_MAX; i++) {
+			struct descriptor *d = server_find_descriptor(srv,
+					AVB_AEM_DESC_STREAM_OUTPUT, i);
+			struct aecp_aem_stream_output_state *so;
+			if (d == NULL)
+				break;
+			so = d->ptr;
+			if (so->stream_info_dirty) {
+				cmd_get_stream_info_emit_unsol_milan_v12(srv,
+						AVB_AEM_DESC_STREAM_OUTPUT, i);
+				so->stream_info_dirty = false;
+			}
+		}
+	}
+}
+
+void avb_aecp_aem_mark_stream_info_dirty(struct server *server,
+		uint16_t desc_type, uint16_t desc_index)
+{
+	struct descriptor *d = server_find_descriptor(server, desc_type, desc_index);
+	if (d == NULL)
+		return;
+	if (desc_type == AVB_AEM_DESC_STREAM_INPUT) {
+		struct aecp_aem_stream_input_state *si = d->ptr;
+		si->stream_info_dirty = true;
+	} else if (desc_type == AVB_AEM_DESC_STREAM_OUTPUT) {
+		struct aecp_aem_stream_output_state *so = d->ptr;
+		so->stream_info_dirty = true;
+	}
+}
+
+void avb_aecp_aem_mark_counters_dirty(struct server *server,
+		uint16_t desc_type, uint16_t desc_index)
+{
+	struct descriptor *d = server_find_descriptor(server, desc_type, desc_index);
+	if (d == NULL)
+		return;
+	if (desc_type == AVB_AEM_DESC_AVB_INTERFACE) {
+		struct aecp_aem_avb_interface_state *ifs = d->ptr;
+		ifs->counters_dirty = true;
+	} else if (desc_type == AVB_AEM_DESC_STREAM_INPUT) {
+		struct aecp_aem_stream_input_state *si = d->ptr;
+		si->counters_dirty = true;
+	} else if (desc_type == AVB_AEM_DESC_STREAM_OUTPUT) {
+		struct aecp_aem_stream_output_state *so = d->ptr;
+		so->counters_dirty = true;
+	}
 }
 
 int avb_aecp_aem_handle_response(struct aecp *aecp, const void *m, int len)

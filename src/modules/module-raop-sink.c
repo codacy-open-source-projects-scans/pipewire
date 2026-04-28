@@ -632,7 +632,7 @@ on_timing_source_io(void *data, int fd, uint32_t mask)
 		}
 		if (bytes != sizeof(packet)) {
 			pw_log_warn("discarding short (%zd < %zd) timing packet",
-					bytes, sizeof(bytes));
+					bytes, sizeof(packet));
 			return;
 		}
 		if (packet[0] != ntohl(0x80d20007))
@@ -671,7 +671,7 @@ on_control_source_io(void *data, int fd, uint32_t mask)
 		}
 		if (bytes != sizeof(packet)) {
 			pw_log_warn("discarding short (%zd < %zd) control packet",
-					bytes, sizeof(bytes));
+					bytes, sizeof(packet));
 			return;
 		}
 		hdr = ntohl(packet[0]);
@@ -728,6 +728,7 @@ static int rtsp_add_raop_auth_header(struct impl *impl, const char *method)
 		pw_base64_encode((uint8_t*)buf, strlen(buf), enc, '=');
 		explicit_bzero(buf, sizeof(buf));
 		spa_scnprintf(auth, sizeof(auth), "Basic %s", enc);
+		explicit_bzero(enc, sizeof(enc));
 	}
 	else if (spa_streq(impl->auth_method, "Digest")) {
 		const char *url;
@@ -744,12 +745,16 @@ static int rtsp_add_raop_auth_header(struct impl *impl, const char *method)
 		spa_scnprintf(auth, sizeof(auth),
 				"username=\"%s\", realm=\"%s\", nonce=\"%s\", uri=\"%s\", response=\"%s\"",
 				RAOP_AUTH_USER_NAME, impl->realm, impl->nonce, url, resp);
+		explicit_bzero(h1, sizeof(h1));
+		explicit_bzero(h2, sizeof(h2));
+		explicit_bzero(resp, sizeof(resp));
 	}
 	else
 		goto error;
 
 	pw_properties_setf(impl->headers, "Authorization", "%s %s",
 			impl->auth_method, auth);
+	explicit_bzero(auth, sizeof(auth));
 
 	return 0;
 error:
@@ -1327,7 +1332,7 @@ static int rtsp_do_options_auth(struct impl *impl, const struct spa_dict *header
 		return -ENOTSUP;
 	}
 
-	pw_log_info("Auth: %s", str);
+	pw_log_debug("Auth: %s", str);
 
 	spa_auto(pw_strv) tokens = pw_split_strv(str, " ", INT_MAX, &n_tokens);
 	if (tokens == NULL || tokens[0] == NULL)
@@ -1434,10 +1439,16 @@ static void connection_cleanup(struct impl *impl)
 
 	free(impl->auth_method);
 	impl->auth_method = NULL;
-	free(impl->realm);
-	impl->realm = NULL;
-	free(impl->nonce);
-	impl->nonce = NULL;
+	if (impl->realm) {
+		explicit_bzero(impl->realm, strlen(impl->realm));
+		free(impl->realm);
+		impl->realm = NULL;
+	}
+	if (impl->nonce) {
+		explicit_bzero(impl->nonce, strlen(impl->nonce));
+		free(impl->nonce);
+		impl->nonce = NULL;
+	}
 }
 
 static void rtsp_disconnected(void *data)

@@ -92,6 +92,8 @@ struct avb_packet_msrp_domain {
 #define AVB_MSRP_LISTENER_PARAM_READY		2
 #define AVB_MSRP_LISTENER_PARAM_READY_FAILED	3
 
+struct avb_mrp_attribute;
+
 struct avb_msrp_attribute {
 	struct avb_mrp_attribute *mrp;
 	uint8_t type;
@@ -106,9 +108,11 @@ struct avb_msrp_attribute {
 
 struct avb_msrp;
 
-struct avb_msrp_attribute *avb_msrp_attribute_new(struct avb_msrp *msrp,
+int avb_msrp_attribute_new(struct avb_msrp *m, struct avb_msrp_attribute *attr,
 		uint8_t type);
 
 struct avb_msrp *avb_msrp_register(struct server *server);
+
+void avb_msrp_log_state(struct server *server, const char *label);
 
 #endif /* AVB_MSRP_H */

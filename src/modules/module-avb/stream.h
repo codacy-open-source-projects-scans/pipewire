@@ -24,16 +24,20 @@ struct stream {
 	struct server *server;
 
 	uint16_t direction;
+	uint16_t index;
 	uint64_t id;
-	uint64_t peer_id;
 
 	struct pw_stream *stream;
 	struct spa_hook stream_listener;
 
+	uint64_t peer_id;
 	uint8_t addr[6];
-	struct spa_source *source;
-	int prio;
 	int vlan_id;
+
+	struct spa_source *source;
+	struct spa_source *flush_timer;
+	uint64_t flush_last_ns;
+	int prio;
 	int mtt;
 	int t_uncertainty;
 	uint32_t frames_per_pdu;
@@ -61,10 +65,6 @@ struct stream {
 	uint64_t format;
 	uint32_t stride;
 	struct spa_audio_info info;
-
-	struct avb_msrp_attribute *talker_attr;
-	struct avb_msrp_attribute *listener_attr;
-	struct avb_mvrp_attribute *vlan_attr;
 };
 
 #include "msrp.h"

@@ -31,8 +31,11 @@
 #include "mvrp.h"
 #include "descriptors.h"
 #include "utils.h"
+#include "acmp-cmds-resps/acmp-milan-v12.h"
 
-#define DEFAULT_INTERVAL	1
+/* IEEE 802.1Q-2014 Section 10.7.11: MRP join timer is ~100 ms. Run the periodic
+ * dispatch at the same granularity so join/leave timers fire on time. */
+#define DEFAULT_INTERVAL_MS	100
 
 #define server_emit(s,m,v,...) spa_hook_list_call(&s->listener_list, struct server_events, m, v, ##__VA_ARGS__)
 #define server_emit_destroy(s)		server_emit(s, destroy, 0)
@@ -56,7 +59,7 @@ static void on_timer_event(void *data)
 	server_emit_periodic(server, SPA_TIMESPEC_TO_NSEC(&now));
 
 	pw_timer_queue_add(impl->timer_queue, &server->timer,
-		&server->timer.timeout, DEFAULT_INTERVAL * SPA_NSEC_PER_SEC,
+		&server->timer.timeout, DEFAULT_INTERVAL_MS * SPA_NSEC_PER_MSEC,
 		on_timer_event, server);
 }
 
@@ -96,7 +99,7 @@ static int raw_send_packet(struct server *server, const uint8_t dest[6],
 
 	if (send(server->source->fd, data, size, 0) < 0) {
 		res = -errno;
-		pw_log_warn("got send error: %m");
+		pw_log_warn("got send error (size=%zu type=0x%04x): %m", size, type);
 	}
 	return res;
 }
@@ -242,7 +245,7 @@ static int raw_transport_setup(struct server *server)
 	}
 
 	if ((res = pw_timer_queue_add(impl->timer_queue, &server->timer,
-			NULL, DEFAULT_INTERVAL * SPA_NSEC_PER_SEC,
+			NULL, DEFAULT_INTERVAL_MS * SPA_NSEC_PER_MSEC,
 			on_timer_event, server)) < 0) {
 		pw_log_error("server %p: can't create timer: %s", impl, spa_strerror(res));
 		goto error_no_timer;
@@ -412,17 +415,8 @@ struct server *avdecc_server_new(struct impl *impl, struct spa_dict *props)
 	server->mmrp = avb_mmrp_register(server);
 	server->msrp = avb_msrp_register(server);
 	server->mvrp = avb_mvrp_register(server);
-	avb_adp_register(server);
-	avb_acmp_register(server);
-
-	server->domain_attr = avb_msrp_attribute_new(server->msrp,
-			AVB_MSRP_ATTRIBUTE_TYPE_DOMAIN);
-	server->domain_attr->attr.domain.sr_class_id = AVB_MSRP_CLASS_ID_DEFAULT;
-	server->domain_attr->attr.domain.sr_class_priority = AVB_MSRP_PRIORITY_DEFAULT;
-	server->domain_attr->attr.domain.sr_class_vid = htons(AVB_DEFAULT_VLAN);
-
-	avb_mrp_attribute_begin(server->domain_attr->mrp, 0);
-	avb_mrp_attribute_join(server->domain_attr->mrp, 0, true);
+	server->adp  = avb_adp_register(server);
+	server->acmp = avb_acmp_register(server);
 
 	avb_maap_reserve(server->maap, 1);
 
@@ -458,4 +452,17 @@ void avdecc_server_free(struct server *server)
 const char *get_avb_mode_str(enum avb_mode mode)
 {
 	return avb_mode_str[mode];
+}
+
+void avb_log_state(struct server *server, const char *label)
+{
+	if (server == NULL)
+		return;
+
+	pw_log_debug("===== state @ %s =====", label);
+	adp_log_state(server, label);
+	avb_msrp_log_state(server, label);
+	if (server->avb_mode == AVB_MODE_MILAN_V12)
+		acmp_log_state_milan_v12(server, label);
+	pw_log_debug("===== end state =====");
 }

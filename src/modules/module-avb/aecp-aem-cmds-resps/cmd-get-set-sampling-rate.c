@@ -84,6 +84,9 @@ static int send_unsol_get_sampling_rate_milan_v12(struct aecp *aecp,
 	struct aecp_aem_base_info info = { 0 };
 	int rc = 0;
 
+	if (len > sizeof(unsol_buf))
+		return -EINVAL;
+
 	memcpy(unsol_buf, m, len);
 	/* Prepare a template packet */
 	info.controller_entity_id = htobe64(ctrler_id);
@@ -105,6 +108,9 @@ static int sample_rate_invalid_response(struct aecp *aecp,
 	struct avb_ethernet_header *h = (struct avb_ethernet_header *) buf;
 	struct avb_packet_aecp_aem *p = SPA_PTROFF(h, sizeof(*h), void);
 	struct avb_packet_aecp_aem_setget_sampling_rate *cmd;
+
+	if (len > sizeof(buf))
+		return -EINVAL;
 
 	memcpy(buf, m, len);
 	cmd = (struct avb_packet_aecp_aem_setget_sampling_rate *)p->payload;
@@ -149,7 +155,7 @@ int handle_cmd_set_sampling_rate_milan_v12(struct aecp *aecp, int64_t now,
 				AVB_AECP_AEM_STATUS_NO_SUCH_DESCRIPTOR, p, len);
 
 	if (desc_type == AVB_AEM_DESC_AUDIO_UNIT) {
-		struct avb_aem_desc_audio_unit *unit = desc->ptr;
+		struct avb_aem_desc_audio_unit *unit = descriptor_body(desc);
 		/* TODO check if the STREAM_PORT associated with it supportes
 		 * the SSRC/ASRC bit.
 		 */
@@ -212,12 +218,16 @@ int handle_cmd_get_sampling_rate_common(struct aecp *aecp, int64_t now,
 				AVB_AECP_AEM_STATUS_NO_SUCH_DESCRIPTOR, p, len);
 
 	if (desc_type == AVB_AEM_DESC_AUDIO_UNIT) {
-		struct avb_aem_desc_audio_unit *unit = desc->ptr;
+		struct avb_aem_desc_audio_unit *unit = descriptor_body(desc);
 		memcpy(&pullfreq, &unit->current_sampling_rate, sizeof(pullfreq));
 	} else {
 		return reply_status(aecp,
 				AVB_AECP_AEM_STATUS_NOT_IMPLEMENTED, p, len);
 	}
+
+	if (len < 0 || (size_t)len > sizeof(buf))
+		return reply_status(aecp,
+				AVB_AECP_AEM_STATUS_BAD_ARGUMENTS, p, len);
 
 	memcpy(buf, m, len);
 	h_reply = (struct avb_ethernet_header *)buf;
