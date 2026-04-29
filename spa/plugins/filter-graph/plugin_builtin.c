@@ -1014,6 +1014,8 @@ error:
 #else
 	spa_log_error(impl->log, "compiled without spa-plugins support, can't resample");
 	float *out_samples = calloc(*n_samples, sizeof(float));
+	if (out_samples == NULL)
+		return NULL;
 	spa_memcpy(out_samples, samples, *n_samples * sizeof(float));
 	return out_samples;
 #endif
@@ -2942,6 +2944,10 @@ static int do_exec(struct pipe_impl *impl, const char *command)
         while ((len = spa_json_next(&it[0], &value)) > 0) {
                 char *s;
 
+                if (argc >= (int)SPA_N_ELEMENTS(argv) - 1) {
+                        spa_log_error(impl->log, "too many exec arguments");
+                        return -E2BIG;
+                }
                 if ((s = malloc(len+1)) == NULL)
                         return -errno;
 
