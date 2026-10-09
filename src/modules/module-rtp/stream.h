@@ -11,7 +11,8 @@ extern "C" {
 
 struct rtp_stream;
 
-#define DEFAULT_FORMAT		"S16BE"
+#define DEFAULT_RAW_AUDIO_FORMAT  "S16BE"
+#define DEFAULT_RAOP_AUDIO_FORMAT "S16LE"
 #define DEFAULT_RATE		48000
 #define DEFAULT_CHANNELS	2
 #define DEFAULT_POSITION	"[ FL FR ]"
@@ -29,6 +30,27 @@ struct rtp_stream;
 #define DEFAULT_MTU		1280
 #define DEFAULT_MIN_PTIME	2.0f
 #define DEFAULT_MAX_PTIME	20.0f
+
+struct rtp_packet {
+	struct spa_list link;
+
+	void *data;
+	size_t maxsize;
+	size_t size;
+
+	uint64_t nsec;
+	uint16_t seq;
+	uint32_t timestamp;
+	size_t hlen;
+
+	void *decoded;
+	uint32_t decoded_len;
+	uint32_t duration;
+
+	void *tmp;
+	size_t tmp_size;
+};
+
 
 struct rtp_stream_events {
 #define RTP_VERSION_STREAM_EVENTS        0
@@ -50,7 +72,9 @@ struct rtp_stream_events {
 
 	void (*param_changed) (void *data, uint32_t id, const struct spa_pod *param);
 
-	void (*send_packet) (void *data, struct iovec *iov, size_t iovlen);
+	void (*command) (void *data, const struct spa_command *command);
+
+	void (*send_packet) (void *data, struct rtp_packet *packet);
 
 	void (*send_feedback) (void *data, uint32_t seqnum);
 };
@@ -63,8 +87,21 @@ void rtp_stream_destroy(struct rtp_stream *s);
 
 int rtp_stream_update_properties(struct rtp_stream *s, const struct spa_dict *dict);
 
-int rtp_stream_receive_packet(struct rtp_stream *s, uint8_t *buffer, size_t len,
+struct rtp_packet *rtp_stream_get_free_packet(struct rtp_stream *s);
+struct rtp_packet *rtp_stream_peek_pending_packet(struct rtp_stream *s);
+void rtp_stream_clear_pending_packet(struct rtp_stream *s);
+void rtp_stream_clear_queued_packets(struct rtp_stream *s);
+
+
+int rtp_stream_receive_packet(struct rtp_stream *s, struct rtp_packet *p,
 				uint64_t current_time);
+
+void rtp_stream_queue_packet(struct rtp_stream *s, struct rtp_packet *p);
+void rtp_stream_dequeue_packet(struct rtp_stream *s, struct rtp_packet *p);
+void rtp_stream_queue_iov(struct rtp_stream *s, struct iovec *iov, int n_iov);
+
+void rtp_stream_send_packet(struct rtp_stream *s, struct rtp_packet *p);
+int rtp_stream_resend_packets(struct rtp_stream *s, uint16_t seq, uint16_t num);
 
 uint64_t rtp_stream_get_nsec(struct rtp_stream *s);
 
@@ -88,6 +125,9 @@ int rtp_stream_update_params(struct rtp_stream *stream,
 
 void rtp_stream_update_process_latency(struct rtp_stream *stream,
 				const struct spa_process_latency_info *process_latency);
+
+int rtp_stream_run_in_data_loop(struct rtp_stream *s, spa_invoke_func_t func,
+				uint32_t seq, const void *data, size_t size, void *user_data);
 
 #ifdef __cplusplus
 }

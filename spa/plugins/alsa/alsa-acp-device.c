@@ -85,17 +85,34 @@ struct impl {
 };
 
 static int emit_info(struct impl *this, bool full);
+static void remove_sources(struct impl *this);
 
 static void handle_acp_poll(struct spa_source *source)
 {
 	struct impl *this = source->data;
+	uint32_t rmask = 0;
 	int i;
 
-	for (i = 0; i < this->n_pfds; i++)
+	for (i = 0; i < this->n_pfds; i++) {
 		this->pfds[i].revents = this->sources[i].rmask;
+		rmask |= this->sources[i].rmask;
+	}
 	acp_card_handle_events(this->card);
 	for (i = 0; i < this->n_pfds; i++)
 		this->sources[i].rmask = 0;
+
+	/* A POLLERR/POLLHUP on a poll fd (e.g. the ALSA control device was
+	 * unplugged) is level-triggered and never clears, so the loop would
+	 * redispatch this handler on every iteration and spin at 100% CPU.
+	 * Stop polling the dead descriptors; the udev monitor handles the
+	 * actual device removal, and setup_sources() re-arms on the next
+	 * profile change if the card comes back. */
+	if (rmask & (SPA_IO_ERR | SPA_IO_HUP)) {
+		spa_log_warn(this->log, "%p: poll fd error/hangup (card removed?), "
+				"removing poll sources", this);
+		remove_sources(this);
+		return;
+	}
 	emit_info(this, false);
 }
 
@@ -161,7 +178,7 @@ static int emit_node(struct impl *this, struct acp_device *dev)
 	char codecs[512];
 	struct spa_device_object_info info;
 	struct acp_card *card = this->card;
-	const char *stream, *card_id, *bus;
+	const char *stream, *card_id, *bus, *product;
 	struct spa_strbuf b;
 
 	info = SPA_DEVICE_OBJECT_INFO_INIT();
@@ -177,7 +194,7 @@ static int emit_node(struct impl *this, struct acp_device *dev)
 
 	info.change_mask = SPA_DEVICE_OBJECT_CHANGE_MASK_PROPS;
 
-	items = alloca((dev->props.n_items + 12) * sizeof(*items));
+	items = alloca((dev->props.n_items + 13) * sizeof(*items));
 	n_items = 0;
 
 	snprintf(card_index, sizeof(card_index), "%d", card->index);
@@ -217,6 +234,10 @@ static int emit_node(struct impl *this, struct acp_device *dev)
 
 	snprintf(routes, sizeof(routes), "%d", dev->n_ports);
 	items[n_items++] = SPA_DICT_ITEM_INIT("device.routes", routes);
+
+	if (dev->n_ports == 1 &&
+	    (product = acp_dict_lookup(&dev->ports[0]->props, SPA_KEY_DEVICE_PRODUCT_NAME)))
+		items[n_items++] = SPA_DICT_ITEM_INIT(ACP_KEY_HDMI_PRODUCT_NAME, product);
 
 	acp_dict_for_each(it, &dev->props)
 		items[n_items++] = SPA_DICT_ITEM_INIT(it->key, it->value);
@@ -437,7 +458,8 @@ static struct spa_pod *build_route(struct spa_pod_builder *b, uint32_t id,
 	spa_pod_builder_prop(b, SPA_PARAM_ROUTE_profiles, 0);
 	spa_pod_builder_push_array(b, &f[1]);
 	for (i = 0; i < p->n_profiles; i++)
-		spa_pod_builder_int(b, p->profiles[i]->index);
+		if (!SPA_FLAG_IS_SET(p->profiles[i]->flags, ACP_PROFILE_HIDDEN))
+			spa_pod_builder_int(b, p->profiles[i]->index);
 	spa_pod_builder_pop(b, &f[1]);
 	if (dev != NULL) {
 		uint32_t channels = dev->format.channels;
@@ -638,7 +660,7 @@ static void on_latency_changed(void *data, struct acp_device *dev)
 	spa_pod_builder_add_object(&b,
 			SPA_TYPE_OBJECT_Props, SPA_EVENT_DEVICE_Props,
 			SPA_PROP_latencyOffsetNsec, SPA_POD_Long(dev->latency_ns));
-	event = spa_pod_builder_pop(&b, &f[0]);
+	event = (struct spa_event *)spa_pod_builder_pop(&b, &f[0]);
 
 	spa_device_emit_event(&this->hooks, event);
 }
@@ -665,7 +687,7 @@ static void on_codecs_changed(void *data, struct acp_device *dev)
 			SPA_TYPE_OBJECT_Props, SPA_EVENT_DEVICE_Props,
 			SPA_PROP_iec958Codecs, SPA_POD_Array(sizeof(uint32_t),
 				SPA_TYPE_Id, dev->n_codecs, dev->codecs));
-	event = spa_pod_builder_pop(&b, &f[0]);
+	event = (struct spa_event *)spa_pod_builder_pop(&b, &f[0]);
 
 	spa_device_emit_event(&this->hooks, event);
 }
@@ -707,6 +729,20 @@ static int apply_device_props(struct impl *this, struct acp_device *dev, struct 
 		case SPA_PROP_channelMap:
 			if (spa_pod_copy_array(&prop->value, SPA_TYPE_Id,
 					channels, SPA_N_ELEMENTS(channels)) > 0) {
+				changed++;
+			}
+			break;
+		case SPA_PROP_volumeMin:
+			acp_device_get_volume_limit(dev, &volumes[0], &volumes[1]);
+			if (spa_pod_get_float(&prop->value, &volumes[0]) == 0) {
+				acp_device_set_volume_limit(dev, volumes[0], volumes[1]);
+				changed++;
+			}
+			break;
+		case SPA_PROP_volumeMax:
+			acp_device_get_volume_limit(dev, &volumes[0], &volumes[1]);
+			if (spa_pod_get_float(&prop->value, &volumes[1]) == 0) {
+				acp_device_set_volume_limit(dev, volumes[0], volumes[1]);
 				changed++;
 			}
 			break;
@@ -851,7 +887,7 @@ static int impl_set_param(void *object,
 				SPA_PARAM_ROUTE_index, SPA_POD_OPT_Int(&idx),
 				SPA_PARAM_ROUTE_name, SPA_POD_OPT_String(&name),
 				SPA_PARAM_ROUTE_device, SPA_POD_Int(&device),
-				SPA_PARAM_ROUTE_props, SPA_POD_OPT_Pod(&props),
+				SPA_PARAM_ROUTE_props, SPA_POD_OPT_PodObject(&props),
 				SPA_PARAM_ROUTE_save, SPA_POD_OPT_Bool(&save))) < 0) {
 			spa_log_warn(this->log, "can't parse route");
 			spa_debug_log_pod(this->log, SPA_LOG_LEVEL_DEBUG, 0, NULL, param);
@@ -897,6 +933,11 @@ static void card_props_changed(void *data)
 {
 	struct impl *this = data;
 	spa_log_info(this->log, "card properties changed");
+
+	this->info.change_mask |= SPA_DEVICE_CHANGE_MASK_PARAMS;
+	this->params[IDX_EnumRoute].user++;
+	this->params[IDX_Route].user++;
+	emit_info(this, false);
 }
 
 static bool has_device(struct acp_card_profile *pr, uint32_t index)
@@ -1047,7 +1088,7 @@ static void on_volume_changed(void *data, struct acp_device *dev)
 						dev->format.map),
 			SPA_PROP_softVolumes, SPA_POD_Array(sizeof(float),
 						SPA_TYPE_Float, n_volume, soft_volume));
-	event = spa_pod_builder_pop(&b, &f[0]);
+	event = (struct spa_event *)spa_pod_builder_pop(&b, &f[0]);
 
 	spa_device_emit_event(&this->hooks, event);
 }
@@ -1078,7 +1119,7 @@ static void on_mute_changed(void *data, struct acp_device *dev)
 			SPA_TYPE_OBJECT_Props, SPA_EVENT_DEVICE_Props,
 			SPA_PROP_mute, SPA_POD_Bool(mute),
 			SPA_PROP_softMute, SPA_POD_Bool(mute));
-	event = spa_pod_builder_pop(&b, &f[0]);
+	event = (struct spa_event *)spa_pod_builder_pop(&b, &f[0]);
 
 	spa_device_emit_event(&this->hooks, event);
 }

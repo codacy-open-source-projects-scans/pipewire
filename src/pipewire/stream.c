@@ -1082,6 +1082,8 @@ static int impl_port_use_buffers(void *object,
 static int impl_port_reuse_buffer(void *object, uint32_t port_id, uint32_t buffer_id)
 {
 	struct stream *d = object;
+	if (buffer_id >= d->n_buffers)
+		return -EINVAL;
 	pw_log_trace("%p: recycle buffer %d", d, buffer_id);
 	queue_push(d, &d->queued, &d->buffers[buffer_id]);
 	return 0;
@@ -1386,6 +1388,9 @@ static int node_event_param(void *object, int seq,
 		float *values;
 		uint32_t i, n_values, val_size, val_type;
 
+		if (!spa_pod_is_object_type(param, SPA_TYPE_OBJECT_Props))
+			return -EINVAL;
+
 		SPA_POD_OBJECT_FOREACH(obj, prop) {
 			struct control *c;
 
@@ -1578,11 +1583,11 @@ stream_new(struct pw_context *context, const char *name,
 	this = &impl->this;
 	pw_log_debug("%p: new \"%s\"", impl, name);
 
-	if (props == NULL) {
+	if (props == NULL)
 		props = pw_properties_new(PW_KEY_MEDIA_NAME, name, NULL);
-	} else if (pw_properties_get(props, PW_KEY_MEDIA_NAME) == NULL) {
+	else if (pw_properties_get(props, PW_KEY_MEDIA_NAME) == NULL)
 		pw_properties_set(props, PW_KEY_MEDIA_NAME, name);
-	}
+
 	if (props == NULL) {
 		res = -errno;
 		goto error_properties;
@@ -1608,6 +1613,10 @@ stream_new(struct pw_context *context, const char *name,
 	pw_context_conf_update_props(context, "stream.properties", props);
 
 	this->name = name ? strdup(name) : NULL;
+	if (name != NULL && this->name == NULL) {
+		res = -errno;
+		goto error_properties;
+	}
 	this->node_id = SPA_ID_INVALID;
 
 	spa_ringbuffer_init(&impl->dequeued.ring);

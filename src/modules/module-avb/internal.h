@@ -9,11 +9,14 @@
 
 #include <pipewire/pipewire.h>
 
+#include "gptp-clock.h"
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 struct server;
+struct avb_gptp;
 struct avb_mrp;
 
 #define AVB_TSN_ETH 0x22f0
@@ -37,6 +40,7 @@ struct avb_transport_ops {
 
 struct impl {
 	struct pw_loop *loop;
+	struct pw_loop *data_loop;	/* RT (SCHED_FIFO) loop for talker egress pacing */
 	struct pw_timer_queue *timer_queue;
 	struct pw_context *context;
 	struct spa_hook context_listener;
@@ -60,6 +64,8 @@ struct server_events {
 	void (*periodic) (void *data, uint64_t now);
 
 	int (*command) (void *data, uint64_t now, const char *command, const char *args, FILE *out);
+
+	void (*gm_changed) (void *data, uint64_t now, uint8_t gm_id[8]);
 };
 
 struct descriptor {
@@ -101,6 +107,11 @@ struct server {
 	uint64_t entity_id;
 	int ifindex;
 
+	/* milan-avb: gPTP time read from the NIC PHC (server->ifname), decoupled from the
+	 * system clock. Lazily opened on first use; gclock_tried guards the one-shot open. */
+	struct avb_gptp_clock gclock;
+	unsigned gclock_tried:1;
+
 	const struct avb_transport_ops *transport;
 	void *transport_data;
 
@@ -114,6 +125,7 @@ struct server {
 
 	unsigned debug_messages:1;
 
+	struct avb_gptp *gptp;
 	struct avb_mrp *mrp;
 	struct avb_mmrp *mmrp;
 	struct avb_mvrp *mvrp;

@@ -543,6 +543,10 @@ static int check_properties(struct pw_impl_port *port)
 	} else {
 		port->passive_mode = passive_mode_from_string(str);
 	}
+	if ((str = pw_properties_get(port->properties, "fade.duration")) == NULL) {
+		if ((str = pw_properties_get(node->properties, "fade.duration")) != NULL)
+			pw_properties_set(port->properties, "fade.duration", str);
+	}
 
 	if (media_class != NULL &&
 	    (strstr(media_class, "Sink") != NULL ||
@@ -1093,7 +1097,7 @@ static int setup_mixer(struct pw_impl_port *port, const struct spa_pod *param)
 	int res;
 	const char *fallback_lib, *factory_name, *str;
 	struct spa_handle *handle;
-	struct spa_dict_item items[4];
+	struct spa_dict_item items[5];
 	char quantum_limit[16];
 	void *iface;
 	struct pw_context *context = port->node->context;
@@ -1153,6 +1157,8 @@ static int setup_mixer(struct pw_impl_port *port, const struct spa_pod *param)
 	items[n_items++] = SPA_DICT_ITEM_INIT(PW_KEY_NODE_LOOP_NAME, port->node->data_loop->name);
 	if ((str = pw_properties_get(port->properties, "control.ump")) != NULL)
 		items[n_items++] = SPA_DICT_ITEM_INIT("control.ump", str);
+	if ((str = pw_properties_get(port->properties, "fade.duration")) != NULL)
+		items[n_items++] = SPA_DICT_ITEM_INIT("fade.duration", str);
 
 	handle = pw_context_load_spa_handle(context, factory_name,
 			&SPA_DICT_INIT(items, n_items));
@@ -1509,7 +1515,10 @@ static int do_destroy_link(void *data, struct pw_impl_link *link)
 
 void pw_impl_port_unlink(struct pw_impl_port *port)
 {
+	struct pw_context *context = port->node->context;
+	pw_context_freeze_recalc_graph(context);
 	pw_impl_port_for_each_link(port, do_destroy_link, port);
+	pw_context_thaw_recalc_graph(context, "port unlink");
 }
 
 static int do_remove_port(struct spa_loop *loop,
@@ -1610,6 +1619,17 @@ void pw_impl_port_destroy(struct pw_impl_port *port)
 	free(port);
 }
 
+void pw_impl_port_suspend(struct pw_impl_port *port)
+{
+	int res;
+	if ((res = pw_impl_port_set_param(port, SPA_PARAM_Format, 0, NULL)) < 0)
+		pw_log_warn("%p: error unset format: %s", port, spa_strerror(res));
+	port->state = PW_IMPL_PORT_STATE_INIT;
+	/* force CONFIGURE in case of async, use update_state to
+	 * notify links so they can cancel pending work */
+	pw_impl_port_update_state(port, PW_IMPL_PORT_STATE_CONFIGURE, 0, NULL);
+}
+
 struct result_port_params_data {
 	struct impl *impl;
 	void *data;
@@ -1638,6 +1658,33 @@ static void result_port_params(void *data, int seq, int res, uint32_t type, cons
 	default:
 		break;
 	}
+}
+
+int pw_impl_port_enum_param(struct pw_impl_port *port,
+			   uint32_t param_id,
+			   uint32_t *index,
+			   const struct spa_pod *filter,
+			   struct spa_pod **param,
+			   struct spa_pod_builder *builder)
+{
+	struct impl *impl = SPA_CONTAINER_OF(port, struct impl, this);
+	struct pw_param *p;
+	uint32_t idx = 0;
+
+	spa_list_for_each(p, &impl->param_list, link) {
+		if (p->id != param_id)
+			continue;
+
+		if (idx++ < *index)
+			continue;
+
+		if (spa_pod_filter(builder, param, p->param, filter) >= 0) {
+			pw_log_debug("%p: param %u", port, idx);
+			*index = idx;
+			return 1;
+		}
+	}
+	return 0;
 }
 
 int pw_impl_port_for_each_param(struct pw_impl_port *port,
@@ -1910,7 +1957,6 @@ int pw_impl_port_recalc_tag(struct pw_impl_port *port)
 	struct spa_tag_info info;
 	enum spa_direction direction;
 	uint8_t buffer[1024];
-	int count = 0;
 	bool changed;
 
 	if (port->destroying)
@@ -1930,7 +1976,6 @@ int pw_impl_port_recalc_tag(struct pw_impl_port *port)
 				while (spa_tag_parse(tag, &info, &state) == 1)
 					spa_tag_build_add_info(&b.b, info.info);
 			}
-			count++;
 		}
 	} else {
 		spa_list_for_each(l, &port->links, input_link) {
@@ -1941,7 +1986,6 @@ int pw_impl_port_recalc_tag(struct pw_impl_port *port)
 				while (spa_tag_parse(tag, &info, &state) == 1)
 					spa_tag_build_add_info(&b.b, info.info);
 			}
-			count++;
 		}
 	}
 	param = spa_tag_build_end(&b.b, &f);
@@ -2070,7 +2114,8 @@ int pw_impl_port_set_param(struct pw_impl_port *port, uint32_t id, uint32_t flag
 		if (port->direction == PW_DIRECTION_INPUT &&
 		    id == SPA_PARAM_Format && param != NULL &&
 		    !SPA_FLAG_IS_SET(port->flags, PW_IMPL_PORT_FLAG_NO_MIXER)) {
-			setup_mixer(port, param);
+			if (setup_mixer(port, param) < 0)
+				pw_log_warn("can't setup mixer");
 		}
 
 		spa_list_for_each(mix, &port->mix_list, link) {
@@ -2113,9 +2158,12 @@ static int negotiate_mixer_buffers(struct pw_impl_port *port, uint32_t flags,
 {
 	int res, res2;
 	struct pw_impl_node *node = port->node;
+	struct pw_buffers mix_buffers;
 
 	if (SPA_FLAG_IS_SET(port->mix_flags, PW_IMPL_PORT_MIX_FLAG_MIX_ONLY))
 		return 0;
+
+	spa_zero(mix_buffers);
 
 	if (SPA_FLAG_IS_SET(port->mix_flags, PW_IMPL_PORT_MIX_FLAG_NEGOTIATE)) {
 		int alloc_flags;
@@ -2140,19 +2188,17 @@ static int negotiate_mixer_buffers(struct pw_impl_port *port, uint32_t flags,
 
 		pw_loop_locked(node->data_loop, do_remove_port, SPA_ID_INVALID, NULL, 0, port);
 
-		pw_buffers_clear(&port->mix_buffers);
-
 		if (n_buffers > 0) {
 			if ((res = pw_buffers_negotiate(node->context, alloc_flags,
 					port->mix, 0,
 					node->node, port->port_id,
-					&port->mix_buffers)) < 0) {
+					&mix_buffers)) < 0) {
 				pw_log_warn("%p: can't negotiate buffers: %s",
 						port, spa_strerror(res));
 				return res;
 			}
-			buffers = port->mix_buffers.buffers;
-			n_buffers = port->mix_buffers.n_buffers;
+			buffers = mix_buffers.buffers;
+			n_buffers = mix_buffers.n_buffers;
 			flags = 0;
 		}
 	}
@@ -2172,10 +2218,17 @@ static int negotiate_mixer_buffers(struct pw_impl_port *port, uint32_t flags,
 			if (res2 != -ENOTSUP && n_buffers > 0) {
 				pw_log_warn("%p: mix use buffers failed: %d (%s)",
 						port, res2, spa_strerror(res2));
+				if (mix_buffers.n_buffers)
+					pw_buffers_clear(&mix_buffers);
 				return res2;
 			}
 		}
 	}
+	if (mix_buffers.n_buffers) {
+		pw_buffers_clear(&port->mix_buffers);
+		port->mix_buffers = mix_buffers;
+	}
+
 	if (n_buffers > 0) {
 		spa_node_port_set_io(node->node,
 				     port->direction, port->port_id,

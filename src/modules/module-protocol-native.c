@@ -32,6 +32,7 @@
 #include <spa/utils/result.h>
 #include <spa/utils/string.h>
 #include <spa/utils/json.h>
+#include <spa/utils/json-builder.h>
 #include <spa/debug/log.h>
 
 #ifdef HAVE_SELINUX
@@ -180,6 +181,10 @@ static const struct spa_dict_item module_props[] = {
 /* Required for s390x */
 #ifndef SO_PEERSEC
 #define SO_PEERSEC 31
+#endif
+
+#ifndef SO_PEERGROUPS
+#define SO_PEERGROUPS 59
 #endif
 
 #define LOCK_SUFFIX     ".lock"
@@ -421,7 +426,6 @@ process_messages(struct client_data *data)
 		pw_protocol_native_connection_enter(conn);
 		res = demarshal[msg->opcode].func(resource, msg);
 		pw_protocol_native_connection_leave(conn);
-		pw_resource_unref(resource);
 
 		if (res < 0) {
 			pw_resource_errorf_id(resource, msg->id,
@@ -429,6 +433,7 @@ process_messages(struct client_data *data)
 					msg->id, msg->opcode, spa_strerror(res));
 			debug_msg("*invalid message*", msg, true);
 		}
+		pw_resource_unref(resource);
 	}
 	res = 0;
 done:
@@ -593,6 +598,39 @@ static bool check_print(const uint8_t *buffer, int len)
 	return true;
 }
 
+#if defined(__linux__)
+/** Retrieve the peer's supplementary group list via SO_PEERGROUPS and store
+ *  as a JSON array property on the client connection. */
+static void
+set_supplementary_gids(struct pw_properties *props, int fd)
+{
+	gid_t gids[128];
+	socklen_t len = sizeof(gids);
+
+	if (getsockopt(fd, SOL_SOCKET, SO_PEERGROUPS, gids, &len) < 0) {
+		pw_log_debug("no SO_PEERGROUPS: %m");
+		return;
+	}
+
+	size_t n = len / sizeof(gid_t);
+	if (n == 0)
+		return;
+
+	struct spa_json_builder b;
+	spa_autofree char *str = NULL;
+	size_t size;
+	if (spa_json_builder_memstream(&b, &str, &size, 0) < 0)
+		return;
+	spa_json_builder_array_push(&b, "[");
+	for (size_t i = 0; i < n; i++)
+		spa_json_builder_array_uint(&b, gids[i]);
+	spa_json_builder_pop(&b, "]");
+	spa_json_builder_close(&b);
+
+	pw_properties_set(props, PW_KEY_SEC_GIDS, str);
+}
+#endif /* __linux__ */
+
 static struct client_data *client_new(struct server *s, int fd)
 {
 	struct client_data *this;
@@ -622,6 +660,7 @@ static struct client_data *client_new(struct server *s, int fd)
 		pw_properties_setf(props, PW_KEY_SEC_PID, "%d", ucred.pid);
 		pw_properties_setf(props, PW_KEY_SEC_UID, "%d", ucred.uid);
 		pw_properties_setf(props, PW_KEY_SEC_GID, "%d", ucred.gid);
+		set_supplementary_gids(props, fd);
 	}
 
 	len = sizeof(buffer);
@@ -632,13 +671,15 @@ static struct client_data *client_new(struct server *s, int fd)
 			pw_log_warn("server %p: security label error: %m", s);
 	} else {
 		if (!check_print(buffer, len)) {
-			char *hex, *p;
+			char *hex;
+			struct spa_strbuf b;
 			static const char *ch = "0123456789abcdef";
 
-			p = hex = alloca(len * 2 + 10);
-			p += snprintf(p, 5, "hex:");
+			hex = alloca(len * 2 + 10);
+			spa_strbuf_init(&b, hex, len * 2 + 10);
+			spa_strbuf_append(&b, "hex:");
 			for(i = 0; i < (int)len; i++)
-				p += snprintf(p, 3, "%c%c",
+				spa_strbuf_append(&b, "%c%c",
 						ch[buffer[i] >> 4], ch[buffer[i] & 0xf]);
 			pw_properties_set(props, PW_KEY_SEC_LABEL, hex);
 
@@ -841,7 +882,7 @@ close_data(void *data, int fd, uint32_t mask)
 static int write_socket_address(struct server *s)
 {
 	long v;
-	int fd, res = 0;
+	int fd, res;
 	char *endptr;
 	const char *env = getenv("PIPEWIRE_NOTIFICATION_FD");
 
@@ -855,24 +896,25 @@ static int write_socket_address(struct server *s)
 	if (errno != 0) {
 		res = -errno;
 		pw_log_error("server %p: strtol() failed with error: %m", s);
-		goto error;
+		goto exit;
 	}
 	fd = (int)v;
-	if (v != fd) {
+	if (fd < 0 || v != fd) {
 		res = -ERANGE;
 		pw_log_error("server %p: invalid fd %ld: %s", s, v, spa_strerror(res));
-		goto error;
+		goto exit;
 	}
 	if (dprintf(fd, "%s\n", s->addr.sun_path) < 0) {
 		res = -errno;
 		pw_log_error("server %p: dprintf() failed with error: %m", s);
-		goto error;
+		goto exit_close;
 	}
-	close(fd);
-	unsetenv("PIPEWIRE_NOTIFICATION_FD");
-	return 0;
+	res = 0;
 
-error:
+exit_close:
+	close(fd);
+exit:
+	unsetenv("PIPEWIRE_NOTIFICATION_FD");
 	return res;
 }
 
@@ -903,7 +945,8 @@ static int set_socket_permissions(struct server *s, struct socket_info *info)
 static int add_socket(struct pw_protocol *protocol, struct server *s, struct socket_info *info)
 {
 	socklen_t size;
-	int fd = -1, res;
+	spa_autoclose int fd = -1;
+	int res;
 	bool activated = false;
 
 	{
@@ -936,13 +979,13 @@ static int add_socket(struct pw_protocol *protocol, struct server *s, struct soc
 					res = -errno;
 					pw_log_error("server %p: stat %s failed with error: %m",
 							s, s->addr.sun_path);
-					goto error_close;
+					goto error;
 				}
 			} else if (S_ISLNK(socket_stat.st_mode)) {
 				pw_log_error("server %p: refusing to follow symlink at %s",
 						s, s->addr.sun_path);
 				res = -EACCES;
-				goto error_close;
+				goto error;
 			} else if (S_ISSOCK(socket_stat.st_mode) &&
 				   (socket_stat.st_mode & S_IWUSR || socket_stat.st_mode & S_IWGRP)) {
 				unlink(s->addr.sun_path);
@@ -954,20 +997,20 @@ static int add_socket(struct pw_protocol *protocol, struct server *s, struct soc
 		if (bind(fd, (struct sockaddr *) &s->addr, size) < 0) {
 			res = -errno;
 			pw_log_error("server %p: bind() failed with error: %m", s);
-			goto error_close;
+			goto error;
 		}
 
 		if ((res = set_socket_permissions(s, info)) < 0) {
 			errno = -res;
 			pw_log_error("server %p: failed to set socket %s permissions: %m",
 					s, info->name);
-			goto error_close;
+			goto error;
 		}
 
 		if (listen(fd, 128) < 0) {
 			res = -errno;
 			pw_log_error("server %p: listen() failed with error: %m", s);
-			goto error_close;
+			goto error;
 		}
 	} else {
 		if (info->has_owner || info->has_mode || info->selinux_context)
@@ -979,12 +1022,12 @@ static int add_socket(struct pw_protocol *protocol, struct server *s, struct soc
 	s->loop = pw_context_get_main_loop(protocol->context);
 	if (s->loop == NULL) {
 		res = -errno;
-		goto error_close;
+		goto error;
 	}
-	s->source = pw_loop_add_io(s->loop, fd, SPA_IO_IN, true, socket_data, s);
+	s->source = pw_loop_add_io(s->loop, spa_steal_fd(fd), SPA_IO_IN, true, socket_data, s);
 	if (s->source == NULL) {
 		res = -errno;
-		goto error_close;
+		goto error;
 	}
 	res = write_socket_address(s);
 	if (res < 0) {
@@ -993,8 +1036,6 @@ static int add_socket(struct pw_protocol *protocol, struct server *s, struct soc
 	}
 	return 0;
 
-error_close:
-	close(fd);
 error:
 	return res;
 
@@ -1675,6 +1716,8 @@ static int create_servers(struct pw_protocol *this, struct pw_impl_core *core,
 	const char *sockets = args ? pw_properties_get(args, "sockets") : NULL;
 	struct spa_json it[2];
 	spa_autoptr(pw_properties) p = pw_properties_copy(props);
+	if (p == NULL)
+		return -errno;
 
 	if (sockets == NULL) {
 		struct socket_info info = {0};

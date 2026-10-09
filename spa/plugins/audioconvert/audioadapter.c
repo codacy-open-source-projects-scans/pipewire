@@ -64,7 +64,7 @@ struct impl {
 	struct spa_node *convert;
 	struct spa_hook convert_listener;
 	uint64_t convert_port_flags;
-	char *convertname;
+	char convertname[64];
 
 	uint32_t n_buffers;
 	struct spa_buffer **buffers;
@@ -171,15 +171,34 @@ static int convert_enum_port_config(struct impl *this,
 		int seq, uint32_t id, uint32_t start, uint32_t num,
 		const struct spa_pod *filter, struct spa_pod_builder *builder)
 {
-	struct spa_pod *f1, *f2 = NULL;
+	struct spa_pod *f1, *f2 = NULL, *format = NULL;
+	struct spa_pod_frame f[1];
+	uint32_t fmt_id, fmt_start = 0;
 	int res;
 
 	if (this->convert == NULL)
 		return 0;
 
-	f1 = spa_pod_builder_add_object(builder,
-		SPA_TYPE_OBJECT_ParamPortConfig, id,
-			SPA_PARAM_PORT_CONFIG_direction, SPA_POD_Id(this->direction));
+	if (id == SPA_PARAM_EnumPortConfig)
+		fmt_id = SPA_PARAM_EnumFormat;
+	else
+		fmt_id = SPA_PARAM_Format;
+
+	res = spa_node_port_enum_params_sync(this->follower,
+			this->direction, 0,
+			fmt_id, &fmt_start, NULL, &format, builder);
+
+	spa_pod_builder_push_object(builder, &f[0],
+		SPA_TYPE_OBJECT_ParamPortConfig, id);
+	spa_pod_builder_add(builder,
+			SPA_PARAM_PORT_CONFIG_direction, SPA_POD_Id(this->direction),
+			0);
+	if (res > 0) {
+		spa_pod_builder_add(builder,
+			SPA_PARAM_PORT_CONFIG_internalFormat, SPA_POD_Pod(format),
+			0);
+	}
+	f1 = spa_pod_builder_pop(builder, &f[0]);
 
 	if (filter) {
 		if ((res = spa_pod_filter(builder, &f2, f1, filter)) < 0)
@@ -222,13 +241,20 @@ next:
 	case SPA_PARAM_EnumPortConfig:
 	case SPA_PARAM_PortConfig:
 		if (this->mode == SPA_PARAM_PORT_CONFIG_MODE_passthrough) {
+			struct spa_pod *format = NULL;
+			res = spa_node_port_enum_params_sync(this->follower,
+					this->direction, 0,
+					SPA_PARAM_Format, &result.index, NULL, &format, &b.b);
+
 			switch (result.index) {
 			case 0:
 				result.param = spa_pod_builder_add_object(&b.b,
 					SPA_TYPE_OBJECT_ParamPortConfig, id,
 					SPA_PARAM_PORT_CONFIG_direction, SPA_POD_Id(this->direction),
 					SPA_PARAM_PORT_CONFIG_mode,      SPA_POD_Id(
-						SPA_PARAM_PORT_CONFIG_MODE_passthrough));
+						SPA_PARAM_PORT_CONFIG_MODE_passthrough),
+					SPA_PARAM_PORT_CONFIG_format, SPA_POD_Pod(format),
+					SPA_PARAM_PORT_CONFIG_internalFormat, SPA_POD_Pod(format));
 				result.next++;
 				res = 1;
 				break;
@@ -864,7 +890,7 @@ static int impl_node_set_param(void *object, uint32_t id, uint32_t flags,
 
 			if (info.media_subtype == SPA_MEDIA_SUBTYPE_raw) {
 				info.info.raw.rate = 0;
-			} else {
+			} else if (mode != SPA_PARAM_PORT_CONFIG_MODE_passthrough) {
 				const char *subtype_name = spa_type_to_short_name(info.media_subtype,
 										spa_type_media_subtype,
 										"<unknown>");
@@ -1448,20 +1474,33 @@ static void follower_port_info(void *data,
 			if (this->add_listener)
 				continue;
 
-			if (idx == IDX_Latency && this->in_recalc == 0) {
-				res = recalc_latency(this, this->follower, direction, port_id, this->target);
-				spa_log_debug(this->log, "latency: %d (%s)", res,
-						spa_strerror(res));
-			}
-			if (idx == IDX_Tag && this->in_recalc == 0) {
-				res = recalc_tag(this, this->follower, direction, port_id, this->target);
-				spa_log_debug(this->log, "tag: %d (%s)", res,
-						spa_strerror(res));
-			}
-			if (idx == IDX_EnumFormat) {
-				spa_log_debug(this->log, "new EnumFormat from follower");
+			switch (idx) {
+			case IDX_Latency:
+				if (this->in_recalc == 0) {
+					res = recalc_latency(this, this->follower, direction, port_id, this->target);
+					spa_log_debug(this->log, "latency: %d (%s)", res,
+							spa_strerror(res));
+				}
+				break;
+			case IDX_Tag:
+				if (this->in_recalc == 0) {
+					res = recalc_tag(this, this->follower, direction, port_id, this->target);
+					spa_log_debug(this->log, "tag: %d (%s)", res,
+							spa_strerror(res));
+				}
+				break;
+			case IDX_Format:
+				spa_log_debug(this->log, "new format");
+				this->params[IDX_PortConfig].user++;
+				break;
+			case IDX_EnumFormat:
+				spa_log_debug(this->log, "new formats");
+				this->params[IDX_EnumPortConfig].user++;
 				/* we will renegotiate when restarting */
 				this->recheck_format = true;
+				break;
+			default:
+				break;
 			}
 
 			this->params[idx].user++;
@@ -1996,7 +2035,7 @@ static int load_converter(struct impl *this, const struct spa_dict *info,
 	this->hnd_convert = hnd_convert;
 	this->convert = iface_conv;
 	this->unload_handle = unload_handle;
-	this->convertname = strdup(factory_name);
+	snprintf(this->convertname, sizeof(this->convertname), "%s", factory_name);
 
 	return 0;
 }
@@ -2119,6 +2158,8 @@ static int impl_clear(struct spa_handle *handle)
 
 	this = (struct impl *) handle;
 
+	activate_io(this, false);
+
 	spa_hook_remove(&this->follower_listener);
 	spa_node_set_callbacks(this->follower, NULL, NULL);
 
@@ -2129,7 +2170,6 @@ static int impl_clear(struct spa_handle *handle)
 			spa_handle_clear(this->hnd_convert);
 			free(this->hnd_convert);
 		}
-		free(this->convertname);
 	}
 
 	clear_buffers(this);

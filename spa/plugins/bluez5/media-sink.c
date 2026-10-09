@@ -544,9 +544,11 @@ static int apply_props(struct impl *this, const struct spa_pod *param)
 	if (param == NULL) {
 		reset_props(this, &new_props);
 	} else {
-		spa_pod_parse_object(param,
+		changed = spa_pod_parse_object(param,
 				SPA_TYPE_OBJECT_Props, NULL,
 				SPA_PROP_latencyOffsetNsec, SPA_POD_OPT_Long(&new_props.latency_offset));
+		if (changed < 0)
+			return changed;
 	}
 
 	changed = (memcmp(&new_props, &this->props, sizeof(struct props)) != 0);
@@ -1685,6 +1687,10 @@ static int transport_start(struct impl *this)
 	return 0;
 
 fail:
+	if (this->update_delay_event) {
+		spa_loop_utils_destroy_source(this->loop_utils, this->update_delay_event);
+		this->update_delay_event = NULL;
+	}
 	if (this->codec_data) {
 		if (this->own_codec_data)
 			this->codec->deinit(this->codec_data);
@@ -1854,6 +1860,9 @@ static int impl_node_send_command(void *object, const struct spa_command *comman
 	case SPA_NODE_COMMAND_Pause:
 		if ((res = do_stop(this)) < 0)
 			return res;
+		break;
+	case SPA_NODE_COMMAND_ParamBegin:
+	case SPA_NODE_COMMAND_ParamEnd:
 		break;
 	default:
 		return -ENOTSUP;
@@ -2437,6 +2446,9 @@ static int do_transport_destroy(struct spa_loop *loop,
 				void *user_data)
 {
 	struct impl *this = user_data;
+
+	if (this->transport)
+		spa_hook_remove(&this->transport_listener);
 	this->transport = NULL;
 	return 0;
 }
@@ -2445,6 +2457,15 @@ static void transport_destroy(void *data)
 {
 	struct impl *this = data;
 	spa_log_debug(this->log, "transport %p destroy", this->transport);
+	spa_loop_locked(this->data_loop, do_transport_destroy, 0, NULL, 0, this);
+}
+
+static void transport_remove_node(void *data)
+{
+	struct impl *this = data;
+
+	spa_log_debug(this->log, "transport %p remove node", this->transport);
+	do_stop(this);
 	spa_loop_locked(this->data_loop, do_transport_destroy, 0, NULL, 0, this);
 }
 
@@ -2485,7 +2506,7 @@ static void transport_state_changed(void *data,
 
 		spa_pod_builder_init(&b, buffer, sizeof(buffer));
 		spa_node_emit_event(&this->hooks,
-				spa_pod_builder_add_object(&b,
+				(struct spa_event*)spa_pod_builder_add_object(&b,
 						SPA_TYPE_EVENT_Node, SPA_NODE_EVENT_Error));
 	}
 }
@@ -2495,6 +2516,7 @@ static const struct spa_bt_transport_events transport_events = {
 	.delay_changed = transport_delay_changed,
 	.state_changed = transport_state_changed,
 	.destroy = transport_destroy,
+	.remove_node = transport_remove_node,
 };
 
 static int impl_get_interface(struct spa_handle *handle, const char *type, void **interface)
@@ -2523,10 +2545,13 @@ static int impl_clear(struct spa_handle *handle)
 		this->codec->clear_props(this->codec_props);
 	if (this->transport)
 		spa_hook_remove(&this->transport_listener);
-	spa_system_close(this->data_system, this->timerfd);
-	spa_system_close(this->data_system, this->flush_timerfd);
-	if (this->codec->kind == MEDIA_CODEC_ASHA) {
-		spa_system_close(this->data_system, this->asha->timerfd);
+	if (this->timerfd > 0)
+		spa_system_close(this->data_system, this->timerfd);
+	if (this->flush_timerfd > 0)
+		spa_system_close(this->data_system, this->flush_timerfd);
+	if (this->codec->kind == MEDIA_CODEC_ASHA && this->asha) {
+		if (this->asha->timerfd > 0)
+			spa_system_close(this->data_system, this->asha->timerfd);
 		free(this->asha);
 	}
 	return 0;
@@ -2549,6 +2574,7 @@ impl_init(const struct spa_handle_factory *factory,
 	struct impl *this;
 	struct port *port;
 	const char *str;
+	int res;
 
 	spa_return_val_if_fail(factory != NULL, -EINVAL);
 	spa_return_val_if_fail(handle != NULL, -EINVAL);
@@ -2671,22 +2697,33 @@ impl_init(const struct spa_handle_factory *factory,
 	spa_bt_transport_add_listener(this->transport,
 			&this->transport_listener, &transport_events, this);
 
-	this->timerfd = spa_system_timerfd_create(this->data_system,
-			CLOCK_MONOTONIC, SPA_FD_CLOEXEC | SPA_FD_NONBLOCK);
+	if ((res = spa_system_timerfd_create(this->data_system,
+			CLOCK_MONOTONIC, SPA_FD_CLOEXEC | SPA_FD_NONBLOCK)) < 0)
+		goto error;
+	this->timerfd = res;
 
-	this->flush_timerfd = spa_system_timerfd_create(this->data_system,
-			CLOCK_MONOTONIC, SPA_FD_CLOEXEC | SPA_FD_NONBLOCK);
+	if ((res = spa_system_timerfd_create(this->data_system,
+			CLOCK_MONOTONIC, SPA_FD_CLOEXEC | SPA_FD_NONBLOCK)) < 0)
+		goto error;
+	this->flush_timerfd = res;
 
 	if (this->codec->kind == MEDIA_CODEC_ASHA) {
 		this->asha = calloc(1, sizeof(struct spa_bt_asha));
-		if (this->asha == NULL)
-			return -ENOMEM;
-
-		this->asha->timerfd = spa_system_timerfd_create(this->data_system,
-				CLOCK_MONOTONIC, SPA_FD_CLOEXEC | SPA_FD_NONBLOCK);
+		if (this->asha == NULL) {
+			res = -errno;
+			goto error;
+		}
+		this->asha->timerfd = -1;
+		if ((res = spa_system_timerfd_create(this->data_system,
+				CLOCK_MONOTONIC, SPA_FD_CLOEXEC | SPA_FD_NONBLOCK)) < 0)
+			goto error;
+		this->asha->timerfd = res;
 	}
-
 	return 0;
+
+error:
+	impl_clear(handle);
+	return res;
 }
 
 static const struct spa_interface_info impl_interfaces[] = {

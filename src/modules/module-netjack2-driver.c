@@ -33,6 +33,8 @@
 #include <pipewire/impl.h>
 #include <pipewire/i18n.h>
 
+#undef N2J_PACKET_DEBUG
+
 #include "module-netjack2/packets.h"
 #include "module-netjack2/peer.c"
 #include "network-utils.h"
@@ -138,8 +140,6 @@
 
 PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
 #define PW_LOG_TOPIC_DEFAULT mod_topic
-
-#define MAX_PORTS	128
 
 #define DEFAULT_NET_IP		"225.3.19.154"
 #define DEFAULT_NET_PORT	19000
@@ -461,6 +461,10 @@ static void make_stream_ports(struct stream *s)
 
 			is_midi = true;
 		}
+		if (props == NULL) {
+			pw_log_error("Can't create properties: %m");
+			return;
+		}
 		latency = SPA_LATENCY_INFO(s->direction,
 				.min_quantum = impl->latency,
 				.max_quantum = impl->latency);
@@ -500,6 +504,9 @@ static void parse_props(struct stream *s, const struct spa_pod *param)
 	uint8_t buffer[1024];
 	struct spa_pod_builder b;
 	const struct spa_pod *params[1];
+
+	if (!spa_pod_is_object_type(param, SPA_TYPE_OBJECT_Props))
+		return;
 
 	SPA_POD_OBJECT_FOREACH(obj, prop) {
 		switch (prop->key) {
@@ -676,11 +683,11 @@ on_data_io(void *data, int fd, uint32_t mask)
 	}
 	if (mask & SPA_IO_IN) {
 		bool source_running, sink_running;
-		uint32_t nframes;
+		int32_t nframes;
 		uint64_t nsec;
 
 		nframes = netjack2_driver_sync_wait(&impl->peer);
-		if (nframes == 0)
+		if (nframes <= 0)
 			return;
 
 		nsec = get_time_nsec(impl);
@@ -729,19 +736,6 @@ on_data_io(void *data, int fd, uint32_t mask)
 	}
 }
 
-static bool is_multicast(struct sockaddr *sa, socklen_t salen)
-{
-	if (sa->sa_family == AF_INET) {
-		static const uint32_t ipv4_mcast_mask = 0xe0000000;
-		struct sockaddr_in *sa4 = (struct sockaddr_in*)sa;
-		return (ntohl(sa4->sin_addr.s_addr) & ipv4_mcast_mask) == ipv4_mcast_mask;
-	} else if (sa->sa_family == AF_INET6) {
-		struct sockaddr_in6 *sa6 = (struct sockaddr_in6*)sa;
-		return sa6->sin6_addr.s6_addr[0] == 0xff;
-	}
-	return false;
-}
-
 static int make_socket(struct sockaddr_storage *src, socklen_t src_len,
 		struct sockaddr_storage *dst, socklen_t dst_len,
 		bool loop, int ttl, int dscp, const char *ifname)
@@ -787,7 +781,7 @@ static int make_socket(struct sockaddr_storage *src, socklen_t src_len,
 		pw_log_error("bind() failed: %m");
 		goto error;
 	}
-	if (is_multicast((struct sockaddr*)dst, dst_len)) {
+	if (pw_net_is_multicast(dst)) {
 		val = loop;
 		if (setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &val, sizeof(val)) < 0)
 			pw_log_warn("setsockopt(IP_MULTICAST_LOOP) failed: %m");
@@ -846,6 +840,7 @@ static int handle_follower_setup(struct impl *impl, struct nj2_session_params *p
 	    peer->params.recv_midi_channels < 0 ||
 	    peer->params.sample_rate == 0 ||
 	    peer->params.period_size == 0 ||
+	    peer->params.period_size > impl->quantum_limit ||
 	    peer->params.mtu == 0 ||
 	    peer->params.mtu > MAX_MTU ||
 	    !encoding_supported(peer->params.sample_encoder)) {
@@ -860,7 +855,8 @@ static int handle_follower_setup(struct impl *impl, struct nj2_session_params *p
 	pw_loop_update_io(impl->main_loop, impl->setup_socket, 0);
 
 	impl->sink.n_ports = peer->params.send_audio_channels + peer->params.send_midi_channels;
-	if (impl->sink.n_ports > MAX_PORTS) {
+	if (impl->sink.n_ports > MAX_PORTS ||
+	    (uint32_t)peer->params.send_audio_channels > MAX_CHANNELS) {
 		pw_log_warn("Too many follower sink ports %d > %d", impl->sink.n_ports, MAX_PORTS);
 		return -EINVAL;
 	}
@@ -871,7 +867,8 @@ static int handle_follower_setup(struct impl *impl, struct nj2_session_params *p
 			impl->sink.info.position[i] = SPA_AUDIO_CHANNEL_AUX0 + i;
 	}
 	impl->source.n_ports = peer->params.recv_audio_channels + peer->params.recv_midi_channels;
-	if (impl->source.n_ports > MAX_PORTS) {
+	if (impl->source.n_ports > MAX_PORTS ||
+	    (uint32_t)peer->params.recv_audio_channels > MAX_CHANNELS) {
 		pw_log_warn("Too many follower source ports %d > %d", impl->source.n_ports, MAX_PORTS);
 		return -EINVAL;
 	}
@@ -923,7 +920,10 @@ static int handle_follower_setup(struct impl *impl, struct nj2_session_params *p
 	peer->send_volume = &impl->sink.volume;
 	peer->recv_volume = &impl->source.volume;
 	peer->quantum_limit = impl->quantum_limit;
-	netjack2_init(peer);
+	if ((res = netjack2_init(peer)) < 0) {
+		pw_log_error("can't init peer: %s", spa_strerror(res));
+		return res;
+	}
 
 	int bufsize = SPA_MIN((size_t)NETWORK_MAX_LATENCY * (peer->params.mtu +
 		(size_t)peer->params.period_size * sizeof(float) *
@@ -1072,7 +1072,6 @@ static int create_netjack2_socket(struct impl *impl)
 	if (impl->setup_socket == NULL) {
 		res = -errno;
 		pw_log_error("can't create setup source: %m");
-		close(fd);
 		goto out;
 	}
 
@@ -1157,6 +1156,7 @@ static void on_timer_event(void *data)
 		}
 		send_follower_available(impl);
 	}
+	update_timer(impl, FOLLOWER_INIT_TIMEOUT);
 }
 
 static void core_error(void *data, uint32_t id, int seq, int res, const char *message)

@@ -25,8 +25,7 @@ using namespace libcamera;
 #include <spa/monitor/device.h>
 #include <spa/monitor/utils.h>
 
-#include "libcamera.h"
-#include "libcamera-manager.hpp"
+#include "libcamera.hpp"
 
 namespace {
 
@@ -118,9 +117,7 @@ void remove_device(struct impl *impl, struct device *device)
 int emit_object_info(struct impl *impl, const struct device *device)
 {
 	struct spa_device_object_info info;
-	struct spa_dict_item items[20];
 	struct spa_dict dict;
-	uint32_t n_items = 0;
 
 	info = SPA_DEVICE_OBJECT_INFO_INIT();
 
@@ -130,14 +127,16 @@ int emit_object_info(struct impl *impl, const struct device *device)
 		SPA_DEVICE_OBJECT_CHANGE_MASK_PROPS;
 	info.flags = 0;
 
-#define ADD_ITEM(key, value) items[n_items++] = SPA_DICT_ITEM_INIT(key, value)
-	ADD_ITEM(SPA_KEY_DEVICE_ENUM_API,"libcamera.manager");
-	ADD_ITEM(SPA_KEY_DEVICE_API, "libcamera");
-	ADD_ITEM(SPA_KEY_MEDIA_CLASS, "Video/Device");
-	ADD_ITEM(SPA_KEY_API_LIBCAMERA_PATH, device->camera->id().c_str());
-#undef ADD_ITEM
+	const spa_dict_item items[] = {
+		{ SPA_KEY_DEVICE_ENUM_API, "libcamera.manager" },
+		{ SPA_KEY_DEVICE_API, "libcamera" },
+		{ SPA_KEY_MEDIA_CLASS, "Video/Device" },
+		{ SPA_KEY_API_LIBCAMERA_PATH, device->camera->id().c_str() },
+		{ KEY_VERSION_LIBRARY, libcamera_library_version() },
+		{ KEY_VERSION_HEADER, libcamera_header_version() },
+	};
 
-	dict = SPA_DICT_INIT(items, n_items);
+	dict = SPA_DICT_INIT_ARRAY(items);
 	info.props = &dict;
 	spa_device_emit_object_info(&impl->hooks, impl->id_of(*device), &info);
 
@@ -389,23 +388,4 @@ const struct spa_handle_factory spa_libcamera_manager_factory = {
 	impl_init,
 	impl_enum_interface_info,
 };
-}
-
-std::shared_ptr<CameraManager> libcamera_manager_acquire(int& res)
-{
-	static std::weak_ptr<CameraManager> global_manager;
-	static std::mutex lock;
-
-	std::lock_guard guard(lock);
-
-	if (auto manager = global_manager.lock())
-		return manager;
-
-	auto manager = std::make_shared<CameraManager>();
-	if ((res = manager->start()) < 0)
-		return {};
-
-	global_manager = manager;
-
-	return manager;
 }

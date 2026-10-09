@@ -21,6 +21,7 @@
 #define NAME "settings"
 
 #define DEFAULT_CLOCK_RATE			48000u
+#define DEFAULT_CLOCK_MIN_RATE			1u
 #define DEFAULT_CLOCK_RATES			"[ 48000 ]"
 #define DEFAULT_CLOCK_QUANTUM			1024u
 #define DEFAULT_CLOCK_MIN_QUANTUM		32u
@@ -37,6 +38,7 @@
 #define DEFAULT_MEM_ALLOW_MLOCK			true
 #define DEFAULT_CHECK_QUANTUM			false
 #define DEFAULT_CHECK_RATE			false
+#define DEFAULT_USE_FALLBACK			true
 
 struct impl {
 	struct pw_context *context;
@@ -110,7 +112,7 @@ static uint32_t parse_clock_rate(struct pw_properties *properties, const char *n
 		uint32_t *rates, const char *def_rates, uint32_t def)
 {
 	const char *str;
-	uint32_t count = 0;
+	uint32_t i, count = 0;
 
 	if ((str = pw_properties_get(properties, name)) == NULL)
 		str = def_rates;
@@ -120,6 +122,9 @@ static uint32_t parse_clock_rate(struct pw_properties *properties, const char *n
 		count = parse_uint32_array(def_rates, rates, MAX_RATES, def);
 	if (count == 0)
 		goto fallback;
+
+	for (i = 0; i < count; i++)
+		rates[i] = SPA_MAX(rates[i], DEFAULT_CLOCK_MIN_RATE);
 
 	return count;
 fallback:
@@ -206,6 +211,7 @@ void pw_settings_init(struct pw_context *this)
 	struct settings *d = &this->defaults;
 
 	d->clock_rate = get_default_int(p, "default.clock.rate", DEFAULT_CLOCK_RATE);
+	d->clock_rate = SPA_MAX(d->clock_rate, DEFAULT_CLOCK_MIN_RATE);
 	d->n_clock_rates = parse_clock_rate(p, "default.clock.allowed-rates", d->clock_rates,
 			DEFAULT_CLOCK_RATES, d->clock_rate);
 	d->clock_quantum = get_default_int(p, "default.clock.quantum", DEFAULT_CLOCK_QUANTUM);
@@ -227,6 +233,7 @@ void pw_settings_init(struct pw_context *this)
 
 	d->check_quantum = get_default_bool(p, "settings.check-quantum", DEFAULT_CHECK_QUANTUM);
 	d->check_rate = get_default_bool(p, "settings.check-rate", DEFAULT_CHECK_RATE);
+	d->use_fallback = get_default_bool(p, "library.use-fallback", DEFAULT_USE_FALLBACK);
 
 	d->link_max_buffers = SPA_MAX(d->link_max_buffers, 1u);
 

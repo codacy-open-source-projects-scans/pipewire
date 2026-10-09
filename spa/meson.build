@@ -94,6 +94,9 @@ if get_option('spa-plugins').allowed()
     endif
     summary({'LDAC DEC': ldac_dec_dep.found()}, bool_yn: true, section: 'Bluetooth audio codecs')
 
+    lhdc_dep = dependency('lhdcv5', required : get_option('bluez5-codec-lhdc'))
+    summary({'LHDC v5': lhdc_dep.found()}, bool_yn: true, section: 'Bluetooth audio codecs')
+
     aptx_dep = dependency('libfreeaptx', required : get_option('bluez5-codec-aptx'))
     summary({'aptX': aptx_dep.found()}, bool_yn: true, section: 'Bluetooth audio codecs')
     fdk_aac_dep = dependency('fdk-aac', required : get_option('bluez5-codec-aac'))
@@ -131,7 +134,7 @@ if get_option('spa-plugins').allowed()
   endif
   summary({'Vulkan': have_vulkan}, bool_yn: true, section: 'Misc dependencies')
 
-  libcamera_dep = dependency('libcamera', version: '>= 0.2.0', required: get_option('libcamera'))
+  libcamera_dep = dependency('libcamera', version: '>= 0.6.0', required: get_option('libcamera'))
   summary({'libcamera': libcamera_dep.found()}, bool_yn: true, section: 'Backend')
 
   compress_offload_option = get_option('compress-offload')

@@ -31,6 +31,7 @@
 #include <pipewire/pipewire.h>
 #include <pipewire/impl.h>
 
+#include <module-rtp/rtp.h>
 #include <module-rtp/stream.h>
 #include "network-utils.h"
 
@@ -42,6 +43,9 @@
  * This module is usually loaded from the \ref page_module_rtp_sap so that the
  * source.ip and source.port and format parameters matches that of the sender that
  * is announced via SAP.
+ *
+ * For the internal design of the shared RTP stream implementation (ring buffer,
+ * buffer modes, and threading model), see \ref page_rtp_module_internals .
  *
  * ## Module Name
  *
@@ -61,6 +65,9 @@
  * - `sess.media = <string>`: the media type audio|midi|opus, default audio
  * - `sess.ts-direct = <bool>`: use direct timestamp mode, default false
  *                (see the Buffer Modes section below)
+ * - `sess.delay-compensation = <bool>`: Do end-to-end delay compensation, default false.
+ *                Only used in constant latency mode. When true sess.latency.msec sets
+ *                a target latency for the entire graph instead of a fixed network buffer.
  * - `stream.may-pause = <bool>`: pause the stream when no data is reveived, default false
  * - `stream.props = {}`: properties to be passed to the stream
  *
@@ -81,6 +88,7 @@
  * - \ref PW_KEY_NODE_GROUP
  * - \ref PW_KEY_NODE_LATENCY
  * - \ref PW_KEY_NODE_VIRTUAL
+ * - \ref PW_KEY_NODE_NETWORK
  *
  * ## Example configuration
  *\code{.unparsed}
@@ -149,6 +157,8 @@
  *    so any output sinks in the graph will already adjust their consumption pace to
  *    match the pace of the graph driver.
  *    AES67 sessions use this mode, for example.
+ *    \note If an RTP source uses this mode, the associated \ref page_module_rtp_sink
+ *    _must_ use this mode as well.
  *
  * \since 0.3.60
  */
@@ -171,8 +181,9 @@ PW_LOG_TOPIC(mod_topic, "mod." NAME);
  		"source.port=<int, source port> "								\
 		"( sess.latency.msec=<target network latency, default "SPA_STRINGIFY(DEFAULT_SESS_LATENCY)"> ) "\
 		"( sess.ignore-ssrc=<to ignore SSRC, default false> ) "\
+		"( sess.delay-compensation=<treat latency as end-to-end latency, default false> ) "\
  		"( sess.media=<string, the media type audio|midi|opus, default audio> ) "			\
-		"( audio.format=<format, default:"DEFAULT_FORMAT"> ) "						\
+		"( audio.format=<format, default:"DEFAULT_RAW_AUDIO_FORMAT"> ) "				\
 		"( audio.rate=<sample rate, default:"SPA_STRINGIFY(DEFAULT_RATE)"> ) "				\
 		"( audio.channels=<number of channels, default:"SPA_STRINGIFY(DEFAULT_CHANNELS)"> ) "		\
 		"( audio.position=<channel map, default:"DEFAULT_POSITION"> ) "					\
@@ -249,8 +260,7 @@ struct impl {
 	bool is_multicast;
 	bool filter_by_address;
 
-	uint8_t *buffer;
-	size_t buffer_size;
+	uint32_t mtu;
 
 #define STATE_IDLE	0
 #define STATE_PROBE	1
@@ -309,8 +319,26 @@ on_rtp_io(void *data, int fd, uint32_t mask)
 	current_time = get_time_ns(impl);
 
 	if (mask & SPA_IO_IN) {
-		if ((len = recvfrom(fd, impl->buffer, impl->buffer_size, 0, (struct sockaddr *)(&recvaddr), &recvaddr_len)) < 0)
+		struct rtp_packet *p;
+
+		if ((p = rtp_stream_get_free_packet(impl->stream)) == NULL)
+			goto out_of_packets;
+
+		if ((len = recvfrom(fd, p->data, p->maxsize,
+#ifdef __linux__
+				    /* Use this Linux specific feature to get the actual size of the
+				     * packet, even if it was truncated due to it being larger than
+				     * the buffer size. The code below uses this to detect packets
+				     * that exceed the MTU size. */
+				    MSG_TRUNC,
+#else
+				    0,
+#endif
+				    (struct sockaddr *)(&recvaddr), &recvaddr_len)) < 0)
 			goto receive_error;
+
+		if (SPA_UNLIKELY((size_t)len > p->maxsize))
+			goto packet_larger_than_mtu;
 
 		/* Filter the packets to exclude those with source addresses
 		 * that do not match the expected one. Only used with unicast.
@@ -338,13 +366,11 @@ on_rtp_io(void *data, int fd, uint32_t mask)
 			return;
 		}
 
-		if (len < 12)
-			goto short_packet;
-
 		if (SPA_LIKELY(impl->stream)) {
-			if (rtp_stream_receive_packet(impl->stream, impl->buffer, len,
-							current_time) < 0)
-				goto receive_error;
+			p->size = len;
+
+			if (rtp_stream_receive_packet(impl->stream, p, current_time) < 0)
+				goto process_error;
 		}
 
 		/* Update last packet timestamp for IGMP recovery.
@@ -362,14 +388,21 @@ on_rtp_io(void *data, int fd, uint32_t mask)
 	}
 	return;
 
+out_of_packets:
+	if ((suppressed = spa_ratelimit_test(&impl->rate_limit, current_time)) >= 0)
+		pw_log_warn("(%d suppressed) recv() out of packets: %m", suppressed);
+	return;
 receive_error:
 	if ((suppressed = spa_ratelimit_test(&impl->rate_limit, current_time)) >= 0)
 		pw_log_warn("(%d suppressed) recv() error: %m", suppressed);
 	return;
-short_packet:
+process_error:
+	return;
+packet_larger_than_mtu:
 	if ((suppressed = spa_ratelimit_test(&impl->rate_limit, current_time)) >= 0)
-		pw_log_warn("(%d suppressed) short packet of len %zd received",
-				suppressed, len);
+		pw_log_warn("(%d suppressed) packet received that is larger than "
+				"the configured MTU (%u bytes)",
+				suppressed, impl->mtu);
 	return;
 }
 
@@ -693,9 +726,8 @@ static void stream_open_connection(void *data, int *result)
 	impl->source = pw_loop_add_io(impl->data_loop, fd,
 				SPA_IO_IN, true, on_rtp_io, impl);
 	if (impl->source == NULL) {
-		pw_log_error("can't create io source: %m");
-		close(fd);
 		res = -errno;
+		pw_log_error("can't create io source: %m");
 		goto finish;
 	}
 
@@ -718,6 +750,18 @@ finish:
 		*result = res;
 }
 
+static int do_remove_source(struct spa_loop *loop, bool async, uint32_t seq,
+		const void *data, size_t size, void *user_data)
+{
+	struct impl *impl = user_data;
+
+	if (impl->source) {
+		pw_loop_destroy_source(impl->data_loop, impl->source);
+		impl->source = NULL;
+	}
+	return 0;
+}
+
 static void stream_close_connection(void *data, int *result)
 {
 	struct impl *impl = data;
@@ -733,8 +777,7 @@ static void stream_close_connection(void *data, int *result)
 	pw_timer_queue_cancel(&impl->stream_start_retry_timer);
 	pw_timer_queue_cancel(&impl->igmp_recovery.timer);
 
-	pw_loop_destroy_source(impl->data_loop, impl->source);
-	impl->source = NULL;
+	pw_loop_locked(impl->data_loop, do_remove_source, 1, NULL, 0, impl);
 }
 
 static void stream_destroy(void *d)
@@ -748,7 +791,7 @@ static void stream_props_changed(struct impl *impl, uint32_t id, const struct sp
 	struct spa_pod_object *obj = (struct spa_pod_object *)param;
 	struct spa_pod_prop *prop;
 
-	if (param == NULL)
+	if (!spa_pod_is_object_type(param, SPA_TYPE_OBJECT_Props))
 		return;
 
 	SPA_POD_OBJECT_FOREACH(obj, prop) {
@@ -860,10 +903,10 @@ static const struct pw_proxy_events core_proxy_events = {
 
 static void impl_destroy(struct impl *impl)
 {
+	if (impl->source)
+		pw_loop_locked(impl->data_loop, do_remove_source, 1, NULL, 0, impl);
 	if (impl->stream)
 		rtp_stream_destroy(impl->stream);
-	if (impl->source)
-		pw_loop_destroy_source(impl->data_loop, impl->source);
 
 	if (impl->core && impl->do_disconnect)
 		pw_core_disconnect(impl->core);
@@ -878,7 +921,6 @@ static void impl_destroy(struct impl *impl)
 	pw_properties_free(impl->stream_props);
 	pw_properties_free(impl->props);
 
-	free(impl->buffer);
 	free(impl->ifname);
 	free(impl);
 }
@@ -994,16 +1036,17 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	copy_props(impl, props, "sess.max-ptime");
 	copy_props(impl, props, "sess.latency.msec");
 	copy_props(impl, props, "sess.ts-direct");
+	copy_props(impl, props, "sess.delay-compensation");
 	copy_props(impl, props, "sess.ignore-ssrc");
 	copy_props(impl, props, "stream.may-pause");
 
 	str = pw_properties_get(props, "local.ifname");
 	impl->ifname = str ? strdup(str) : NULL;
 
-	impl->src_port = pw_properties_get_uint32(props, "source.port", 0);
-	if (impl->src_port == 0) {
+	str = pw_properties_get(props, "source.port");
+	if ((impl->src_port = pw_net_parse_port(str, 0)) == 0) {
 		res = -EINVAL;
-		pw_log_error("invalid source.port");
+		pw_log_error("invalid source.port '%s'", str);
 		goto out;
 	}
 	if ((str = pw_properties_get(props, "source.ip")) == NULL)
@@ -1089,13 +1132,7 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 		goto out;
 	}
 
-	impl->buffer_size = rtp_stream_get_mtu(impl->stream);
-	impl->buffer = calloc(1, impl->buffer_size);
-	if (impl->buffer == NULL) {
-		res = -errno;
-		pw_log_error("can't create packet buffer of size %zd: %m", impl->buffer_size);
-		goto out;
-	}
+	impl->mtu = rtp_stream_get_mtu(impl->stream);
 
 	pw_impl_module_add_listener(module, &impl->module_listener, &module_events, impl);
 

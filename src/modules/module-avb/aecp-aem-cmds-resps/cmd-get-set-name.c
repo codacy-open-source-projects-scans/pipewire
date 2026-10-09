@@ -12,6 +12,7 @@
 #include "../aecp-aem.h"
 #include "../aecp-aem-state.h"
 #include "../aecp-aem-descriptors.h"
+#include "../strings.h"
 
 
 #include "cmd-get-set-name.h"
@@ -145,7 +146,6 @@ int handle_cmd_get_name_common(struct aecp *aecp, int64_t now,
 
 /**
  * IEEE 1722.1-2021 7.4.17 SET_NAME
- * For now this is not handling UTF characters, only ASCII
  */
 int handle_cmd_set_name_common(struct aecp *aecp, int64_t now,
 	const void *m, int len)
@@ -156,7 +156,7 @@ int handle_cmd_set_name_common(struct aecp *aecp, int64_t now,
 	const struct avb_packet_aecp_aem_setget_name *cmd;
 	struct descriptor *desc;
 	uint16_t desc_type, desc_id, name_index;
-	char *name_ptr;
+	unsigned char *name_ptr;
 	int rc;
 
 	cmd = (const struct avb_packet_aecp_aem_setget_name *)p->payload;
@@ -169,7 +169,7 @@ int handle_cmd_set_name_common(struct aecp *aecp, int64_t now,
 		return reply_status(aecp,
 				AVB_AECP_AEM_STATUS_NO_SUCH_DESCRIPTOR, m, len);
 
-	name_ptr = get_name_ptr(desc_type, descriptor_body(desc), name_index);
+	name_ptr = (unsigned char *)get_name_ptr(desc_type, descriptor_body(desc), name_index);
 	if (name_ptr == NULL)
 		return reply_status(aecp,
 				AVB_AECP_AEM_STATUS_BAD_ARGUMENTS, m, len);
@@ -181,14 +181,17 @@ int handle_cmd_set_name_common(struct aecp *aecp, int64_t now,
 	/**
 	 * IEEE 1722.1-2021: 7.4.17.1: The name does not contain a trailing NULL
 	 * but if the name is less than 64 bytes in length then it is zero
-	 * padded
+	 * padded.
 	 */
-	memcpy(name_ptr, cmd->name, 64);
+	if (check_zero_padding(cmd->name, 64) == -1)
+		return reply_status(aecp,
+				AVB_AECP_AEM_STATUS_BAD_ARGUMENTS, m, len);
 
-	/** TODO: According to the specification, the string should alwasy be 0
-	 * terminated, the goal would be to check whether a string is UTF-8 and
-	 * that it is correctly zero terminitaed if less than 64 char, if not
-	 * then a simple memcpy is enough */
+	if (validate_utf8(cmd->name, 64) == -1)
+		return reply_status(aecp,
+				AVB_AECP_AEM_STATUS_BAD_ARGUMENTS, m, len);
+
+	memcpy(name_ptr, cmd->name, 64);
 
 	rc = reply_success(aecp, m, len);
 	if (rc < 0)

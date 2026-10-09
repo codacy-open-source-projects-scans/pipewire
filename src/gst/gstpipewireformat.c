@@ -443,7 +443,7 @@ add_limits (struct spa_pod_dynamic_builder *b, ConvertData *d)
       spa_pod_builder_rectangle (&b->b, v.width, v.height);
     }
     if (i > 0) {
-      choice = spa_pod_builder_pop(&b->b, &f);
+      choice = (struct spa_pod_choice *)spa_pod_builder_pop(&b->b, &f);
       if (i == 1)
         choice->body.type = SPA_CHOICE_None;
     }
@@ -461,7 +461,7 @@ add_limits (struct spa_pod_dynamic_builder *b, ConvertData *d)
       spa_pod_builder_fraction (&b->b, v.num, v.denom);
     }
     if (i > 0) {
-      choice = spa_pod_builder_pop(&b->b, &f);
+      choice = (struct spa_pod_choice *)spa_pod_builder_pop(&b->b, &f);
       if (i == 1)
         choice->body.type = SPA_CHOICE_None;
     }
@@ -479,7 +479,7 @@ add_limits (struct spa_pod_dynamic_builder *b, ConvertData *d)
       spa_pod_builder_fraction (&b->b, v.num, v.denom);
     }
     if (i > 0) {
-      choice = spa_pod_builder_pop(&b->b, &f);
+      choice = (struct spa_pod_choice *)spa_pod_builder_pop(&b->b, &f);
       if (i == 1)
         choice->body.type = SPA_CHOICE_None;
     }
@@ -646,42 +646,101 @@ handle_video_fields (ConvertData *d)
   }
 }
 
-static void
-set_default_channels (struct spa_pod_builder *b, uint32_t channels)
+static uint32_t
+gst_channel_to_spa (GstAudioChannelPosition pos)
 {
-  uint32_t position[8] = {0};
-  gboolean ok = TRUE;
-
-  switch (channels) {
-  case 8:
-    position[6] = SPA_AUDIO_CHANNEL_SL;
-    position[7] = SPA_AUDIO_CHANNEL_SR;
-    SPA_FALLTHROUGH
-  case 6:
-    position[5] = SPA_AUDIO_CHANNEL_LFE;
-    SPA_FALLTHROUGH
-  case 5:
-    position[4] = SPA_AUDIO_CHANNEL_FC;
-    SPA_FALLTHROUGH
-  case 4:
-    position[2] = SPA_AUDIO_CHANNEL_RL;
-    position[3] = SPA_AUDIO_CHANNEL_RR;
-    SPA_FALLTHROUGH
-  case 2:
-    position[0] = SPA_AUDIO_CHANNEL_FL;
-    position[1] = SPA_AUDIO_CHANNEL_FR;
-    break;
-  case 1:
-    position[0] = SPA_AUDIO_CHANNEL_MONO;
-    break;
-  default:
-    ok = FALSE;
-    break;
+  switch (pos) {
+    case GST_AUDIO_CHANNEL_POSITION_NONE:
+      return SPA_AUDIO_CHANNEL_NA;
+    case GST_AUDIO_CHANNEL_POSITION_MONO:
+      return SPA_AUDIO_CHANNEL_MONO;
+    case GST_AUDIO_CHANNEL_POSITION_FRONT_LEFT:
+      return SPA_AUDIO_CHANNEL_FL;
+    case GST_AUDIO_CHANNEL_POSITION_FRONT_RIGHT:
+      return SPA_AUDIO_CHANNEL_FR;
+    case GST_AUDIO_CHANNEL_POSITION_FRONT_CENTER:
+      return SPA_AUDIO_CHANNEL_FC;
+    case GST_AUDIO_CHANNEL_POSITION_LFE1:
+      return SPA_AUDIO_CHANNEL_LFE;
+    case GST_AUDIO_CHANNEL_POSITION_REAR_LEFT:
+      return SPA_AUDIO_CHANNEL_RL;
+    case GST_AUDIO_CHANNEL_POSITION_REAR_RIGHT:
+      return SPA_AUDIO_CHANNEL_RR;
+    case GST_AUDIO_CHANNEL_POSITION_FRONT_LEFT_OF_CENTER:
+      return SPA_AUDIO_CHANNEL_FLC;
+    case GST_AUDIO_CHANNEL_POSITION_FRONT_RIGHT_OF_CENTER:
+      return SPA_AUDIO_CHANNEL_FRC;
+    case GST_AUDIO_CHANNEL_POSITION_REAR_CENTER:
+      return SPA_AUDIO_CHANNEL_RC;
+    case GST_AUDIO_CHANNEL_POSITION_LFE2:
+      return SPA_AUDIO_CHANNEL_LFE2;
+    case GST_AUDIO_CHANNEL_POSITION_SIDE_LEFT:
+      return SPA_AUDIO_CHANNEL_SL;
+    case GST_AUDIO_CHANNEL_POSITION_SIDE_RIGHT:
+      return SPA_AUDIO_CHANNEL_SR;
+    case GST_AUDIO_CHANNEL_POSITION_TOP_FRONT_LEFT:
+      return SPA_AUDIO_CHANNEL_TFL;
+    case GST_AUDIO_CHANNEL_POSITION_TOP_FRONT_RIGHT:
+      return SPA_AUDIO_CHANNEL_TFR;
+    case GST_AUDIO_CHANNEL_POSITION_TOP_FRONT_CENTER:
+      return SPA_AUDIO_CHANNEL_TFC;
+    case GST_AUDIO_CHANNEL_POSITION_TOP_CENTER:
+      return SPA_AUDIO_CHANNEL_TC;
+    case GST_AUDIO_CHANNEL_POSITION_TOP_REAR_LEFT:
+      return SPA_AUDIO_CHANNEL_TRL;
+    case GST_AUDIO_CHANNEL_POSITION_TOP_REAR_RIGHT:
+      return SPA_AUDIO_CHANNEL_TRR;
+    case GST_AUDIO_CHANNEL_POSITION_TOP_SIDE_LEFT:
+      return SPA_AUDIO_CHANNEL_TSL;
+    case GST_AUDIO_CHANNEL_POSITION_TOP_SIDE_RIGHT:
+      return SPA_AUDIO_CHANNEL_TSR;
+    case GST_AUDIO_CHANNEL_POSITION_TOP_REAR_CENTER:
+      return SPA_AUDIO_CHANNEL_TRC;
+    case GST_AUDIO_CHANNEL_POSITION_BOTTOM_FRONT_CENTER:
+      return SPA_AUDIO_CHANNEL_BC;
+    case GST_AUDIO_CHANNEL_POSITION_BOTTOM_FRONT_LEFT:
+      return SPA_AUDIO_CHANNEL_BLC;
+    case GST_AUDIO_CHANNEL_POSITION_BOTTOM_FRONT_RIGHT:
+      return SPA_AUDIO_CHANNEL_BRC;
+    case GST_AUDIO_CHANNEL_POSITION_WIDE_LEFT:
+      return SPA_AUDIO_CHANNEL_FLW;
+    case GST_AUDIO_CHANNEL_POSITION_WIDE_RIGHT:
+      return SPA_AUDIO_CHANNEL_FRW;
+    default:
+      /*
+       * SURROUND_LEFT, SURROUND_RIGHT, TOP_SURROUND_LEFT, TOP_SURROUND_RIGHT,
+       * INVALID have no SPA equivalent.
+       */
+      return SPA_AUDIO_CHANNEL_UNKNOWN;
   }
+}
 
-  if (ok)
-    spa_pod_builder_add (b, SPA_FORMAT_AUDIO_position,
-        SPA_POD_Array(sizeof(uint32_t), SPA_TYPE_Id, channels, position), 0);
+static void
+set_audio_channels (struct spa_pod_builder *b, ConvertData * d,
+    uint32_t channels)
+{
+  GstAudioChannelPosition gst_positions[64];
+  uint32_t spa_positions[64];
+  guint64 channel_mask;
+  const GValue *value;
+  gint i;
+
+  value = gst_structure_get_value (d->cs, "channel-mask");
+  if (value)
+    channel_mask = gst_value_get_bitmask (value);
+  else
+    channel_mask = gst_audio_channel_get_fallback_mask (channels);
+
+  if (!gst_audio_channel_positions_from_mask (channels, channel_mask,
+          gst_positions))
+    return;
+
+  for (i = 0; i < (gint) channels; i++)
+    spa_positions[i] = gst_channel_to_spa (gst_positions[i]);
+
+  spa_pod_builder_add (b, SPA_FORMAT_AUDIO_position,
+      SPA_POD_Array (sizeof (uint32_t), SPA_TYPE_Id, channels, spa_positions),
+      0);
 }
 
 static void
@@ -719,7 +778,7 @@ handle_audio_fields (ConvertData *d)
         spa_pod_builder_id (&b.b, audio_format_map[idx]);
     }
     if (i > 0) {
-      choice = spa_pod_builder_pop(&b.b, &f);
+      choice = (struct spa_pod_choice *)spa_pod_builder_pop(&b.b, &f);
       if (i == 1)
         choice->body.type = SPA_CHOICE_None;
     }
@@ -759,7 +818,7 @@ handle_audio_fields (ConvertData *d)
       spa_pod_builder_id (&b.b, layout);
     }
     if (i > 0) {
-      choice = spa_pod_builder_pop(&b.b, &f);
+      choice = (struct spa_pod_choice *)spa_pod_builder_pop(&b.b, &f);
       if (i == 1)
         choice->body.type = SPA_CHOICE_None;
     }
@@ -777,7 +836,7 @@ handle_audio_fields (ConvertData *d)
       spa_pod_builder_int (&b.b, v);
     }
     if (i > 0) {
-      choice = spa_pod_builder_pop(&b.b, &f);
+      choice = (struct spa_pod_choice *)spa_pod_builder_pop(&b.b, &f);
       if (i == 1)
         choice->body.type = SPA_CHOICE_None;
     }
@@ -794,10 +853,10 @@ handle_audio_fields (ConvertData *d)
       spa_pod_builder_int (&b.b, v);
     }
     if (i > 0) {
-      choice = spa_pod_builder_pop(&b.b, &f);
+      choice = (struct spa_pod_choice *)spa_pod_builder_pop(&b.b, &f);
       if (i == 1) {
         choice->body.type = SPA_CHOICE_None;
-        set_default_channels (&b.b, v);
+        set_audio_channels (&b.b, d, v);
       }
     }
   }
@@ -1097,6 +1156,110 @@ handle_dmabuf_prop (const struct spa_pod_prop *prop,
   }
 }
 
+/* A SPA fraction is a pair of uint32; a GstFraction is a pair of gint. A source that
+ * advertises a long maximum frame interval inverts into a framerate whose denominator
+ * does not fit: v4l2loopback uses UINT32_MAX, and so does the in-tree mgb4 capture
+ * driver, where 0xFFFFFFFF / MGB4_HW_FREQ is a perfectly ordinary "slowest frame"
+ * of 34 seconds. Passed on as it is, the value arrives as -1, gst_caps_set_simple()
+ * decides the range starts after it ends and drops it, and the whole framerate field
+ * is lost from the caps.
+ *
+ * Reduce first, which is exact and enough for mgb4, and scale only if that still does
+ * not fit, which is the case for v4l2loopback's 1/UINT32_MAX. */
+static void
+fraction_to_gst (const struct spa_fraction *f, gint *num, gint *denom)
+{
+  uint32_t n = f->num, d = f->denom, a, b, g;
+
+  if (d == 0) {
+    *num = 0;
+    *denom = 1;
+    return;
+  }
+
+  for (a = n, b = d; b != 0; ) {
+    uint32_t t = a % b;
+    a = b;
+    b = t;
+  }
+  g = a ? a : 1;
+  n /= g;
+  d /= g;
+
+  if (n > G_MAXINT || d > G_MAXINT) {
+    uint64_t m = SPA_MAX (n, d);
+    uint32_t n0 = n;
+
+    n = (uint32_t) ((uint64_t) n * G_MAXINT / m);
+    d = (uint32_t) ((uint64_t) d * G_MAXINT / m);
+    /* 0/1 is how GStreamer spells a variable frame rate, so do not let a very
+     * small rate round down into it. */
+    if (n == 0 && n0 != 0)
+      n = 1;
+    if (d == 0)
+      d = 1;
+  }
+
+  *num = (gint) n;
+  *denom = (gint) d;
+}
+
+/* A GST_TYPE_INT_RANGE is resolved by gst_caps_fixate() to its minimum, so the value
+ * the source said it preferred - values[0] of the choice - was dropped on the way
+ * into caps, and every consumer without a preference of its own ended up at the
+ * bottom of every range. Keep it as the first entry of a list with the range behind
+ * it: fixation lands on the preferred value, and a consumer that does have a
+ * preference still finds the range. */
+static void
+set_pref_int_range (GstCaps *res, const char *key, int pref, int min, int max)
+{
+  GValue list = { 0 }, v = { 0 };
+
+  if (pref <= min || pref > max) {
+    gst_caps_set_simple (res, key, GST_TYPE_INT_RANGE, min, max, NULL);
+    return;
+  }
+
+  g_value_init (&list, GST_TYPE_LIST);
+  g_value_init (&v, G_TYPE_INT);
+  g_value_set_int (&v, pref);
+  gst_value_list_append_and_take_value (&list, &v);
+  g_value_init (&v, GST_TYPE_INT_RANGE);
+  gst_value_set_int_range (&v, min, max);
+  gst_value_list_append_and_take_value (&list, &v);
+  gst_caps_set_value (res, key, &list);
+  g_value_unset (&list);
+}
+
+static void
+set_pref_fraction_range (GstCaps *res, const char *key,
+    const struct spa_fraction *pref, const struct spa_fraction *min,
+    const struct spa_fraction *max)
+{
+  GValue list = { 0 }, v = { 0 };
+  gint pn, pd, mn, md, xn, xd;
+
+  fraction_to_gst (pref, &pn, &pd);
+  fraction_to_gst (min, &mn, &md);
+  fraction_to_gst (max, &xn, &xd);
+
+  if (gst_util_fraction_compare (pn, pd, mn, md) <= 0 ||
+      gst_util_fraction_compare (pn, pd, xn, xd) > 0) {
+    gst_caps_set_simple (res, key, GST_TYPE_FRACTION_RANGE, mn, md, xn, xd, NULL);
+    return;
+  }
+
+  g_value_init (&list, GST_TYPE_LIST);
+  g_value_init (&v, GST_TYPE_FRACTION);
+  gst_value_set_fraction (&v, pn, pd);
+  gst_value_list_append_and_take_value (&list, &v);
+  g_value_init (&v, GST_TYPE_FRACTION_RANGE);
+  gst_value_set_fraction_range_full (&v, mn, md, xn, xd);
+  gst_value_list_append_and_take_value (&list, &v);
+  gst_caps_set_value (res, key, &list);
+  g_value_unset (&list);
+}
+
 static void
 handle_int_prop (const struct spa_pod_prop *prop, const char *key, GstCaps *res)
 {
@@ -1119,7 +1282,7 @@ handle_int_prop (const struct spa_pod_prop *prop, const char *key, GstCaps *res)
     {
       if (n_items < 3)
         return;
-      gst_caps_set_simple (res, key, GST_TYPE_INT_RANGE, ints[1], ints[2], NULL);
+      set_pref_int_range (res, key, ints[0], ints[1], ints[2]);
       break;
     }
     case SPA_CHOICE_Enum:
@@ -1172,10 +1335,8 @@ handle_rect_prop (const struct spa_pod_prop *prop, const char *width, const char
             height, G_TYPE_INT, rect[1].height,
             NULL);
       } else {
-        gst_caps_set_simple (res,
-            width, GST_TYPE_INT_RANGE, rect[1].width, rect[2].width,
-            height, GST_TYPE_INT_RANGE, rect[1].height, rect[2].height,
-            NULL);
+        set_pref_int_range (res, width, rect[0].width, rect[1].width, rect[2].width);
+        set_pref_int_range (res, height, rect[0].height, rect[1].height, rect[2].height);
       }
       break;
     }
@@ -1230,13 +1391,11 @@ handle_fraction_prop (const struct spa_pod_prop *prop, const char *key, GstCaps 
 
       if (fract[1].num == fract[2].num &&
           fract[1].denom == fract[2].denom) {
-        gst_caps_set_simple (res, key, GST_TYPE_FRACTION,
-            fract[1].num, fract[1].denom, NULL);
+        gint n1, d1;
+        fraction_to_gst (&fract[1], &n1, &d1);
+        gst_caps_set_simple (res, key, GST_TYPE_FRACTION, n1, d1, NULL);
       } else {
-        gst_caps_set_simple (res, key, GST_TYPE_FRACTION_RANGE,
-            fract[1].num, fract[1].denom,
-            fract[2].num, fract[2].denom,
-            NULL);
+        set_pref_fraction_range (res, key, &fract[0], &fract[1], &fract[2]);
       }
       break;
     }

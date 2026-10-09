@@ -56,7 +56,7 @@ struct impl {
 	struct pw_context this;
 	struct spa_handle *dbus_handle;
 	struct spa_plugin_loader plugin_loader;
-	unsigned int recalc:1;
+	int recalc;
 	unsigned int recalc_pending:1;
 
 	uint32_t cpu_count;
@@ -152,7 +152,6 @@ static struct spa_handle *impl_plugin_loader_load(void *object, const char *fact
 		errno = EINVAL;
 		return NULL;
 	}
-
 	return pw_context_load_spa_handle(&impl->this, factory_name, info);
 }
 
@@ -992,20 +991,36 @@ int pw_context_recalc_graph(struct pw_context *context, const char *reason)
 
 	pw_log_info("%p: busy:%d reason:%s", context, impl->recalc, reason);
 
-	if (impl->recalc) {
+	if (impl->recalc > 0) {
 		impl->recalc_pending = true;
 		return -EBUSY;
 	}
 
 again:
-	impl->recalc = true;
+	impl->recalc++;
 
 	pw_context_emit_recalc_graph(context);
 
-	impl->recalc = false;
-	if (impl->recalc_pending) {
+	if (--impl->recalc == 0 && impl->recalc_pending) {
 		impl->recalc_pending = false;
 		goto again;
+	}
+	return 0;
+}
+
+int pw_context_freeze_recalc_graph(struct pw_context *context)
+{
+	struct impl *impl = SPA_CONTAINER_OF(context, struct impl, this);
+	impl->recalc++;
+	return 0;
+}
+
+int pw_context_thaw_recalc_graph(struct pw_context *context, const char *reason)
+{
+	struct impl *impl = SPA_CONTAINER_OF(context, struct impl, this);
+	if (--impl->recalc == 0 && impl->recalc_pending) {
+		impl->recalc_pending = false;
+		pw_context_recalc_graph(context, reason);
 	}
 	return 0;
 }
@@ -1030,6 +1045,11 @@ int pw_context_add_spa_lib(struct pw_context *context,
 	}
 
 	entry->lib = strdup(lib);
+	if (entry->lib == NULL) {
+		regfree(&entry->regex);
+		pw_array_remove(&context->factory_lib, entry);
+		return -ENOMEM;
+	}
 	pw_log_debug("%p: map factory regex '%s' to '%s", context,
 			factory_regexp, lib);
 	return 0;
@@ -1052,20 +1072,23 @@ struct spa_handle *pw_context_load_spa_handle(struct pw_context *context,
 		const char *factory_name,
 		const struct spa_dict *info)
 {
-	const char *lib;
+	const char *lib, *fallback_lib = NULL;
 	const struct spa_support *support;
 	uint32_t n_support;
 	struct spa_handle *handle;
 
-	pw_log_debug("%p: load factory %s", context, factory_name);
+	if (info != NULL)
+		fallback_lib = spa_dict_lookup(info, SPA_KEY_LIBRARY_NAME);
+
+	pw_log_info("%p: load factory %s fallback:%s", context, factory_name, fallback_lib);
 
 	lib = pw_context_find_spa_lib(context, factory_name);
-	if (lib == NULL && info != NULL)
-		lib = spa_dict_lookup(info, SPA_KEY_LIBRARY_NAME);
-	if (lib == NULL) {
-		errno = ENOENT;
-		pw_log_warn("%p: no library for %s: %m",
-				context, factory_name);
+	if (lib == NULL && context->settings.use_fallback)
+		lib = fallback_lib;
+	if (lib == NULL || spa_streq(lib, "blocked")) {
+		errno = lib ? EPERM : ENOENT;
+		pw_log_warn("%p: no library for %s (fallback: %s): %m",
+				context, factory_name, fallback_lib);
 		return NULL;
 	}
 

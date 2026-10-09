@@ -42,6 +42,7 @@ SPA_LOG_TOPIC_DEFINE_STATIC(log_topic, "spa.filter-graph");
 
 #define MAX_HNDL 64
 #define MAX_CHANNELS SPA_AUDIO_MAX_CHANNELS
+#define MAX_IO 8
 
 #define DEFAULT_RATE	48000
 
@@ -225,6 +226,12 @@ struct impl {
 	struct spa_plugin_loader *loader;
 	struct spa_loop *data_loop;
 
+	struct {
+		const char *type;
+		void *data;
+		size_t size;
+	} io[MAX_IO];
+
 	uint64_t info_all;
 	struct spa_filter_graph_info info;
 
@@ -233,6 +240,7 @@ struct impl {
 	uint32_t quantum_limit;
 	uint32_t max_align;
 	long unsigned rate;
+	bool filter_path;
 
 	struct spa_list plugin_list;
 
@@ -617,13 +625,20 @@ static int port_set_control_value(struct port *port, float *value)
 
 	p = &node->desc->desc->ports[port->p];
 	get_ranges(impl, p, &def, &min, &max);
-	v = SPA_CLAMP(value ? *value : def, min, max);
+	v = value ? *value : def;
+	if (v < min || v > max) {
+		spa_log_warn(impl->log, "control value %f out of range [%f, %f]",
+				v, min, max);
+		v = SPA_CLAMP(v, min, max);
+	}
 
+	if (!port->control_initialized || port->control_current != v)
+		count++;
 	port->control_current = v;
 	port->control_initialized = true;
 
 	for (i = 0; i < node->n_hndl; i++)
-		count += port_id_set_control_value(port, i, v);
+		port_id_set_control_value(port, i, v);
 
 	return count;
 }
@@ -767,6 +782,9 @@ static int sync_volume(struct graph *graph, struct volume *vol)
 		}
 		v = v * (vol->max[n_port] - vol->min[n_port]) + vol->min[n_port];
 
+		p->control_initialized = true;
+		p->control_current = v;
+
 		n_hndl = SPA_MAX(1u, p->node->n_hndl);
 		res += port_id_set_control_value(p, i % n_hndl, v);
 	}
@@ -784,7 +802,13 @@ static int impl_set_props(void *object, enum spa_direction direction, const stru
 	char buf[1024];
 	struct spa_pod_dynamic_builder b;
 	struct volume *vol = &graph->volume[direction];
+	float soft_vols[MAX_CHANNELS];
+	uint32_t n_soft_vols = 0;
+	bool soft_mute = false, have_soft_mute = false;
 	bool do_volume = false;
+
+	if (!spa_pod_is_object_type(props, SPA_TYPE_OBJECT_Props))
+		return -EINVAL;
 
 	spa_pod_dynamic_builder_init(&b, buf, sizeof(buf), 1024);
 	spa_pod_builder_push_object(&b.b, &f[0], SPA_TYPE_OBJECT_Props, SPA_PARAM_Props);
@@ -829,7 +853,12 @@ static int impl_set_props(void *object, enum spa_direction direction, const stru
 			break;
 		}
 		case SPA_PROP_softVolumes:
+			n_soft_vols = spa_pod_copy_array(&prop->value, SPA_TYPE_Float, soft_vols,
+					SPA_N_ELEMENTS(soft_vols));
+			break;
 		case SPA_PROP_softMute:
+			if (spa_pod_get_bool(&prop->value, &soft_mute) == 0)
+				have_soft_mute = true;
 			break;
 		default:
 			spa_pod_builder_raw_padded(&b.b, prop, SPA_POD_PROP_SIZE(prop));
@@ -837,24 +866,27 @@ static int impl_set_props(void *object, enum spa_direction direction, const stru
 		}
 	}
 	if (do_volume && vol->n_ports != 0) {
-		float soft_vols[MAX_CHANNELS];
 		uint32_t i;
 
 		for (i = 0; i < vol->n_volumes; i++)
 			soft_vols[i] = (vol->mute || vol->volumes[i] == 0.0f) ? 0.0f : 1.0f;
-
-		spa_pod_builder_prop(&b.b, SPA_PROP_softMute, 0);
-		spa_pod_builder_bool(&b.b, vol->mute);
-		spa_pod_builder_prop(&b.b, SPA_PROP_softVolumes, 0);
-		spa_pod_builder_array(&b.b, sizeof(float), SPA_TYPE_Float,
-				vol->n_volumes, soft_vols);
-		props = spa_pod_builder_pop(&b.b, &f[0]);
+		n_soft_vols = vol->n_volumes;
+		soft_mute = vol->mute;
+		have_soft_mute = true;
 
 		sync_volume(graph, vol);
-
-	} else {
-		props = spa_pod_builder_pop(&b.b, &f[0]);
 	}
+	if (have_soft_mute) {
+		spa_pod_builder_prop(&b.b, SPA_PROP_softMute, 0);
+		spa_pod_builder_bool(&b.b, soft_mute);
+	}
+	if (n_soft_vols > 0) {
+		spa_pod_builder_prop(&b.b, SPA_PROP_softVolumes, 0);
+		spa_pod_builder_array(&b.b, sizeof(float), SPA_TYPE_Float,
+				n_soft_vols, soft_vols);
+	}
+	props = spa_pod_builder_pop(&b.b, &f[0]);
+
 	spa_filter_graph_emit_apply_props(&impl->hooks, direction, props);
 
 	spa_pod_dynamic_builder_clean(&b);
@@ -863,6 +895,61 @@ static int impl_set_props(void *object, enum spa_direction direction, const stru
 		emit_node_control_changed(impl);
 		spa_filter_graph_emit_props_changed(&impl->hooks, SPA_DIRECTION_INPUT);
 	}
+	return 0;
+}
+
+static int sync_io(struct impl *impl, const char *type, void *data, size_t size)
+{
+	struct graph *graph = &impl->graph;
+	struct node *node;
+	uint32_t i;
+
+	spa_list_for_each(node, &graph->node_list, link) {
+		const struct spa_fga_descriptor *d = node->desc->desc;
+		if (d->set_io == NULL)
+			continue;
+		for (i = 0; i < node->n_hndl; i++) {
+			if (node->hndl[i] != NULL)
+				d->set_io(node->hndl[i], type, data, size);
+		}
+	}
+	return 0;
+}
+
+static int sync_all_io(struct impl *impl)
+{
+	uint32_t i;
+	for (i = 0; i < SPA_N_ELEMENTS(impl->io);  i++) {
+		if (impl->io[i].type != NULL)
+			sync_io(impl, impl->io[i].type, impl->io[i].data, impl->io[i].size);
+	}
+	return 0;
+}
+
+static int impl_set_io(void *object, const char *type, void *data, size_t size)
+{
+	struct impl *impl = object;
+	uint32_t i;
+
+	for (i = 0; i < SPA_N_ELEMENTS(impl->io);  i++) {
+		if (spa_streq(impl->io[i].type, type)) {
+			impl->io[i].data = data;
+			impl->io[i].size = size;
+			break;
+		}
+	}
+	if (i == SPA_N_ELEMENTS(impl->io)) {
+		do {
+			i--;
+			if (impl->io[i].type == NULL) {
+				impl->io[i].type = type;
+				impl->io[i].data = data;
+				impl->io[i].size = size;
+				break;
+			}
+		} while (i > 0);
+	}
+	sync_io(impl, type, data, size);
 	return 0;
 }
 
@@ -908,7 +995,7 @@ static struct plugin *plugin_load(struct impl *impl, const char *type, const cha
 	struct spa_handle *hndl = NULL;
 	struct plugin *plugin;
 	char module[PATH_MAX];
-	char factory_name[256], dsp_ptr[256];
+	char factory_name[256], dsp_ptr[256], filter[16];
 	void *iface;
 	int res;
 
@@ -926,11 +1013,14 @@ static struct plugin *plugin_load(struct impl *impl, const char *type, const cha
 			"filter.graph.plugin.%s", type);
 	spa_scnprintf(dsp_ptr, sizeof(dsp_ptr),
 			"pointer:%p", impl->dsp);
+	spa_scnprintf(filter, sizeof(filter),
+			"%s", impl->filter_path ? "true" : "false");
 
 	hndl = spa_plugin_loader_load(impl->loader, factory_name,
 			&SPA_DICT_ITEMS(
 				SPA_DICT_ITEM(SPA_KEY_LIBRARY_NAME, module),
 				SPA_DICT_ITEM("filter.graph.path", path),
+				SPA_DICT_ITEM("library.filter-path", filter),
 				SPA_DICT_ITEM("filter.graph.audio.dsp", dsp_ptr)));
 
 	if (hndl == NULL) {
@@ -1670,17 +1760,16 @@ static int impl_activate(void *object, const struct spa_dict *props)
 		d = desc->desc;
 		p = desc->plugin->plugin;
 
-		for (i = 0; i < node->n_hndl; i++) {
-			spa_log_info(impl->log, "instantiate %s %s[%d] rate:%lu", d->name, node->name, i, impl->rate);
-			errno = EINVAL;
-			if ((node->hndl[i] = d->instantiate(p, d, impl->rate, i, node->config)) == NULL) {
-				spa_log_error(impl->log, "cannot create plugin instance %d rate:%lu: %m", i, impl->rate);
-				res = -errno;
-				goto error;
-			}
+		spa_log_info(impl->log, "instantiate %s %s[%d] rate:%lu", d->name, node->name,
+				node->n_hndl, impl->rate);
+		if ((res = d->instantiate(p, d, impl->rate, node->config, node->n_hndl, node->hndl)) < 0) {
+			spa_log_error(impl->log, "cannot create plugin instance %d rate:%lu: %s",
+					node->n_hndl, impl->rate, spa_strerror(res));
+			goto error;
 		}
 		node->control_changed = true;
 	}
+	sync_all_io(impl);
 
 	/* then link ports */
 	spa_list_for_each(node, &graph->node_list, link) {
@@ -1747,9 +1836,7 @@ static int impl_activate(void *object, const struct spa_dict *props)
 
 	/* now activate */
 	spa_list_for_each(node, &graph->node_list, link) {
-		desc = node->desc;
-		d = desc->desc;
-
+		d = node->desc->desc;
 		for (i = 0; i < node->n_hndl; i++) {
 			if (d->activate)
 				d->activate(node->hndl[i]);
@@ -1856,7 +1943,7 @@ static int setup_graph(struct graph *graph)
 	struct port *port;
 	struct graph_port *gp;
 	struct graph_hndl *gh;
-	uint32_t i, j, n, n_input, n_output, n_hndl = 0, n_out_hndl;
+	uint32_t i, j, n, n_input, n_output, n_hndl = 0, n_out_hndl, target_outputs;
 	int res;
 	struct descriptor *desc;
 	const struct spa_fga_descriptor *d;
@@ -1890,12 +1977,20 @@ static int setup_graph(struct graph *graph)
 	if (graph->n_outputs == 0)
 		graph->n_outputs = impl->info.n_outputs;
 
+	/* With port pair we try to get as many outputs as inputs, otherwise
+	 * we aim to fill all outputs */
+	if (first == last &&
+	    SPA_FLAG_IS_SET(first->desc->desc->flags, SPA_FGA_DESCRIPTOR_PORT_PAIR))
+		target_outputs = graph->n_inputs;
+	else
+		target_outputs = n_output;
+
 	/* compare to the requested number of inputs and duplicate the
 	 * graph n_hndl times when needed. */
 	n_hndl = n_input ? graph->n_inputs / n_input : 1;
 
 	if (graph->n_outputs == 0)
-		graph->n_outputs = n_output * n_hndl;
+		graph->n_outputs = target_outputs * n_hndl;
 
 	n_out_hndl = n_output ? graph->n_outputs / n_output : 1;
 
@@ -1925,9 +2020,10 @@ static int setup_graph(struct graph *graph)
 				graph->n_outputs, n_output);
 
 		if (graph->n_outputs == 0)
-			graph->n_outputs = n_output * n_hndl;
+			graph->n_outputs = target_outputs * n_hndl;
 	}
-	spa_log_info(impl->log, "using %d instances %d %d", n_hndl, n_input, n_output);
+	spa_log_info(impl->log, "using %d instances %d/%d %d/%d", n_hndl,
+			graph->n_inputs, n_input, graph->n_outputs, n_output);
 
 	graph->n_input = 0;
 	size_t input_count, output_count;
@@ -1946,6 +2042,10 @@ static int setup_graph(struct graph *graph)
 			desc = first->desc;
 			d = desc->desc;
 			for (j = 0; j < desc->n_input; j++) {
+				if (graph->n_input >= input_count) {
+					res = -ENOSPC;
+					goto error;
+				}
 				gp = &graph->input[graph->n_input++];
 				spa_log_info(impl->log, "input port %s[%d]:%s",
 						first->name, i, d->ports[desc->input[j]].name);
@@ -1958,6 +2058,10 @@ static int setup_graph(struct graph *graph)
 			for (n = 0; n < graph->n_input_names; n++) {
 				pname = graph->input_names[n];
 				if (spa_streq(pname, "null")) {
+					if (graph->n_input >= input_count) {
+						res = -ENOSPC;
+						goto error;
+					}
 					gp = &graph->input[graph->n_input++];
 					gp->desc = NULL;
 					spa_log_info(impl->log, "ignore input port %d", graph->n_input);
@@ -1993,6 +2097,10 @@ static int setup_graph(struct graph *graph)
 							spa_list_for_each(link, &p->link_list, output_link) {
 								struct port *peer = link->input;
 
+								if (graph->n_input >= input_count) {
+									res = -ENOSPC;
+									goto error;
+								}
 								spa_log_info(impl->log, "copy input port %s[%d]:%s",
 									port->node->name, i,
 									d->ports[port->p].name);
@@ -2011,6 +2119,10 @@ static int setup_graph(struct graph *graph)
 						port->node->disabled = disabled;
 					}
 					if (!disabled) {
+						if (graph->n_input >= input_count) {
+							res = -ENOSPC;
+							goto error;
+						}
 						spa_log_info(impl->log, "input port %s[%d]:%s",
 							port->node->name, i, d->ports[port->p].name);
 						port->external = graph->n_input;
@@ -2028,6 +2140,10 @@ static int setup_graph(struct graph *graph)
 			desc = last->desc;
 			d = desc->desc;
 			for (j = 0; j < desc->n_output; j++) {
+				if (graph->n_output >= output_count) {
+					res = -ENOSPC;
+					goto error;
+				}
 				gp = &graph->output[graph->n_output++];
 				spa_log_info(impl->log, "output port %s[%d]:%s",
 						last->name, i, d->ports[desc->output[j]].name);
@@ -2039,6 +2155,10 @@ static int setup_graph(struct graph *graph)
 		} else {
 			for (n = 0; n < graph->n_output_names; n++) {
 				pname = graph->output_names[n];
+				if (graph->n_output >= output_count) {
+					res = -ENOSPC;
+					goto error;
+				}
 				gp = &graph->output[graph->n_output];
 				if (spa_streq(pname, "null")) {
 					gp->desc = NULL;
@@ -2266,6 +2386,10 @@ static int load_graph(struct graph *graph, const struct spa_dict *props)
 		if ((res = load_node(graph, &it[1])) < 0)
 			return res;
 	}
+	if (spa_list_is_empty(&graph->node_list)) {
+		spa_log_error(impl->log, "filter.graph has no nodes");
+		return -EINVAL;
+	}
 	if (plinks != NULL) {
 		while (spa_json_enter_object(plinks, &it[1]) > 0) {
 			if ((res = parse_link(graph, &it[1])) < 0)
@@ -2287,16 +2411,28 @@ static int load_graph(struct graph *graph, const struct spa_dict *props)
 	if (pinputs != NULL) {
 		graph->n_input_names = count_array(pinputs);
 		graph->input_names = calloc(graph->n_input_names, sizeof(char *));
+		if (graph->input_names == NULL)
+			return -ENOMEM;
 		graph->n_input_names = 0;
-		while (spa_json_get_string(pinputs, key, sizeof(key)) > 0)
-			graph->input_names[graph->n_input_names++] = strdup(key);
+		while (spa_json_get_string(pinputs, key, sizeof(key)) > 0) {
+			graph->input_names[graph->n_input_names] = strdup(key);
+			if (graph->input_names[graph->n_input_names] == NULL)
+				return -ENOMEM;
+			graph->n_input_names++;
+		}
 	}
 	if (poutputs != NULL) {
 		graph->n_output_names = count_array(poutputs);
 		graph->output_names = calloc(graph->n_output_names, sizeof(char *));
+		if (graph->output_names == NULL)
+			return -ENOMEM;
 		graph->n_output_names = 0;
-		while (spa_json_get_string(poutputs, key, sizeof(key)) > 0)
-			graph->output_names[graph->n_output_names++] = strdup(key);
+		while (spa_json_get_string(poutputs, key, sizeof(key)) > 0) {
+			graph->output_names[graph->n_output_names] = strdup(key);
+			if (graph->output_names[graph->n_output_names] == NULL)
+				return -ENOMEM;
+			graph->n_output_names++;
+		}
 	}
 	if ((res = setup_graph_controls(graph)) < 0)
 		return res;
@@ -2317,7 +2453,6 @@ static int load_graph(struct graph *graph, const struct spa_dict *props)
 		graph->default_outputs = graph->n_output_names;
 	else
 		graph->default_outputs = last->desc->n_output;
-
 
 	return 0;
 }
@@ -2350,6 +2485,7 @@ static const struct spa_filter_graph_methods impl_filter_graph = {
 	.enum_prop_info = impl_enum_prop_info,
 	.get_props = impl_get_props,
 	.set_props = impl_set_props,
+	.set_io = impl_set_io,
 	.activate = impl_activate,
 	.deactivate = impl_deactivate,
 	.reset = impl_reset,
@@ -2433,6 +2569,8 @@ impl_init(const struct spa_handle_factory *factory,
 			spa_atou32(s, &impl->info.n_inputs, 0);
 		if (spa_streq(k, "filter-graph.n_outputs"))
 			spa_atou32(s, &impl->info.n_outputs, 0);
+		if (spa_streq(k, "library.filter-path"))
+			impl->filter_path = spa_atob(s);
 	}
 	if (impl->quantum_limit == 0)
 		return -EINVAL;

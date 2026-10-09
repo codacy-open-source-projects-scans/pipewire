@@ -6,6 +6,8 @@
 
 #include <unistd.h>
 
+#include <spa/utils/cleanup.h>
+
 #include <pipewire/pipewire.h>
 
 #include "mvrp.h"
@@ -64,7 +66,7 @@ static int process_vid(struct mvrp *mvrp, uint64_t now, uint8_t attr_type,
 	return mvrp_attr_event(mvrp, now, attr_type, event);
 }
 
-static int encode_vid(struct mvrp *mvrp, struct attr *a, void *m)
+static int encode_vid(struct mvrp *mvrp, struct attr *a, void *m, size_t maxsize)
 {
 	struct avb_packet_mvrp_msg *msg = m;
 	struct avb_packet_mrp_vector *v;
@@ -72,6 +74,9 @@ static int encode_vid(struct mvrp *mvrp, struct attr *a, void *m)
 	struct avb_packet_mrp_footer *f;
 	uint8_t *ev;
 	size_t attr_list_length = sizeof(*v) + sizeof(*d) + sizeof(*f) + 1;
+
+	if (attr_list_length + sizeof(*msg) > maxsize)
+		return -ENOSPC;
 
 	msg->attribute_type = AVB_MVRP_ATTRIBUTE_TYPE_VID;
 	msg->attribute_length = sizeof(*d);
@@ -102,7 +107,7 @@ static const struct {
 	const char *name;
 	int (*process) (struct mvrp *mvrp, uint64_t now, uint8_t attr_type,
 			const void *m, uint8_t event, uint8_t param, int num);
-	int (*encode) (struct mvrp *mvrp, struct attr *attr, void *m);
+	int (*encode) (struct mvrp *mvrp, struct attr *attr, void *m, size_t maxsize);
 	void (*notify) (struct mvrp *mvrp, uint64_t now, struct attr *attr, uint8_t notify);
 } dispatch[] = {
 	[AVB_MVRP_ATTRIBUTE_TYPE_VID] = { "vid", process_vid, encode_vid, notify_vid },
@@ -214,7 +219,7 @@ static void mvrp_event(void *data, uint64_t now, uint8_t event)
 	void *msg = SPA_PTROFF(buffer, sizeof(*p), void);
 	struct attr *a;
 	int len, count = 0;
-	size_t total = sizeof(*p) + 2;
+	size_t total = sizeof(*p) + sizeof(*f);
 
 	p->version = AVB_MRP_PROTOCOL_VERSION;
 
@@ -227,7 +232,8 @@ static void mvrp_event(void *data, uint64_t now, uint8_t event)
 		pw_log_debug("send %s %s", dispatch[a->attr->type].name,
 				avb_mrp_send_name(a->attr->mrp->pending_send));
 
-		len = dispatch[a->attr->type].encode(mvrp, a, msg);
+		len = dispatch[a->attr->type].encode(mvrp, a, msg,
+				sizeof(buffer) - total);
 		if (len < 0)
 			break;
 
@@ -251,9 +257,9 @@ static const struct avb_mrp_events mrp_events = {
 struct avb_mvrp *avb_mvrp_register(struct server *server)
 {
 	struct mvrp *mvrp;
-	int fd, res;
+	int res;
 
-	fd = avb_server_make_socket(server, AVB_MVRP_ETH, mvrp_mac);
+	spa_autoclose int fd = avb_server_make_socket(server, AVB_MVRP_ETH, mvrp_mac);
 	if (fd < 0) {
 		errno = -fd;
 		return NULL;
@@ -261,27 +267,26 @@ struct avb_mvrp *avb_mvrp_register(struct server *server)
 	mvrp = calloc(1, sizeof(*mvrp));
 	if (mvrp == NULL) {
 		res = -errno;
-		goto error_close;
+		goto error;
 	}
 
 	mvrp->server = server;
 	spa_list_init(&mvrp->attributes);
 
-	mvrp->source = pw_loop_add_io(server->impl->loop, fd, SPA_IO_IN, true, on_socket_data, mvrp);
+	mvrp->source = pw_loop_add_io(server->impl->loop, spa_steal_fd(fd), SPA_IO_IN, true, on_socket_data, mvrp);
 	if (mvrp->source == NULL) {
 		res = -errno;
 		pw_log_error("mvrp %p: can't create mvrp source: %m", mvrp);
-		goto error_no_source;
+		goto error_free;
 	}
 	avdecc_server_add_listener(server, &mvrp->server_listener, &server_events, mvrp);
 	avb_mrp_add_listener(server->mrp, &mvrp->mrp_listener, &mrp_events, mvrp);
 
 	return (struct avb_mvrp*)mvrp;
 
-error_no_source:
+error_free:
 	free(mvrp);
-error_close:
-	close(fd);
+error:
 	errno = -res;
 	return NULL;
 }

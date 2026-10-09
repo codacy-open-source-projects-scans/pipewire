@@ -108,11 +108,10 @@ static void mrp_periodic(void *data, uint64_t now)
 
 
 	if (now > mrp->lva_timer.leave_all_timeout) {
-		/* 802.1Q-2014 Table 10-5 */
+		/* IEEE 802.1Q-2018 Section 10.7.5.20: own LVA timer => TX path only, no RX_LVA */
 		mrp->lva_timer.state = FSM_LVA_ACTIVE;
 		if (mrp->lva_timer.leave_all_timeout > 0) {
 			mrp->lva_tx_pending = true;
-			global_event(mrp, now, AVB_MRP_EVENT_RX_LVA);
 			leave_all = true;
 		}
 	}
@@ -173,8 +172,8 @@ int avb_mrp_parse_packet(struct avb_mrp *mrp, uint64_t now, const void *pkt, int
 			const struct avb_packet_mrp_vector *v =
 				(const struct avb_packet_mrp_vector*)m;
 			uint16_t i, num_values = AVB_MRP_VECTOR_GET_NUM_VALUES(v);
-			uint8_t event_len = (num_values+2)/3;
-			uint8_t param_len = has_param ? (num_values+3)/4 : 0;
+			uint16_t event_len = (num_values+2)/3;
+			uint16_t param_len = has_param ? (num_values+3)/4 : 0;
 			int plen = sizeof(*v) + attr_len + event_len + param_len;
 			const uint8_t *first = v->first_value;
 			uint8_t event[3], param[4] = { 0, };
@@ -435,7 +434,6 @@ void avb_mrp_attribute_update_state(struct avb_mrp_attribute *attr, uint64_t now
 		break;
 	case AVB_MRP_EVENT_RX_LV:
 	case AVB_MRP_EVENT_RX_LVA:
-	case AVB_MRP_EVENT_TX_LVA:
 	case AVB_MRP_EVENT_REDECLARE:
 		switch (state) {
 		case AVB_MRP_IN:
@@ -443,6 +441,9 @@ void avb_mrp_attribute_update_state(struct avb_mrp_attribute *attr, uint64_t now
 			state = AVB_MRP_LV;
 			break;
 		}
+		break;
+	case AVB_MRP_EVENT_TX_LVA:
+		/* IEEE 802.1Q-2018 Table 10-4: TX events do not transition the registrar */
 		break;
 	case AVB_MRP_EVENT_FLUSH:
 		switch (state) {
@@ -463,17 +464,21 @@ void avb_mrp_attribute_update_state(struct avb_mrp_attribute *attr, uint64_t now
 	default:
 		break;
 	}
-	if (notify) {
-		mrp_attribute_emit_notify(a, now, notify);
-		mrp_emit_notify(mrp, now, &a->attr, notify);
-	}
-
+	/* commit registrar_state BEFORE notify: callbacks (e.g. notify_talker ->
+	 * refresh_listener_param) read the registrar state, so they must see the new
+	 * one. Emitting notify first made the Listener latch AskingFailed off a stale
+	 * MT state and never recompute -> SRP bridge refused to forward the stream. */
 	if (a->registrar_state != state || notify) {
 		pw_log_debug("REG: attr %p: %s %s %s -> %s notify=%s", a, a->attr.name,
 			avb_mrp_event_name(event), avb_registrar_state_name(a->registrar_state),
 			avb_registrar_state_name(state),
 			notify ? avb_mrp_notify_name(notify) : "none");
 		a->registrar_state = state;
+	}
+
+	if (notify) {
+		mrp_attribute_emit_notify(a, now, notify);
+		mrp_emit_notify(mrp, now, &a->attr, notify);
 	}
 
 	state = a->applicant_state;

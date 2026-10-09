@@ -583,6 +583,42 @@ conv_s32_to_f32d_1s_sse2(void *data, void * SPA_RESTRICT dst[], const void * SPA
 }
 
 void
+conv_s32_to_f32d_2_sse2(struct convert *conv, void * SPA_RESTRICT dst[], const void * SPA_RESTRICT src[],
+		uint32_t n_samples)
+{
+	const int32_t *s = src[0];
+	float *d0 = dst[0], *d1 = dst[1];
+	uint32_t n, unrolled;
+	__m128 t0, t1, factor = _mm_set1_ps(1.0f / S32_SCALE_I2F);
+
+	if (SPA_IS_ALIGNED(s, 16) &&
+	    SPA_IS_ALIGNED(d0, 16) &&
+	    SPA_IS_ALIGNED(d1, 16))
+		unrolled = n_samples & ~3;
+	else
+		unrolled = 0;
+
+	for(n = 0; n < unrolled; n += 4) {
+		t0 = _mm_mul_ps(_mm_cvtepi32_ps(_mm_load_si128((__m128i*)(s + 0))), factor);
+		t1 = _mm_mul_ps(_mm_cvtepi32_ps(_mm_load_si128((__m128i*)(s + 4))), factor);
+
+		_mm_store_ps(&d0[n], _mm_shuffle_ps(t0, t1, _MM_SHUFFLE(2, 0, 2, 0)));
+		_mm_store_ps(&d1[n], _mm_shuffle_ps(t0, t1, _MM_SHUFFLE(3, 1, 3, 1)));
+		s += 8;
+	}
+	for(; n < n_samples; n++) {
+		__m128 out;
+		out = _mm_cvtsi32_ss(factor, s[0]);
+		out = _mm_mul_ss(out, factor);
+		_mm_store_ss(&d0[n], out);
+		out = _mm_cvtsi32_ss(factor, s[1]);
+		out = _mm_mul_ss(out, factor);
+		_mm_store_ss(&d1[n], out);
+		s += 2;
+	}
+}
+
+void
 conv_s32_to_f32d_sse2(struct convert *conv, void * SPA_RESTRICT dst[], const void * SPA_RESTRICT src[],
 		uint32_t n_samples)
 {
@@ -948,6 +984,37 @@ conv_interleave_32_4s_sse2(void *data, void * SPA_RESTRICT dst, const void * SPA
 }
 
 void
+conv_32d_to_32_2_sse2(struct convert *conv, void * SPA_RESTRICT dst[], const void * SPA_RESTRICT src[],
+		uint32_t n_samples)
+{
+	const float *s0 = src[0], *s1 = src[1];
+	float *d = dst[0];
+	uint32_t n, unrolled;
+	__m128 t0, t1;
+
+	if (SPA_IS_ALIGNED(s0, 16) &&
+	    SPA_IS_ALIGNED(s1, 16) &&
+	    SPA_IS_ALIGNED(d, 16))
+		unrolled = n_samples & ~3;
+	else
+		unrolled = 0;
+
+	for(n = 0; n < unrolled; n += 4) {
+		t0 = _mm_load_ps(&s0[n]);
+		t1 = _mm_load_ps(&s1[n]);
+
+		_mm_store_ps(&d[0], _mm_unpacklo_ps(t0, t1));
+		_mm_store_ps(&d[4], _mm_unpackhi_ps(t0, t1));
+		d += 8;
+	}
+	for(; n < n_samples; n++) {
+		d[0] = s0[n];
+		d[1] = s1[n];
+		d += 2;
+	}
+}
+
+void
 conv_32d_to_32_sse2(struct convert *conv, void * SPA_RESTRICT dst[], const void * SPA_RESTRICT src[],
 		uint32_t n_samples)
 {
@@ -1110,6 +1177,37 @@ conv_deinterleave_32_4s_sse2(void *data, void * SPA_RESTRICT dst[], const void *
 		d2[n] = s[2];
 		d3[n] = s[3];
 		s += n_channels;
+	}
+}
+
+void
+conv_32_to_32d_2_sse2(struct convert *conv, void * SPA_RESTRICT dst[], const void * SPA_RESTRICT src[],
+		uint32_t n_samples)
+{
+	const float *s = src[0];
+	float *d0 = dst[0], *d1 = dst[1];
+	uint32_t n, unrolled;
+	__m128 t0, t1;
+
+	if (SPA_IS_ALIGNED(s, 16) &&
+	    SPA_IS_ALIGNED(d0, 16) &&
+	    SPA_IS_ALIGNED(d1, 16))
+		unrolled = n_samples & ~3;
+	else
+		unrolled = 0;
+
+	for(n = 0; n < unrolled; n += 4) {
+		t0 = _mm_load_ps(&s[0]);
+		t1 = _mm_load_ps(&s[4]);
+
+		_mm_store_ps(&d0[n], _mm_shuffle_ps(t0, t1, _MM_SHUFFLE(2, 0, 2, 0)));
+		_mm_store_ps(&d1[n], _mm_shuffle_ps(t0, t1, _MM_SHUFFLE(3, 1, 3, 1)));
+		s += 8;
+	}
+	for(; n < n_samples; n++) {
+		d0[n] = s[0];
+		d1[n] = s[1];
+		s += 2;
 	}
 }
 

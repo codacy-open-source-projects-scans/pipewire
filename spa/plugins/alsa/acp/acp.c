@@ -6,6 +6,7 @@
 #include "alsa-mixer.h"
 #include "alsa-ucm.h"
 
+#include <spa/monitor/device.h>
 #include <spa/utils/string.h>
 #include <spa/utils/json.h>
 #include <spa/utils/cleanup.h>
@@ -227,7 +228,8 @@ static void init_device(pa_card *impl, pa_alsa_device *dev, pa_alsa_direction_t 
 	dev->device.format.rate_mask = m->sample_spec.rate;
 	dev->device.format.channels = m->channel_map.channels;
 	dev->device.format.map = calloc(m->channel_map.channels, sizeof(uint32_t));
-	channelmap_to_acp(&m->channel_map, dev->device.format.map);
+	if (dev->device.format.map != NULL)
+		channelmap_to_acp(&m->channel_map, dev->device.format.map);
 	pa_cvolume_reset(&dev->real_volume, dev->device.format.channels);
 	pa_cvolume_reset(&dev->soft_volume, dev->device.format.channels);
 	dev->direction = direction;
@@ -328,6 +330,22 @@ static const char *find_best_verb(pa_card *impl)
 	return res;
 }
 
+static void get_pro_description(char *desc, size_t size,
+		snd_pcm_info_t *pcminfo, int dev, int count)
+{
+	const char *sub_name = snd_pcm_info_get_subdevice_name(pcminfo);
+	const char *pcm_name = snd_pcm_info_get_name(pcminfo);
+
+	if (sub_name && *sub_name && !pa_startswith(sub_name, "subdevice #"))
+		snprintf(desc, size, "%s", sub_name);
+	else if (pcm_name && *pcm_name)
+		snprintf(desc, size, "%s", pcm_name);
+	else if (count == 0)
+		snprintf(desc, size, "Pro");
+	else
+		snprintf(desc, size, "Pro %d", dev);
+}
+
 static int add_pro_profile(pa_card *impl, uint32_t index)
 {
 	snd_ctl_t *ctl_hndl;
@@ -361,6 +379,7 @@ static int add_pro_profile(pa_card *impl, uint32_t index)
 	ap->profile.description = ap->description = pa_xstrdup(_("Pro Audio"));
 	ap->profile.available = ACP_AVAILABLE_YES;
 	ap->profile.flags = ACP_PROFILE_PRO;
+	ap->supported = true;
 	ap->output_mappings = pa_idxset_new(pa_idxset_trivial_hash_func, pa_idxset_trivial_compare_func);
 	ap->input_mappings = pa_idxset_new(pa_idxset_trivial_hash_func, pa_idxset_trivial_compare_func);
 	pa_hashmap_put(ps->profiles, ap->name, ap);
@@ -396,10 +415,7 @@ static int add_pro_profile(pa_card *impl, uint32_t index)
 		snd_pcm_info_set_subdevice(pcminfo, 0);
 
 		snprintf(devstr, sizeof(devstr), "hw:%d,%d", index, dev);
-		if (count++ == 0)
-			snprintf(desc, sizeof(desc), "Pro");
-		else
-			snprintf(desc, sizeof(desc), "Pro %d", dev);
+		count++;
 
 		snd_pcm_info_set_stream(pcminfo, SND_PCM_STREAM_PLAYBACK);
 		if ((err = snd_ctl_pcm_info(ctl_hndl, pcminfo)) < 0) {
@@ -414,6 +430,7 @@ static int add_pro_profile(pa_card *impl, uint32_t index)
 			m = NULL;
 		}
 		if (m) {
+			get_pro_description(desc, sizeof(desc), pcminfo, dev, count);
 			m->description = pa_xstrdup(desc);
 			m->device_strings = pa_split_spaces_strv(devstr);
 
@@ -450,6 +467,7 @@ static int add_pro_profile(pa_card *impl, uint32_t index)
 			m = NULL;
 		}
 		if (m) {
+			get_pro_description(desc, sizeof(desc), pcminfo, dev, count);
 			m->description = pa_xstrdup(desc);
 			m->device_strings = pa_split_spaces_strv(devstr);
 
@@ -524,8 +542,9 @@ static void add_profiles(pa_card *impl)
 	pa_alsa_device *dev;
 	int n_profiles, n_ports, n_devices;
 	uint32_t idx;
-	const char *arr;
+	const char *arr, *str;
 	bool broken_ucm = false;
+	char name[512];
 
 	n_devices = 0;
 	pa_dynarray_init(&impl->out.devices, device_free);
@@ -535,6 +554,7 @@ static void add_profiles(pa_card *impl)
 	ap->profile.description = ap->description = pa_xstrdup(_("Off"));
 	ap->profile.available = ACP_AVAILABLE_YES;
 	ap->profile.flags = ACP_PROFILE_OFF;
+	ap->supported = true;
 	pa_hashmap_put(impl->profiles, ap->name, ap);
 
 	if (!impl->disable_pro_audio)
@@ -547,6 +567,11 @@ static void add_profiles(pa_card *impl)
 		cp->name = ap->name;
 		cp->description = ap->description;
 		cp->priority = ap->priority ? ap->priority : 1;
+
+		if (!ap->supported) {
+			cp->available = ACP_AVAILABLE_NO;
+			cp->flags |= ACP_PROFILE_HIDDEN;
+		}
 
 		pa_dynarray_init(&ap->out.devices, NULL);
 
@@ -639,15 +664,58 @@ static void add_profiles(pa_card *impl)
 		dp->port.n_profiles = n_profiles;
 		dp->port.profiles = dp->prof.array.data;
 
+		snprintf(name, sizeof(name), "api.acp.port.%s.min-volume", dp->name);
+		if ((str = pa_proplist_gets(impl->proplist, name)))
+			spa_atof(str, &dp->hard_volume_limit[0]);
+		else
+			dp->hard_volume_limit[0] = impl->hard_volume_limit[0];
+
+		snprintf(name, sizeof(name), "api.acp.port.%s.max-volume", dp->name);
+		if ((str = pa_proplist_gets(impl->proplist, name)))
+			spa_atof(str, &dp->hard_volume_limit[1]);
+		else
+			dp->hard_volume_limit[1] = impl->hard_volume_limit[1];
+
+		dp->soft_volume_limit[0] = dp->hard_volume_limit[0];
+		dp->soft_volume_limit[1] = dp->hard_volume_limit[1];
 		pa_proplist_setf(dp->proplist, "card.profile.port", "%u", dp->port.index);
 		pa_proplist_as_dict(dp->proplist, &dp->port.props);
 		pa_dynarray_append(&impl->out.ports, dp);
 	}
 	PA_DYNARRAY_FOREACH(dev, &impl->out.devices, idx) {
+		float vol_limit[2] = { 0.0f, FLT_MAX };
+		n_ports = 0;
+
+		snprintf(name, sizeof(name), "api.acp.device.%s.min-volume", dev->device.name);
+		if ((str = pa_proplist_gets(impl->proplist, name)))
+			spa_atof(str, &vol_limit[0]);
+		else
+			vol_limit[0] = impl->hard_volume_limit[0];
+
+		snprintf(name, sizeof(name), "api.acp.device.%s.max-volume", dev->device.name);
+		if ((str = pa_proplist_gets(impl->proplist, name)))
+			spa_atof(str, &vol_limit[1]);
+		else
+			vol_limit[1] = impl->hard_volume_limit[1];
+
 		PA_HASHMAP_FOREACH(dp, dev->ports, state) {
+			if (n_ports == 0) {
+				vol_limit[0] = dp->hard_volume_limit[0];
+				vol_limit[1] = dp->hard_volume_limit[1];
+			} else {
+				vol_limit[0] = fminf(vol_limit[0], dp->hard_volume_limit[0]);
+				vol_limit[1] = fmaxf(vol_limit[1], dp->hard_volume_limit[1]);
+			}
 			pa_dynarray_append(&dev->port_array, dp);
 			pa_dynarray_append(&dp->devices, dev);
+			n_ports++;
 		}
+		if (n_ports == 0) {
+			pa_proplist_setf(dev->proplist, "channelmix.min-volume", "%f", vol_limit[0]);
+			pa_proplist_setf(dev->proplist, "channelmix.max-volume", "%f", vol_limit[1]);
+		}
+		pa_proplist_as_dict(dev->proplist, &dev->device.props);
+
 		dev->device.ports = dev->port_array.array.data;
 		dev->device.n_ports = pa_dynarray_size(&dev->port_array);
 	}
@@ -742,17 +810,130 @@ struct temp_port_avail {
 	pa_available_t avail;
 };
 
+static void update_profile_availabilities(pa_card *impl)
+{
+	pa_alsa_profile *profile;
+	void *state;
+	bool any_input_port_available;
+	enum acp_available active_available = ACP_AVAILABLE_UNKNOWN;
+	const char *hidden_profiles;
+
+	/* Unhide profiles that became supported after re-probing, but not profiles
+	 * hidden by the user via api.acp.hidden-profiles */
+	hidden_profiles = pa_proplist_gets(impl->proplist, "api.acp.hidden-profiles");
+	PA_HASHMAP_FOREACH(profile, impl->profiles, state) {
+		if (profile->supported &&
+				(profile->profile.flags & ACP_PROFILE_HIDDEN) &&
+				!contains_string(hidden_profiles, profile->profile.name))
+			profile->profile.flags &= ~ACP_PROFILE_HIDDEN;
+	}
+
+	/* Update profile availabilities. Ideally we would mark all profiles
+	 * unavailable that contain unavailable devices. We can't currently do that
+	 * in all cases, because if there are multiple sinks in a profile, and the
+	 * profile contains a mix of available and unavailable ports, we don't know
+	 * how the ports are distributed between the different sinks. It's possible
+	 * that some sinks contain only unavailable ports, in which case we should
+	 * mark the profile as unavailable, but it's also possible that all sinks
+	 * contain at least one available port, in which case we should mark the
+	 * profile as available. Until the data structures are improved so that we
+	 * can distinguish between these two cases, we mark the problematic cases
+	 * as available (well, "unknown" to be precise, but there's little
+	 * practical difference).
+	 *
+	 * When all output ports are unavailable, we know that all sinks are
+	 * unavailable, and therefore the profile is marked unavailable as well.
+	 * The same applies to input ports as well, of course.
+	 *
+	 * If there are no output ports at all, but the profile contains at least
+	 * one sink, then the output is considered to be available. */
+	if (impl->card.active_profile_index != ACP_INVALID_INDEX)
+		active_available = impl->card.profiles[impl->card.active_profile_index]->available;
+
+	/* First round - detect, if we have any input port available. */
+	any_input_port_available = false;
+	PA_HASHMAP_FOREACH(profile, impl->profiles, state) {
+		pa_device_port *port;
+		void *state2;
+
+		if (profile->profile.flags & ACP_PROFILE_OFF)
+			continue;
+
+		PA_HASHMAP_FOREACH(port, impl->ports, state2) {
+			if (!pa_hashmap_get(port->profiles, profile->profile.name))
+				continue;
+
+			if (port->port.direction == ACP_DIRECTION_CAPTURE &&
+			    port->port.available != ACP_AVAILABLE_NO) {
+				any_input_port_available = true;
+				goto input_port_found;
+			}
+		}
+	}
+input_port_found:
+
+	/* Second round */
+	PA_HASHMAP_FOREACH(profile, impl->profiles, state) {
+		pa_device_port *port;
+		void *state2;
+		bool has_input_port = false;
+		bool has_output_port = false;
+		bool found_available_input_port = false;
+		bool found_available_output_port = false;
+		enum acp_available available = ACP_AVAILABLE_UNKNOWN;
+
+		if (profile->profile.flags & ACP_PROFILE_OFF)
+			continue;
+
+		PA_HASHMAP_FOREACH(port, impl->ports, state2) {
+			if (!pa_hashmap_get(port->profiles, profile->profile.name))
+				continue;
+
+			if (port->port.direction == ACP_DIRECTION_CAPTURE) {
+				has_input_port = true;
+				if (port->port.available != ACP_AVAILABLE_NO)
+					found_available_input_port = true;
+			} else {
+				has_output_port = true;
+				if (port->port.available != ACP_AVAILABLE_NO)
+					found_available_output_port = true;
+			}
+		}
+
+		if ((has_input_port && !found_available_input_port) ||
+		    (has_output_port && !found_available_output_port))
+			available = ACP_AVAILABLE_NO;
+
+		if (has_input_port && !has_output_port && found_available_input_port)
+			available = ACP_AVAILABLE_YES;
+		if (has_output_port && (!has_input_port || !any_input_port_available) && found_available_output_port)
+			available = ACP_AVAILABLE_YES;
+		if (has_output_port && has_input_port && found_available_output_port && found_available_input_port)
+			available = ACP_AVAILABLE_YES;
+
+		/* If hardware re-probe found this profile unsupported, force unavailable */
+		if (!(profile->profile.flags & ACP_PROFILE_PRO) && !profile->supported)
+			available = ACP_AVAILABLE_NO;
+
+		if (profile->profile.index == impl->card.active_profile_index)
+			active_available = available;
+		else
+			profile_set_available(impl, profile->profile.index, available, false);
+	}
+
+	if (impl->card.active_profile_index != ACP_INVALID_INDEX)
+		profile_set_available(impl, impl->card.active_profile_index, active_available, true);
+}
+
 static int report_jack_state(snd_mixer_elem_t *melem, unsigned int mask)
 {
 	pa_card *impl = snd_mixer_elem_get_callback_private(melem);
 	snd_hctl_elem_t **_elem = snd_mixer_elem_get_private(melem), *elem;
 	snd_ctl_elem_value_t *elem_value;
-	bool plugged_in, any_input_port_available;
+	bool plugged_in;
 	void *state;
 	pa_alsa_jack *jack;
 	struct temp_port_avail *tp, *tports;
-	pa_alsa_profile *profile;
-	enum acp_available active_available = ACP_AVAILABLE_UNKNOWN;
 	size_t size;
 
 	pa_assert(_elem);
@@ -838,102 +1019,7 @@ static int report_jack_state(snd_mixer_elem_t *melem, unsigned int mask)
 #endif
 	}
 
-	/* Update profile availabilities. Ideally we would mark all profiles
-	 * unavailable that contain unavailable devices. We can't currently do that
-	 * in all cases, because if there are multiple sinks in a profile, and the
-	 * profile contains a mix of available and unavailable ports, we don't know
-	 * how the ports are distributed between the different sinks. It's possible
-	 * that some sinks contain only unavailable ports, in which case we should
-	 * mark the profile as unavailable, but it's also possible that all sinks
-	 * contain at least one available port, in which case we should mark the
-	 * profile as available. Until the data structures are improved so that we
-	 * can distinguish between these two cases, we mark the problematic cases
-	 * as available (well, "unknown" to be precise, but there's little
-	 * practical difference).
-	 *
-	 * When all output ports are unavailable, we know that all sinks are
-	 * unavailable, and therefore the profile is marked unavailable as well.
-	 * The same applies to input ports as well, of course.
-	 *
-	 * If there are no output ports at all, but the profile contains at least
-	 * one sink, then the output is considered to be available. */
-	if (impl->card.active_profile_index != ACP_INVALID_INDEX)
-		active_available = impl->card.profiles[impl->card.active_profile_index]->available;
-
-	/* First round - detect, if we have any input port available.
-	   If the hardware can report the state for all I/O jacks, only speakers
-	   may be plugged in. */
-	any_input_port_available = false;
-	PA_HASHMAP_FOREACH(profile, impl->profiles, state) {
-		pa_device_port *port;
-		void *state2;
-
-		if (profile->profile.flags & ACP_PROFILE_OFF)
-			continue;
-
-		PA_HASHMAP_FOREACH(port, impl->ports, state2) {
-			if (!pa_hashmap_get(port->profiles, profile->profile.name))
-				continue;
-
-			if (port->port.direction == ACP_DIRECTION_CAPTURE &&
-			    port->port.available != ACP_AVAILABLE_NO) {
-				any_input_port_available = true;
-				goto input_port_found;
-			}
-		}
-	}
-input_port_found:
-
-	/* Second round */
-	PA_HASHMAP_FOREACH(profile, impl->profiles, state) {
-		pa_device_port *port;
-		void *state2;
-		bool has_input_port = false;
-		bool has_output_port = false;
-		bool found_available_input_port = false;
-		bool found_available_output_port = false;
-		enum acp_available available = ACP_AVAILABLE_UNKNOWN;
-
-		if (profile->profile.flags & ACP_PROFILE_OFF)
-			continue;
-
-		PA_HASHMAP_FOREACH(port, impl->ports, state2) {
-			if (!pa_hashmap_get(port->profiles, profile->profile.name))
-				continue;
-
-			if (port->port.direction == ACP_DIRECTION_CAPTURE) {
-				has_input_port = true;
-				if (port->port.available != ACP_AVAILABLE_NO)
-					found_available_input_port = true;
-			} else {
-				has_output_port = true;
-				if (port->port.available != ACP_AVAILABLE_NO)
-					found_available_output_port = true;
-			}
-		}
-
-		if ((has_input_port && !found_available_input_port) ||
-		    (has_output_port && !found_available_output_port))
-			available = ACP_AVAILABLE_NO;
-
-		if (has_input_port && !has_output_port && found_available_input_port)
-			available = ACP_AVAILABLE_YES;
-		if (has_output_port && (!has_input_port || !any_input_port_available) && found_available_output_port)
-			available = ACP_AVAILABLE_YES;
-		if (has_output_port && has_input_port && found_available_output_port && found_available_input_port)
-			available = ACP_AVAILABLE_YES;
-
-		/* We want to update the active profile's status last, so logic that
-		 * may change the active profile based on profile availability status
-		 * has an updated view of all profiles' availabilities. */
-		if (profile->profile.index == impl->card.active_profile_index)
-			active_available = available;
-		else
-			profile_set_available(impl, profile->profile.index, available, false);
-	}
-
-	if (impl->card.active_profile_index != ACP_INVALID_INDEX)
-		profile_set_available(impl, impl->card.active_profile_index, active_available, true);
+	update_profile_availabilities(impl);
 
 	return 0;
 }
@@ -1073,7 +1159,7 @@ static int hdmi_eld_changed(snd_mixer_elem_t *melem, unsigned int mask)
 	pa_card *impl = snd_mixer_elem_get_callback_private(melem);
 	snd_hctl_elem_t **_elem = snd_mixer_elem_get_private(melem), *elem;
 	int device;
-	const char *old_monitor_name, *old_iec958_codec_list, *old_channels, *old_position;
+	const char *old_monitor_name, *old_product_id, *old_port_id, *old_iec958_codec_list, *old_channels, *old_position;
 	pa_device_port *p;
 	pa_hdmi_eld eld;
 	bool changed = false;
@@ -1110,6 +1196,28 @@ static int hdmi_eld_changed(snd_mixer_elem_t *melem, unsigned int mask)
 	} else {
 		changed |= (old_monitor_name == NULL) || (!spa_streq(old_monitor_name, eld.monitor_name));
 		pa_proplist_sets(p->proplist, PA_PROP_DEVICE_PRODUCT_NAME, eld.monitor_name);
+	}
+
+	old_product_id = pa_proplist_gets(p->proplist, ACP_KEY_HDMI_PRODUCT_ID);
+	if (eld.manufacturer[0] == '\0' && eld.product_id == 0) {
+		changed |= old_product_id != NULL;
+		pa_proplist_unset(p->proplist, ACP_KEY_HDMI_PRODUCT_ID);
+	} else {
+		char product_id[16];
+		snprintf(product_id, sizeof(product_id), "%s:%u", eld.manufacturer, eld.product_id);
+		changed |= (old_product_id == NULL) || (!spa_streq(old_product_id, product_id));
+		pa_proplist_sets(p->proplist, ACP_KEY_HDMI_PRODUCT_ID, product_id);
+	}
+
+	old_port_id = pa_proplist_gets(p->proplist, ACP_KEY_HDMI_PORT_ID);
+	if (eld.port_id == 0) {
+		changed |= old_port_id != NULL;
+		pa_proplist_unset(p->proplist, ACP_KEY_HDMI_PORT_ID);
+	} else {
+		char port_id[19];
+		snprintf(port_id, sizeof(port_id), "0x%016llx", (unsigned long long) eld.port_id);
+		changed |= (old_port_id == NULL) || (!spa_streq(old_port_id, port_id));
+		pa_proplist_sets(p->proplist, ACP_KEY_HDMI_PORT_ID, port_id);
 	}
 
 	old_iec958_codec_list = pa_proplist_gets(p->proplist, ACP_KEY_IEC958_CODECS_DETECTED);
@@ -1194,6 +1302,12 @@ static int hdmi_eld_changed(snd_mixer_elem_t *melem, unsigned int mask)
 
 	if (changed && mask != 0 && impl->events && impl->events->props_changed)
 		impl->events->props_changed(impl->user_data);
+
+	if (changed && mask != 0) {
+		pa_alsa_profile_set_recheck_hdmi_eld(impl->profile_set, impl->card.index, &eld);
+		update_profile_availabilities(impl);
+	}
+
 	return 0;
 }
 
@@ -1333,6 +1447,46 @@ static int mixer_callback(snd_mixer_elem_t *elem, unsigned int mask)
 	pa_log_info("%p mixer changed %d", dev, mask);
 
 	if (mask & SND_CTL_EVENT_MASK_VALUE) {
+		if (dev->read_volume)
+			dev->read_volume(dev);
+		if (dev->read_mute)
+			dev->read_mute(dev);
+	}
+	return 0;
+}
+
+/*
+ * A control can leave the card and come back while the card stays, for
+ * instance when the driver that provides it is unbound and bound again.
+ * The element that comes back is a new object without mixer_callback()
+ * on it: the device would still write the control but no longer see it
+ * change. Attach the callback again and pick up the current value.
+ */
+static int mixer_elem_added(snd_mixer_t *mixer, unsigned int mask, snd_mixer_elem_t *elem)
+{
+	pa_card *impl = snd_mixer_get_callback_private(mixer);
+	pa_alsa_device *dev;
+	uint32_t idx;
+	bool attached;
+
+	if (!(mask & SND_CTL_EVENT_MASK_ADD))
+		return 0;
+
+	PA_DYNARRAY_FOREACH(dev, &impl->out.devices, idx) {
+		if (dev->mixer_handle != mixer || !(dev->device.flags & ACP_DEVICE_ACTIVE))
+			continue;
+
+		if (dev->mixer_path_set)
+			attached = pa_alsa_path_set_attach_callback(dev->mixer_path_set, elem, mixer_callback, dev);
+		else if (dev->mixer_path)
+			attached = pa_alsa_path_attach_callback(dev->mixer_path, elem, mixer_callback, dev);
+		else
+			attached = false;
+
+		if (!attached)
+			continue;
+
+		pa_log_info("%p mixer element returned", dev);
 		if (dev->read_volume)
 			dev->read_volume(dev);
 		if (dev->read_mute)
@@ -1676,6 +1830,8 @@ static int setup_mixer(pa_card *impl, pa_alsa_device *dev, bool ignore_dB)
 			pa_alsa_path_set_set_callback(dev->mixer_path_set, dev->mixer_handle, mixer_callback, dev);
 		else
 			pa_alsa_path_set_callback(dev->mixer_path, dev->mixer_handle, mixer_callback, dev);
+		snd_mixer_set_callback(dev->mixer_handle, mixer_elem_added);
+		snd_mixer_set_callback_private(dev->mixer_handle, impl);
 	}
 	return 0;
 }
@@ -1744,10 +1900,13 @@ static int device_enable(pa_card *impl, pa_alsa_mapping *mapping, pa_alsa_device
 				dev->device.format.channels = atoi(channels);
 				free(dev->device.format.map);
 				dev->device.format.map = calloc(dev->device.format.channels, sizeof(uint32_t));
+				if (dev->device.format.map == NULL)
+					break;
 
-				while ((position = pa_split_in_place(positions, ",", &n, &split_state)) != NULL &&
+				while ((position = pa_split_in_place(positions, "[,]", &n, &split_state)) != NULL &&
 						i < dev->device.format.channels) {
-					dev->device.format.map[i++] = acp_channel_from_str(position, n);
+					if (n > 0)
+						dev->device.format.map[i++] = acp_channel_from_str(position, n);
 				}
 
 				break;
@@ -1944,6 +2103,8 @@ struct acp_card *acp_card_new(uint32_t index, const struct acp_dict *props)
 	impl->ignore_dB = false;
 	impl->rate = DEFAULT_RATE;
 	impl->pro_channels = DEFAULT_CHANNELS;
+	impl->hard_volume_limit[0] = 0.0f;
+	impl->hard_volume_limit[1] = FLT_MAX;
 
 	if (props) {
 		if ((s = acp_dict_lookup(props, "api.alsa.use-ucm")) != NULL)
@@ -1954,9 +2115,9 @@ struct acp_card *acp_card_new(uint32_t index, const struct acp_dict *props)
 			impl->disable_mixer_path = spa_atob(s);
 		if ((s = acp_dict_lookup(props, "api.alsa.ignore-dB")) != NULL)
 			impl->ignore_dB = spa_atob(s);
-		if ((s = acp_dict_lookup(props, "device.profile-set")) != NULL)
+		if ((s = acp_dict_lookup(props, SPA_KEY_DEVICE_PROFILE_SET)) != NULL)
 			profile_set = s;
-		if ((s = acp_dict_lookup(props, "device.profile")) != NULL)
+		if ((s = acp_dict_lookup(props, SPA_KEY_DEVICE_PROFILE)) != NULL)
 			profile = s;
 		if ((s = acp_dict_lookup(props, "api.acp.auto-profile")) != NULL)
 			impl->auto_profile = spa_atob(s);
@@ -1972,6 +2133,10 @@ struct acp_card *acp_card_new(uint32_t index, const struct acp_dict *props)
 			impl->disable_pro_audio = spa_atob(s);
 		if ((s = acp_dict_lookup(props, "api.acp.use-eld-channels")) != NULL)
 			impl->use_eld_channels = spa_atob(s);
+		if ((s = acp_dict_lookup(props, "api.acp.min-volume")) != NULL)
+			spa_atof(s, &impl->hard_volume_limit[0]);
+		if ((s = acp_dict_lookup(props, "api.acp.max-volume")) != NULL)
+			spa_atof(s, &impl->hard_volume_limit[1]);
 	}
 
 #if SND_LIB_VERSION < 0x10207
@@ -2021,7 +2186,7 @@ struct acp_card *acp_card_new(uint32_t index, const struct acp_dict *props)
 	impl->profile_set->ignore_dB = impl->ignore_dB;
 
 	pa_alsa_profile_set_probe(impl->profile_set, impl->ucm.mixers,
-			device_id,
+			index,
 			&impl->ucm.default_sample_spec,
 			impl->ucm.default_n_fragments,
 			impl->ucm.default_fragment_size_msec);
@@ -2164,6 +2329,7 @@ int acp_card_handle_events(struct acp_card *card)
 			return n;
 		count += n;
 	}
+
 	return count;
 }
 
@@ -2287,21 +2453,69 @@ int acp_device_set_port(struct acp_device *dev, uint32_t port_index, uint32_t fl
 	return res;
 }
 
+int acp_device_get_volume_limit(struct acp_device *dev, float *min, float *max)
+{
+	pa_alsa_device *d = (pa_alsa_device*)dev;
+	pa_card *impl = d->card;
+	pa_device_port *p;
+	float *soft_volume_limit, *hard_volume_limit;
+
+	if ((p = d->active_port) != NULL) {
+		soft_volume_limit = p->soft_volume_limit;
+		hard_volume_limit = p->hard_volume_limit;
+	} else {
+		soft_volume_limit = impl->hard_volume_limit;
+		hard_volume_limit = impl->hard_volume_limit;
+	}
+	if (min)
+		*min = fmaxf(soft_volume_limit[0], hard_volume_limit[0]);
+	if (max)
+		*max = fminf(soft_volume_limit[1], hard_volume_limit[1]);
+	return 0;
+}
+int acp_device_set_volume_limit(struct acp_device *dev, float min, float max)
+{
+	pa_alsa_device *d = (pa_alsa_device*)dev;
+	pa_card *impl = d->card;
+	pa_device_port *p;
+	float *soft_volume_limit, *hard_volume_limit;
+
+	if ((p = d->active_port) != NULL) {
+		soft_volume_limit = p->soft_volume_limit;
+		hard_volume_limit = p->hard_volume_limit;
+	}
+	else {
+		soft_volume_limit = impl->hard_volume_limit;
+		hard_volume_limit = impl->hard_volume_limit;
+	}
+	soft_volume_limit[0] = fmaxf(min, hard_volume_limit[0]);
+	soft_volume_limit[1] = fminf(max, hard_volume_limit[1]);
+	return 0;
+}
+
 int acp_device_set_volume(struct acp_device *dev, const float *volume, uint32_t n_volume)
 {
 	pa_alsa_device *d = (pa_alsa_device*)dev;
 	pa_card *impl = d->card;
 	uint32_t i;
 	pa_cvolume v, old_volume;
+	pa_device_port *p;
+	float *volume_limit;
 
 	if (n_volume == 0)
 		return -EINVAL;
 
 	old_volume = d->real_volume;
 
+	if ((p = d->active_port) != NULL)
+		volume_limit = p->soft_volume_limit;
+	else
+		volume_limit = impl->hard_volume_limit;
+
 	v.channels = d->mapping->channel_map.channels;
 	for (i = 0; i < v.channels; i++)
-		v.values[i] = pa_sw_volume_from_linear(volume[i % n_volume]);
+		v.values[i] = pa_sw_volume_from_linear(
+				SPA_CLAMPF(volume[i % n_volume], volume_limit[0], volume_limit[1]));
 
 	pa_log_info("Set %s volume: min:%d max:%d",
 			d->set_volume ? "hardware" : "software",

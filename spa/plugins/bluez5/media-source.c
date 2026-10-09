@@ -148,6 +148,7 @@ struct impl {
 	unsigned int decode_buffer_target;
 
 	unsigned int node_latency;
+	uint32_t min_latency_ms;
 
 	int fd;
 	struct spa_source source;
@@ -455,7 +456,8 @@ static int apply_props(struct impl *this, const struct spa_pod *param)
 	if (param == NULL) {
 		reset_props(&new_props);
 	} else {
-		/* noop */
+		if (!spa_pod_is_object_type(param, SPA_TYPE_OBJECT_Props))
+			return -EINVAL;
 	}
 
 	changed = (memcmp(&new_props, &this->props, sizeof(struct props)) != 0);
@@ -1001,8 +1003,10 @@ static int transport_start(struct impl *this)
 			&port->current_format,
 			this->codec_props,
 			this->transport->read_mtu);
-	if (this->codec_data == NULL)
-		return -EIO;
+	if (this->codec_data == NULL) {
+		res = -EIO;
+		goto fail;
+	}
 
 	spa_log_info(this->log, "%p: using %s codec %s", this,
 			media_codec_kind_str(this->codec), this->codec->description);
@@ -1012,8 +1016,10 @@ static int transport_start(struct impl *this)
 	 * and this won't work properly with epoll. Always dup to avoid problems.
 	 */
 	this->fd = dup(this->transport->fd);
-	if (this->fd < 0)
-		return -errno;
+	if (this->fd < 0) {
+		res = -errno;
+		goto fail;
+	}
 
 	val = 6;
 	if (setsockopt(this->fd, SOL_SOCKET, SO_PRIORITY, &val, sizeof(val)) < 0)
@@ -1025,7 +1031,7 @@ static int transport_start(struct impl *this)
 	if ((res = spa_bt_decode_buffer_init(&port->buffer, this->log,
 			port->frame_size, port->current_format.info.raw.rate,
 			this->quantum_limit, this->quantum_limit)) < 0)
-		return res;
+		goto fail;
 
 	spa_bt_decode_buffer_set_target_latency(&port->buffer, (int32_t) this->decode_buffer_target);
 
@@ -1037,6 +1043,11 @@ static int transport_start(struct impl *this)
 		/* 80 ms max extra buffer */
 		spa_bt_decode_buffer_set_max_extra_latency(&port->buffer,
 				port->current_format.info.raw.rate * 80 / 1000);
+	}
+
+	if (this->min_latency_ms) {
+		spa_bt_decode_buffer_set_min_latency(&port->buffer,
+				this->min_latency_ms * port->current_format.info.raw.rate / 1000);
 	}
 
 	this->delay.buffer = -1;
@@ -1066,8 +1077,10 @@ static int transport_start(struct impl *this)
 					spa_strerror(res));
 	} else {
 		spa_zero(this->source);
-		if (spa_bt_transport_ensure_sco_io(this->transport, this->data_loop, this->data_system) < 0)
+		if (spa_bt_transport_ensure_sco_io(this->transport, this->data_loop, this->data_system) < 0) {
+			res = -EIO;
 			goto fail;
+		}
 		spa_loop_locked(this->data_loop, do_start_sco_iso_io, 0, NULL, 0, this);
 	}
 
@@ -1079,11 +1092,20 @@ static int transport_start(struct impl *this)
 	return 0;
 
 fail:
+	if (this->update_delay_event) {
+		spa_loop_utils_destroy_source(this->loop_utils, this->update_delay_event);
+		this->update_delay_event = NULL;
+	}
+	if (this->fd >= 0) {
+		close(this->fd);
+		this->fd = -1;
+	}
+	spa_bt_decode_buffer_clear(&port->buffer);
 	if (this->codec_data) {
 		this->codec->deinit(this->codec_data);
 		this->codec_data = NULL;
 	}
-	return -EIO;
+	return res;
 }
 
 static int do_start(struct impl *this)
@@ -1139,10 +1161,6 @@ static int do_remove_source(struct spa_loop *loop,
 
 	if (this->timer_source.loop)
 		spa_loop_remove_source(this->data_loop, &this->timer_source);
-	if (this->transport && this->transport->iso_io) {
-		spa_bt_iso_io_set_cb(this->transport->iso_io, NULL, NULL);
-		spa_bt_iso_io_set_source_buffer(this->transport->iso_io, NULL);
-	}
 	if (this->transport && this->transport->sco_io)
 		spa_bt_sco_io_set_source_cb(this->transport->sco_io, NULL, NULL);
 	set_timeout(this, 0);
@@ -1253,6 +1271,9 @@ static int impl_node_send_command(void *object, const struct spa_command *comman
 	case SPA_NODE_COMMAND_Pause:
 		if ((res = do_stop(this)) < 0)
 			return res;
+		break;
+	case SPA_NODE_COMMAND_ParamBegin:
+	case SPA_NODE_COMMAND_ParamEnd:
 		break;
 	default:
 		return -ENOTSUP;
@@ -2046,7 +2067,7 @@ static void transport_state_changed(void *data,
 
 		spa_pod_builder_init(&b, buffer, sizeof(buffer));
 		spa_node_emit_event(&this->hooks,
-				spa_pod_builder_add_object(&b,
+				(struct spa_event*)spa_pod_builder_add_object(&b,
 						SPA_TYPE_EVENT_Node, SPA_NODE_EVENT_Error));
 	}
 }
@@ -2067,6 +2088,9 @@ static int do_transport_destroy(struct spa_loop *loop,
 				void *user_data)
 {
 	struct impl *this = user_data;
+
+	if (this->transport)
+		spa_hook_remove(&this->transport_listener);
 	this->transport = NULL;
 	return 0;
 }
@@ -2078,11 +2102,21 @@ static void transport_destroy(void *data)
 	spa_loop_locked(this->data_loop, do_transport_destroy, 0, NULL, 0, this);
 }
 
+static void transport_remove_node(void *data)
+{
+	struct impl *this = data;
+
+	spa_log_debug(this->log, "transport %p remove node", this->transport);
+	do_stop(this);
+	spa_loop_locked(this->data_loop, do_transport_destroy, 0, NULL, 0, this);
+}
+
 static const struct spa_bt_transport_events transport_events = {
 	SPA_VERSION_BT_TRANSPORT_EVENTS,
 	.delay_changed = transport_delay_changed,
 	.state_changed = transport_state_changed,
         .destroy = transport_destroy,
+	.remove_node = transport_remove_node,
 };
 
 static int impl_get_interface(struct spa_handle *handle, const char *type, void **interface)
@@ -2112,7 +2146,8 @@ static int impl_clear(struct spa_handle *handle)
 		this->codec->clear_props(this->codec_props);
 	if (this->transport)
 		spa_hook_remove(&this->transport_listener);
-	spa_system_close(this->data_system, this->timerfd);
+	if (this->timerfd > 0)
+		spa_system_close(this->data_system, this->timerfd);
 	spa_bt_decode_buffer_clear(&port->buffer);
 	return 0;
 }
@@ -2134,6 +2169,7 @@ impl_init(const struct spa_handle_factory *factory,
 	struct impl *this;
 	struct port *port;
 	const char *str;
+	int res;
 
 	spa_return_val_if_fail(factory != NULL, -EINVAL);
 	spa_return_val_if_fail(handle != NULL, -EINVAL);
@@ -2147,6 +2183,7 @@ impl_init(const struct spa_handle_factory *factory,
 	this->data_loop = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_DataLoop);
 	this->data_system = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_DataSystem);
 	this->loop_utils = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_LoopUtils);
+	this->timerfd = -1;
 
 	spa_log_topic_init(this->log, &log_topic);
 
@@ -2246,6 +2283,8 @@ impl_init(const struct spa_handle_factory *factory,
 			spa_scnprintf(this->props.rate, sizeof(this->props.rate), "%s", str);
 			this->props.has_rate = true;
 		}
+		if ((str = spa_dict_lookup(info, SPA_KEY_API_BLUEZ5_MIN_LATENCY_MS)) != NULL)
+			spa_atou32(str, &this->min_latency_ms, 0);
 	}
 
 	if (this->is_duplex) {
@@ -2268,8 +2307,10 @@ impl_init(const struct spa_handle_factory *factory,
 	spa_bt_transport_add_listener(this->transport,
 			&this->transport_listener, &transport_events, this);
 
-	this->timerfd = spa_system_timerfd_create(this->data_system,
-			CLOCK_MONOTONIC, SPA_FD_CLOEXEC | SPA_FD_NONBLOCK);
+	if ((res = spa_system_timerfd_create(this->data_system,
+			CLOCK_MONOTONIC, SPA_FD_CLOEXEC | SPA_FD_NONBLOCK)) < 0)
+		goto error;
+	this->timerfd = res;
 
 	this->node_latency = 512;
 
@@ -2278,6 +2319,10 @@ impl_init(const struct spa_handle_factory *factory,
 	this->fd = -1;
 
 	return 0;
+
+error:
+	impl_clear(handle);
+	return res;
 }
 
 static const struct spa_interface_info impl_interfaces[] = {

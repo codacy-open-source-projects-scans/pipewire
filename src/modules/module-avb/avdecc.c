@@ -5,6 +5,9 @@
 #include <linux/if_ether.h>
 #include <linux/if_packet.h>
 #include <linux/filter.h>
+#include <linux/netlink.h>
+#include <linux/rtnetlink.h>
+#include <linux/if_link.h>
 #include <linux/net_tstamp.h>
 #include <limits.h>
 #include <net/if.h>
@@ -14,6 +17,7 @@
 
 #include <spa/support/cpu.h>
 #include <spa/debug/mem.h>
+#include <spa/utils/cleanup.h>
 #include <spa/utils/result.h>
 
 #include <pipewire/pipewire.h>
@@ -21,6 +25,7 @@
 #include "avb.h"
 #include "packets.h"
 #include "internal.h"
+#include "gptp.h"
 #include "stream.h"
 #include "acmp.h"
 #include "adp.h"
@@ -147,12 +152,12 @@ static int load_filter(int fd, uint16_t eth, const uint8_t dest[6], const uint8_
 
 static int raw_make_socket(struct server *server, uint16_t type, const uint8_t mac[6])
 {
-	int fd, res;
+	int res;
 	struct ifreq req;
 	struct packet_mreq mreq;
 	struct sockaddr_ll sll;
 
-	fd = socket(AF_PACKET, SOCK_RAW|SOCK_NONBLOCK, htons(ETH_P_ALL));
+	spa_autoclose int fd = socket(AF_PACKET, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, htons(ETH_P_ALL));
 	if (fd < 0) {
 		pw_log_error("socket() failed: %m");
 		return -errno;
@@ -163,7 +168,7 @@ static int raw_make_socket(struct server *server, uint16_t type, const uint8_t m
 	if (ioctl(fd, SIOCGIFINDEX, &req) < 0) {
 		res = -errno;
 		pw_log_error("SIOCGIFINDEX %s failed: %m", server->ifname);
-		goto error_close;
+		return res;
 	}
 	server->ifindex = req.ifr_ifindex;
 
@@ -172,7 +177,7 @@ static int raw_make_socket(struct server *server, uint16_t type, const uint8_t m
 	if (ioctl(fd, SIOCGIFHWADDR, &req) < 0) {
 		res = -errno;
 		pw_log_error("SIOCGIFHWADDR %s failed: %m", server->ifname);
-		goto error_close;
+		return res;
 	}
 	memcpy(server->mac_addr, req.ifr_hwaddr.sa_data, sizeof(server->mac_addr));
 
@@ -192,7 +197,7 @@ static int raw_make_socket(struct server *server, uint16_t type, const uint8_t m
 	if (bind(fd, (struct sockaddr *) &sll, sizeof(sll)) < 0) {
 		res = -errno;
 		pw_log_error("bind() failed: %m");
-		goto error_close;
+		return res;
 	}
 
 	spa_zero(mreq);
@@ -205,17 +210,13 @@ static int raw_make_socket(struct server *server, uint16_t type, const uint8_t m
 				&mreq, sizeof(mreq)) < 0) {
 		res = -errno;
 		pw_log_error("setsockopt(ADD_MEMBERSHIP) failed: %m");
-		goto error_close;
+		return res;
 	}
 
 	if ((res = load_filter(fd, type, mac, server->mac_addr)) < 0)
-		goto error_close;
+		return res;
 
-	return fd;
-
-error_close:
-	close(fd);
-	return res;
+	return spa_steal_fd(fd);
 }
 
 int avb_server_make_socket(struct server *server, uint16_t type, const uint8_t mac[6])
@@ -228,57 +229,249 @@ int avb_server_make_socket(struct server *server, uint16_t type, const uint8_t m
 static int raw_transport_setup(struct server *server)
 {
 	struct impl *impl = server->impl;
-	int fd, res;
+	int res;
 	static const uint8_t bmac[6] = AVB_BROADCAST_MAC;
 
-	fd = raw_make_socket(server, AVB_TSN_ETH, bmac);
+	spa_autoclose int fd = raw_make_socket(server, AVB_TSN_ETH, bmac);
 	if (fd < 0)
 		return fd;
 
 	pw_log_info("0x%"PRIx64" %d", server->entity_id, server->ifindex);
 
-	server->source = pw_loop_add_io(impl->loop, fd, SPA_IO_IN, true, on_socket_data, server);
+	server->source = pw_loop_add_io(impl->loop, spa_steal_fd(fd), SPA_IO_IN, true, on_socket_data, server);
 	if (server->source == NULL) {
 		res = -errno;
 		pw_log_error("server %p: can't create server source: %m", impl);
-		goto error_no_source;
+		return res;
 	}
 
 	if ((res = pw_timer_queue_add(impl->timer_queue, &server->timer,
 			NULL, DEFAULT_INTERVAL_MS * SPA_NSEC_PER_MSEC,
 			on_timer_event, server)) < 0) {
 		pw_log_error("server %p: can't create timer: %s", impl, spa_strerror(res));
-		goto error_no_timer;
+		pw_loop_destroy_source(impl->loop, server->source);
+		server->source = NULL;
+		return res;
 	}
 	return 0;
+}
 
-error_no_timer:
-	pw_loop_destroy_source(impl->loop, server->source);
-	server->source = NULL;
-error_no_source:
+/* milan-avb: hand-rolled netlink VLAN sub-iface creator.
+ *
+ * On I210-class NICs with rx-vlan-filter[fixed]=on the silicon drops
+ * VLAN-tagged frames whose VID is not registered. Registering happens
+ * implicitly when a VLAN sub-iface is added via RTM_NEWLINK. We create
+ * <parent>.<vid> on first use, never delete it (bounded leak: one
+ * sub-iface per SR class), and bind the listener stream socket to it.
+ *
+ * Fall back to PACKET_MR_PROMISC if any step fails (no CAP_NET_ADMIN,
+ * no 8021q module loaded, etc.).  */
+
+#define MILAN_NLALIGN(n) (((n) + 3U) & ~3U)
+
+static int milan_nl_send(int fd, uint16_t mt, uint16_t flags,
+		uint32_t seq, const void *payload, size_t plen)
+{
+	struct {
+		struct nlmsghdr nlh;
+		char body[2048];
+	} msg = { 0 };
+	size_t need = NLMSG_HDRLEN + plen;
+	if (need > sizeof(msg))
+		return -EMSGSIZE;
+	msg.nlh.nlmsg_len = need;
+	msg.nlh.nlmsg_type = mt;
+	msg.nlh.nlmsg_flags = flags;
+	msg.nlh.nlmsg_seq = seq;
+	msg.nlh.nlmsg_pid = 0;
+	if (plen)
+		memcpy(msg.body, payload, plen);
+	if (send(fd, &msg, need, 0) < 0)
+		return -errno;
+	return 0;
+}
+
+static int milan_nl_recv_ack(int fd, uint32_t seq)
+{
+	char buf[4096];
+	for (;;) {
+		ssize_t n = recv(fd, buf, sizeof(buf), 0);
+		size_t off = 0;
+		if (n < 0)
+			return -errno;
+		while (off + NLMSG_HDRLEN <= (size_t)n) {
+			struct nlmsghdr *h = (struct nlmsghdr *)(buf + off);
+			if (h->nlmsg_len < NLMSG_HDRLEN ||
+			    off + h->nlmsg_len > (size_t)n)
+				break;
+			if (h->nlmsg_type == NLMSG_ERROR && h->nlmsg_seq == seq) {
+				struct nlmsgerr *e = NLMSG_DATA(h);
+				return e->error;
+			}
+			off += NLMSG_ALIGN(h->nlmsg_len);
+		}
+	}
+}
+
+static size_t milan_nl_attr(char *p, uint16_t type, const void *val, uint16_t vlen)
+{
+	struct rtattr *r = (struct rtattr *)p;
+	size_t total;
+	r->rta_len = RTA_LENGTH(vlen);
+	r->rta_type = type;
+	memcpy(RTA_DATA(r), val, vlen);
+	total = RTA_ALIGN(r->rta_len);
+	if (total > (size_t)r->rta_len)
+		memset(p + r->rta_len, 0, total - r->rta_len);
+	return total;
+}
+
+/* Returns ifindex (>0) or -errno. */
+static int milan_get_ifindex(const char *name)
+{
+	int fd = socket(AF_INET, SOCK_DGRAM | SOCK_CLOEXEC, 0);
+	struct ifreq req;
+	int res, saved;
+	if (fd < 0)
+		return -errno;
+	spa_zero(req);
+	snprintf(req.ifr_name, sizeof(req.ifr_name), "%s", name);
+	res = ioctl(fd, SIOCGIFINDEX, &req);
+	saved = -errno;
 	close(fd);
-	return res;
+	return res < 0 ? saved : req.ifr_ifindex;
+}
+
+/* Ensure <parent>.<vid> exists, is UP, and is a VLAN sub-iface of <parent>.
+ * Writes the sub-iface name to out and returns 0 on success. */
+static int milan_ensure_vlan_iface(const char *parent_ifname, uint16_t vid,
+		char *out, size_t out_size)
+{
+	int rc, existing, parent_idx, nlfd, err, new_idx;
+	struct sockaddr_nl sa = { .nl_family = AF_NETLINK };
+	char payload[256];
+	char *p = payload;
+	struct ifinfomsg ifi = { 0 };
+	uint32_t pidx;
+	char nested[64];
+	char *np = nested;
+	const char kind[] = "vlan";
+	char data[16];
+	char *dp = data;
+	uint16_t vidv = vid;
+	uint32_t seq = 1;
+	struct ifinfomsg up_ifi = { 0 };
+
+	if (vid == 0 || vid >= 4095)
+		return -EINVAL;
+	rc = snprintf(out, out_size, "%s.%u", parent_ifname, (unsigned)vid);
+	if (rc < 0 || (size_t)rc >= out_size)
+		return -ENAMETOOLONG;
+
+	/* If the sub-iface already exists, assume it is what we want and reuse. */
+	existing = milan_get_ifindex(out);
+	if (existing > 0)
+		return 0;
+
+	parent_idx = milan_get_ifindex(parent_ifname);
+	if (parent_idx <= 0)
+		return parent_idx ? parent_idx : -ENODEV;
+
+	nlfd = socket(AF_NETLINK, SOCK_RAW | SOCK_CLOEXEC, NETLINK_ROUTE);
+	if (nlfd < 0)
+		return -errno;
+	if (bind(nlfd, (struct sockaddr *)&sa, sizeof(sa)) < 0) {
+		int e = -errno; close(nlfd); return e;
+	}
+
+	/* RTM_NEWLINK: ifinfomsg + IFLA_IFNAME + IFLA_LINK + IFLA_LINKINFO{KIND=vlan, DATA{VLAN_ID}} */
+	ifi.ifi_family = AF_UNSPEC;
+	ifi.ifi_change = 0xFFFFFFFFu;
+	memcpy(p, &ifi, sizeof(ifi)); p += sizeof(ifi);
+	p += milan_nl_attr(p, IFLA_IFNAME, out, (uint16_t)(strlen(out) + 1));
+	pidx = (uint32_t)parent_idx;
+	p += milan_nl_attr(p, IFLA_LINK, &pidx, sizeof(pidx));
+
+	/* LINKINFO is nested: KIND=vlan, DATA={VLAN_ID=vid} */
+	np += milan_nl_attr(np, IFLA_INFO_KIND, kind, sizeof(kind));
+	dp += milan_nl_attr(dp, IFLA_VLAN_ID, &vidv, sizeof(vidv));
+	np += milan_nl_attr(np, IFLA_INFO_DATA, data, (uint16_t)(dp - data));
+	p += milan_nl_attr(p, IFLA_LINKINFO, nested, (uint16_t)(np - nested));
+
+	err = milan_nl_send(nlfd, RTM_NEWLINK,
+			NLM_F_REQUEST | NLM_F_CREATE | NLM_F_EXCL | NLM_F_ACK,
+			seq, payload, (size_t)(p - payload));
+	if (err == 0)
+		err = milan_nl_recv_ack(nlfd, seq);
+	if (err != 0 && err != -EEXIST) {
+		close(nlfd);
+		return err;
+	}
+
+	/* Bring it UP. */
+	new_idx = milan_get_ifindex(out);
+	if (new_idx <= 0) {
+		close(nlfd);
+		return new_idx ? new_idx : -ENODEV;
+	}
+	up_ifi.ifi_family = AF_UNSPEC;
+	up_ifi.ifi_index = new_idx;
+	up_ifi.ifi_flags = IFF_UP;
+	up_ifi.ifi_change = IFF_UP;
+	err = milan_nl_send(nlfd, RTM_NEWLINK, NLM_F_REQUEST | NLM_F_ACK,
+			++seq, &up_ifi, sizeof(up_ifi));
+	if (err == 0)
+		err = milan_nl_recv_ack(nlfd, seq);
+	close(nlfd);
+	if (err != 0)
+		return err;
+
+	return 0;
 }
 
 static int raw_stream_setup_socket(struct server *server, struct stream *stream)
 {
-	int fd, res;
+	int res;
 	char buf[128];
 	struct ifreq req;
+	const char *bind_ifname = server->ifname;
+	char vlan_ifname[IFNAMSIZ];
+	bool used_vlan_subiface = false;
 
-	fd = socket(AF_PACKET, SOCK_RAW | SOCK_NONBLOCK, htons(ETH_P_ALL));
+	spa_autoclose int fd = socket(AF_PACKET, SOCK_RAW | SOCK_CLOEXEC | SOCK_NONBLOCK, htons(ETH_P_ALL));
 	if (fd < 0) {
 		pw_log_error("socket() failed: %m");
 		return -errno;
 	}
 
+	/* For listener RX: route stream via a VLAN sub-iface so the NIC's
+	 * hardware filter accepts VID-tagged AAF without promisc on parent. */
+	/* Listener-only: route stream RX via a VLAN sub-iface so the NIC accepts
+	 * VID-tagged AAF without promisc on parent. OUTPUT direction stays on
+	 * the parent because setup_pdu_milan_v12() already inserts a manual
+	 * 802.1Q tag in the PDU header — the kernel would add a second tag
+	 * (QinQ) if we bound the talker socket to enp6s0.<vid>. */
+	if (stream->direction == SPA_DIRECTION_INPUT && stream->vlan_id > 0) {
+		int e = milan_ensure_vlan_iface(server->ifname,
+				(uint16_t)stream->vlan_id,
+				vlan_ifname, sizeof(vlan_ifname));
+		if (e == 0) {
+			bind_ifname = vlan_ifname;
+			used_vlan_subiface = true;
+			pw_log_info("milan-avb: listener RX via VLAN sub-iface %s (vid %d)",
+					vlan_ifname, stream->vlan_id);
+		} else {
+			pw_log_warn("milan-avb: VLAN sub-iface setup failed (%d), "
+					"falling back to PACKET_MR_PROMISC on parent", -e);
+		}
+	}
+
 	spa_zero(req);
-	snprintf(req.ifr_name, sizeof(req.ifr_name), "%s", server->ifname);
+	snprintf(req.ifr_name, sizeof(req.ifr_name), "%s", bind_ifname);
 	res = ioctl(fd, SIOCGIFINDEX, &req);
 	if (res < 0) {
 		pw_log_error("SIOCGIFINDEX %s failed: %m", server->ifname);
-		res = -errno;
-		goto error_close;
+		return -errno;
 	}
 
 	spa_zero(stream->sock_addr);
@@ -287,24 +480,14 @@ static int raw_stream_setup_socket(struct server *server, struct stream *stream)
 	stream->sock_addr.sll_ifindex = req.ifr_ifindex;
 
 	if (stream->direction == SPA_DIRECTION_OUTPUT) {
-		struct sock_txtime txtime_cfg;
-
+		/* CBS/Qav-exclusive: set only the traffic-class priority so the egress
+		 * CBS qdisc shapes this stream. SO_TXTIME (launch-time/ETF) is NOT set --
+		 * CBS and SO_TXTIME cannot coexist on the same queue. */
 		res = setsockopt(fd, SOL_SOCKET, SO_PRIORITY, &stream->prio,
 				sizeof(stream->prio));
 		if (res < 0) {
 			pw_log_error("setsockopt(SO_PRIORITY %d) failed: %m", stream->prio);
-			res = -errno;
-			goto error_close;
-		}
-
-		txtime_cfg.clockid = CLOCK_TAI;
-		txtime_cfg.flags = 0;
-		res = setsockopt(fd, SOL_SOCKET, SO_TXTIME, &txtime_cfg,
-				sizeof(txtime_cfg));
-		if (res < 0) {
-			pw_log_error("setsockopt(SO_TXTIME) failed: %m");
-			res = -errno;
-			goto error_close;
+			return -errno;
 		}
 	} else {
 		struct packet_mreq mreq;
@@ -312,8 +495,7 @@ static int raw_stream_setup_socket(struct server *server, struct stream *stream)
 		res = bind(fd, (struct sockaddr *) &stream->sock_addr, sizeof(stream->sock_addr));
 		if (res < 0) {
 			pw_log_error("bind() failed: %m");
-			res = -errno;
-			goto error_close;
+			return -errno;
 		}
 
 		spa_zero(mreq);
@@ -328,15 +510,22 @@ static int raw_stream_setup_socket(struct server *server, struct stream *stream)
 
 		if (res < 0) {
 			pw_log_error("setsockopt(ADD_MEMBERSHIP) failed: %m");
-			res = -errno;
-			goto error_close;
+			return -errno;
+		}
+
+		/* Fallback: lift promisc only when the VLAN sub-iface path didn't
+		 * take. With the sub-iface, the NIC accepts VID 2 natively. */
+		if (!used_vlan_subiface) {
+			spa_zero(mreq);
+			mreq.mr_ifindex = req.ifr_ifindex;
+			mreq.mr_type = PACKET_MR_PROMISC;
+			res = setsockopt(fd, SOL_PACKET, PACKET_ADD_MEMBERSHIP,
+					&mreq, sizeof(struct packet_mreq));
+			if (res < 0)
+				pw_log_warn("setsockopt(PACKET_MR_PROMISC) fallback failed: %m");
 		}
 	}
-	return fd;
-
-error_close:
-	close(fd);
-	return res;
+	return spa_steal_fd(fd);
 }
 
 static ssize_t raw_stream_send(struct server *server, struct stream *stream,
@@ -405,6 +594,9 @@ struct server *avdecc_server_new(struct impl *impl, struct spa_dict *props)
 	if ((res = server->transport->setup(server)) < 0)
 		goto error_free;
 
+	server->gptp = avb_gptp_new(server);
+	if (server->gptp == NULL)
+		goto error_free;
 
 	server->mrp = avb_mrp_new(server);
 	if (server->mrp == NULL)

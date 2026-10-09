@@ -211,6 +211,7 @@ static int impl_node_set_param(void *object, uint32_t id, uint32_t flags,
 			       const struct spa_pod *param)
 {
 	struct impl *this = object;
+	int res;
 
 	spa_return_val_if_fail(this != NULL, -EINVAL);
 
@@ -223,16 +224,17 @@ static int impl_node_set_param(void *object, uint32_t id, uint32_t flags,
 			reset_props(p);
 			return 0;
 		}
-		spa_pod_parse_object(param,
+		res = spa_pod_parse_object(param,
 			SPA_TYPE_OBJECT_Props, NULL,
 			SPA_PROP_patternType, SPA_POD_OPT_Int(&p->pattern));
 
 		break;
 	}
 	default:
-		return -ENOENT;
+		res = -ENOENT;
+		break;
 	}
-	return 0;
+	return res;
 }
 
 #include "draw.c"
@@ -346,6 +348,9 @@ static int impl_node_send_command(void *object, const struct spa_command *comman
 			return 0;
 		this->started = false;
 		set_timer(this, false);
+		break;
+	case SPA_NODE_COMMAND_ParamBegin:
+	case SPA_NODE_COMMAND_ParamEnd:
 		break;
 	default:
 		return -ENOTSUP;

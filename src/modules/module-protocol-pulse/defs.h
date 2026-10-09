@@ -39,6 +39,10 @@
 
 #define SCACHE_ENTRY_SIZE_MAX	(1024*1024*16)
 
+#define MAX_CLIENTS		64u
+#define MAX_OPERATIONS		64u
+#define MAX_PENDING_SAMPLES	64u
+
 #define MODULE_INDEX_MASK	0xfffffffu
 #define MODULE_FLAG		(1u << 29)
 
@@ -103,9 +107,7 @@ static inline int res_to_err(int res)
 	case -ENOKEY: return ERR_AUTHKEY;
 #endif
 	case -ECONNRESET: case -EPIPE: return ERR_CONNECTIONTERMINATED;
-#ifdef EBADFD
-	case -EBADFD: return ERR_BADSTATE;
-#endif
+	case -EBADF: return ERR_BADSTATE;
 #ifdef ENODATA
 	case -ENODATA: return ERR_NODATA;
 #endif
@@ -140,9 +142,7 @@ static inline int err_to_res(int err)
 	case ERR_KILLED: return -EFAULT;
 	case ERR_INVALIDSERVER: return -EINVAL;
 	case ERR_MODINITFAILED: return -EIO;
-#ifdef EBADFD
-	case ERR_BADSTATE: return -EBADFD;
-#endif
+	case ERR_BADSTATE: return -EBADF;
 	case ERR_NODATA: return -ENODATA;
 	case ERR_VERSION: return -EPROTO;
 	case ERR_TOOLARGE: return -E2BIG;
@@ -330,5 +330,6 @@ static inline uint32_t port_type_value(const char *port_type)
 #define METADATA_TARGET_OBJECT          "target.object"
 #define METADATA_FEATURES_AUDIO_MONO    "node.features.audio.mono"
 #define METADATA_BLUETOOTH_HEADSET_AUTOSWITCH "bluetooth.autoswitch-to-headset-profile"
+#define METADATA_BLUETOOTH_PROFILE_PREFERENCE "bluetooth.profile-preference"
 
 #endif /* PULSE_SERVER_DEFS_H */

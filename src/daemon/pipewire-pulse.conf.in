@@ -15,13 +15,27 @@ context.properties = {
     #mem.mlock-all   = false
     #log.level       = 2
     #rlimit.nofile   = -1
+    #library.use-fallback = true
 
     #default.clock.quantum-limit = 8192
 }
 
 context.spa-libs = {
-    audio.convert.* = audioconvert/libspa-audioconvert
     support.*       = support/libspa-support
+    audio.convert.* = audioconvert/libspa-audioconvert
+    audio.adapt     = audioconvert/libspa-audioconvert
+    audio.mixer     = audiomixer/libspa-audiomixer
+    audio.aec       = aec/libspa-aec-webrtc
+    # because the pulse server allows dynamic loading of streams and modules
+    # inside the server, we must be careful with the filter-graph.
+    #filter.graph.plugin.ffmpeg  = filter-graph/libspa-filter-graph-plugin-ffmpeg
+    #filter.graph.plugin.onnx    = filter-graph/libspa-filter-graph-plugin-onnx
+    #filter.graph.plugin.ebur128 = filter-graph/libspa-filter-graph-plugin-ebur128
+    #filter.graph.plugin.sofa    = filter-graph/libspa-filter-graph-plugin-sofa
+    filter.graph.plugin.ladspa  = filter-graph/libspa-filter-graph-plugin-ladspa
+    #filter.graph.plugin.lv2     = filter-graph/libspa-filter-graph-plugin-lv2
+    filter.graph.plugin.builtin = filter-graph/libspa-filter-graph-plugin-builtin
+    filter.graph    = filter-graph/libspa-filter-graph
 }
 
 context.modules = [
@@ -31,6 +45,9 @@ context.modules = [
             #rt.prio      = @rtprio_client@
             #rt.time.soft = -1
             #rt.time.hard = -1
+            #rlimits.enabled = true
+            rtportal.enabled = false
+            #rtkit.enabled = true
             #uclamp.min = 0
             #uclamp.max = 1024
         }
@@ -92,7 +109,9 @@ stream.properties = {
     #channelmix.surround-level = 0.707106781
     #channelmix.lfe-level      = 0.5
     #channelmix.hilbert-taps = 0
-    #dither.noise = 0
+    #dither.noise            = 0
+    #fade.gap                = 0
+    #fade.duration           = 0.020
 }
 
 pulse.properties = {
@@ -119,8 +138,11 @@ pulse.properties = {
     #pulse.default.tlength  = 96000/48000   # 2 seconds
     #pulse.min.quantum      = 256/48000     # 5.3ms
     #pulse.idle.timeout     = 0             # don't pause after underruns
+    #pulse.max-streams      = 64            # max streams per client
+    #pulse.max-sample-cache = 67108864      # max total sample cache size (64MB)
     #pulse.default.format   = F32
     #pulse.default.position = [ FL FR ]
+    #pulse.fade.gap         = 0             # detect silence of N samples and fade-in/out
 }
 
 pulse.properties.rules = [
@@ -188,4 +210,13 @@ pulse.rules = [
     #    matches = [ { application.process.binary = "Discord" } ]
     #    actions = { quirks = [ block-source-volume ] }
     #}
+
+    {
+        matches = [ { application.process.binary = "chrome" } ]
+        actions = {
+            update-props = {
+                pulse.fade.gap     = 8
+            }
+        }
+    }
 ]

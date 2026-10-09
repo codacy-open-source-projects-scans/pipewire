@@ -55,6 +55,7 @@ struct stream {
 	struct spa_io_position *position;
 	struct spa_ringbuffer ring;
 	void *buffer;
+	uint32_t bufsize;
 
 	int64_t read_index;
 	int64_t write_index;
@@ -63,7 +64,11 @@ struct stream {
 	uint64_t ticks_base;
 	uint64_t timestamp;
 	uint64_t idle_time;
-	int64_t delay;
+	struct {
+		uint64_t buffered;
+		int64_t delay;
+		struct spa_fraction rate;
+	} delay;
 
 	uint32_t last_quantum;
 	int64_t requested;
@@ -101,6 +106,7 @@ struct stream {
 	unsigned int is_paused:1;
 	unsigned int fail_on_suspend:1;
 	unsigned int is_suspended:1;
+	unsigned int dont_inhibit_auto_suspend:1;
 };
 
 struct stream *stream_new(struct client *client, enum stream_type type, uint32_t create_tag,

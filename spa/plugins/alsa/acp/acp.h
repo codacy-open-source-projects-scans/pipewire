@@ -154,16 +154,32 @@ const char *acp_available_str(enum acp_available status);
 		 * as receivers are powered on or off.
 		 */
 #define ACP_KEY_AUDIO_CHANNELS_DETECTED "audio.channels.detected"
-		/**< The number of channels detected detected via EDID-like data read from a device
+		/**< The number of channels detected via EDID-like data read from a device
 		 * connected via HDMI/DisplayPort. This only serves as a hint, as the auto-detected
 		 * values may be incorrect and/or might change, e.g. when external devices such
 		 * as receivers are powered on or off.
 		 */
 #define ACP_KEY_AUDIO_POSITION_DETECTED "audio.position.detected"
-		/**< The channel positions detected detected via EDID-like data read from a device
+		/**< The channel positions detected via EDID-like data read from a device
 		 * connected via HDMI/DisplayPort. This only serves as a hint, as the auto-detected
 		 * values may be incorrect and/or might change, e.g. when external devices such
 		 * as receivers are powered on or off.
+		 */
+#define ACP_KEY_HDMI_PRODUCT_NAME "hdmi.product.name"
+		/**< The product name of the device connected via HDMI/DisplayPort, e.g. a monitor,
+		 * TV or receiver, read via EDID-like data. Set on nodes with a single port
+		 * since then it is not ambiguous.
+		 */
+#define ACP_KEY_HDMI_PRODUCT_ID "hdmi.product.id"
+		/**< The EDID manufacturer and product ID of a device connected via HDMI/DisplayPort.
+		 * Useful for matching rules, as it is stable for a given device,
+		 * but not unique as all units of the same model share it.
+		 * Three letters for manufacturer, up to 5 decimals for product, like this: "DEL:16618".
+		 */
+#define ACP_KEY_HDMI_PORT_ID "hdmi.port-id"
+		/**< The graphics driver's identifier for the physical HDMI/DisplayPort
+		 * connector read via EDID-like data. These are stable across reboots,
+		 * so can be good targets for matching rules (and consistent default restore).
 		 */
 
 struct acp_device;
@@ -303,6 +319,8 @@ int acp_device_get_soft_volume(struct acp_device *dev, float *volume, uint32_t n
 int acp_device_get_volume(struct acp_device *dev, float *volume, uint32_t n_volume);
 int acp_device_set_mute(struct acp_device *dev, bool mute);
 int acp_device_get_mute(struct acp_device *dev, bool *mute);
+int acp_device_get_volume_limit(struct acp_device *dev, float *min, float *max);
+int acp_device_set_volume_limit(struct acp_device *dev, float min, float max);
 
 typedef void (*acp_log_func) (void *data,
 		int level, const char *file, int line, const char *func,

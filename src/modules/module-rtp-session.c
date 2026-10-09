@@ -140,7 +140,7 @@ PW_LOG_TOPIC(mod_topic, "mod." NAME);
 		"( sess.min-ptime=<minimum packet time in milliseconds, default:2> ) "		\
 		"( sess.max-ptime=<maximum packet time in milliseconds, default:20> ) "		\
 		"( sess.media=<string, the media type audio|midi|opus, default midi> ) "	\
-		"( audio.format=<format, default:"DEFAULT_FORMAT"> ) "				\
+		"( audio.format=<format, default:"DEFAULT_RAW_AUDIO_FORMAT"> ) "		\
 		"( audio.rate=<sample rate, default:"SPA_STRINGIFY(DEFAULT_RATE)"> ) "		\
 		"( audio.channels=<number of channels, default:"SPA_STRINGIFY(DEFAULT_CHANNELS)"> ) "\
 		"( audio.position=<channel map, default:"DEFAULT_POSITION"> ) "			\
@@ -466,20 +466,24 @@ static void send_close_connection(void *data, int *result)
 		session_stop(sess);
 }
 
-static void send_send_packet(void *data, struct iovec *iov, size_t iovlen)
+static void send_send_packet(void *data, struct rtp_packet *packet)
 {
 	struct session *sess = data;
 	struct impl *impl = sess->impl;
 	struct msghdr msg;
+	struct iovec iovec[1];
 
 	if (!sess->data_ready || !sess->sending)
 		return;
 
+	iovec[0].iov_base = packet->data;
+	iovec[0].iov_len = packet->size;
+
 	spa_zero(msg);
 	msg.msg_name = &sess->data_addr;
 	msg.msg_namelen = sess->data_len;
-	msg.msg_iov = iov;
-	msg.msg_iovlen = iovlen;
+	msg.msg_iov = iovec;
+	msg.msg_iovlen = 1;
 	msg.msg_control = NULL;
 	msg.msg_controllen = 0;
 	msg.msg_flags = 0;
@@ -622,6 +626,12 @@ static struct session *make_session(struct impl *impl, struct service_info *info
 	str = pw_properties_get(props, "sess.name");
 	sess->name = str ? strdup(str) : strdup("RTP Session");
 
+	if (sess->info.name == NULL || sess->info.type == NULL ||
+	    sess->info.domain == NULL || sess->name == NULL) {
+		free_session(sess);
+		goto error;
+	}
+
 	if (impl->ts_refclk != NULL)
 		pw_properties_setf(props, "rtp.sender-ts-offset", "%u", impl->ts_offset);
 	pw_properties_setf(props, "rtp.sender-ssrc", "%u", sess->ssrc);
@@ -720,9 +730,6 @@ static void parse_apple_midi_cmd_in(struct impl *impl, bool ctrl, uint8_t *buffe
 	uint32_t initiator, ssrc;
 	char addr[128];
 	uint16_t port = 0;
-
-	if ((size_t)len < sizeof(*hdr))
-		return;
 
 	initiator = ntohl(hdr->initiator);
 	ssrc = ntohl(hdr->ssrc);
@@ -862,8 +869,13 @@ static void parse_apple_midi_cmd_ck(struct impl *impl, bool ctrl, uint8_t *buffe
 	struct rtp_apple_midi_ck reply;
 	struct session *sess;
 	uint64_t ts, t1, t2, t3;
-	uint32_t ssrc = ntohl(hdr->ssrc);
+	uint32_t ssrc;
 	struct timespec now;
+
+	if ((size_t)len < sizeof(*hdr))
+		return;
+
+	ssrc = ntohl(hdr->ssrc);
 
 	sess = find_session_by_ssrc(impl, ssrc);
 	if (sess == NULL) {
@@ -1063,8 +1075,20 @@ on_data_io(void *data, int fd, uint32_t mask)
 
 			if (sess->data_ready && sess->receiving) {
 				uint64_t current_time = rtp_stream_get_nsec(sess->recv);
-				rtp_stream_receive_packet(sess->recv, buffer, len,
-							current_time);
+				struct rtp_packet *p;
+
+				if ((p = rtp_stream_get_free_packet(sess->recv)) == NULL)
+					goto out_of_packets;
+
+				if (len > (ssize_t)p->maxsize) {
+					errno = ENOSPC;
+					goto receive_error;
+				}
+
+				memcpy(p->data, buffer, len);
+				p->size = len;
+
+				rtp_stream_receive_packet(sess->recv, p, current_time);
 			}
 		}
 	}
@@ -1079,6 +1103,9 @@ short_packet:
 	return;
 unknown_ssrc:
 	pw_log_debug("unknown SSRC %08x", ssrc);
+	return;
+out_of_packets:
+	pw_log_debug("out of packets");
 	return;
 }
 
@@ -1191,10 +1218,8 @@ static int setup_apple_session(struct impl *impl)
 	impl->ctrl_source = pw_loop_add_io(impl->loop, fd,
 					SPA_IO_IN, true, on_ctrl_io, impl);
 
-	if (impl->ctrl_source == NULL) {
-		close(fd);
+	if (impl->ctrl_source == NULL)
 		return -errno;
-	}
 
 	if ((fd = make_socket(&impl->data_addr, impl->data_len,
 				impl->mcast_loop, impl->ttl, impl->ifname)) < 0)
@@ -1202,10 +1227,8 @@ static int setup_apple_session(struct impl *impl)
 
 	impl->data_source = pw_loop_add_io(impl->data_loop, fd,
 				SPA_IO_IN, true, on_data_io, impl);
-	if (impl->data_source == NULL) {
-		close(fd);
+	if (impl->data_source == NULL)
 		return -errno;
-	}
 	return 0;
 }
 
@@ -1417,9 +1440,11 @@ static void on_zeroconf_added(void *data, const void *user, const struct spa_dic
 
 	if ((res = pw_net_parse_address(address, port, &sess->ctrl_addr, &sess->ctrl_len)) < 0) {
 		pw_log_error("invalid address %s: %s", address, spa_strerror(res));
+		goto error;
 	}
 	if ((res = pw_net_parse_address(address, port+1, &sess->data_addr, &sess->data_len)) < 0) {
 		pw_log_error("invalid address %s: %s", address, spa_strerror(res));
+		goto error;
 	}
 	return;
 error:
@@ -1618,7 +1643,7 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 
 	if (spa_streq(str, "audio")) {
 		struct spa_dict_item items[] = {
-			{ "audio.format", DEFAULT_FORMAT },
+			{ "audio.format", DEFAULT_RAW_AUDIO_FORMAT },
 			{ "audio.rate", SPA_STRINGIFY(DEFAULT_RATE) },
 			{ "audio.channels", SPA_STRINGIFY(DEFAULT_CHANNELS) },
 			{ "audio.position", DEFAULT_POSITION } };
@@ -1635,7 +1660,8 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	str = pw_properties_get(props, "local.ifname");
 	impl->ifname = str ? strdup(str) : NULL;
 
-	port = pw_properties_get_uint32(props, "control.port", DEFAULT_CONTROL_PORT);
+	str = pw_properties_get(props, "control.port");
+	port = pw_net_parse_port(str, DEFAULT_CONTROL_PORT);
 	if ((str = pw_properties_get(props, "control.ip")) == NULL)
 		str = DEFAULT_CONTROL_IP;
 

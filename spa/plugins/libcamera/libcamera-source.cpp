@@ -8,6 +8,7 @@
 #include <cstddef>
 #include <limits>
 #include <optional>
+#include <span>
 #include <type_traits>
 #include <utility>
 
@@ -42,8 +43,7 @@
 #include <libcamera/framebuffer.h>
 #include <libcamera/framebuffer_allocator.h>
 
-#include "libcamera.h"
-#include "libcamera-manager.hpp"
+#include "libcamera.hpp"
 
 using namespace libcamera;
 
@@ -303,7 +303,7 @@ void freeBuffers(struct impl *impl, struct port *port)
 }
 
 [[nodiscard]]
-std::size_t count_unique_fds(libcamera::Span<const libcamera::FrameBuffer::Plane> planes)
+std::size_t count_unique_fds(std::span<const libcamera::FrameBuffer::Plane> planes)
 {
 	std::size_t c = 0;
 	int fd = -1;
@@ -1219,8 +1219,8 @@ spa_libcamera_alloc_buffers(struct impl *impl, struct port *port,
 	for (uint32_t i = 0; i < n_buffers; i++) {
 		struct buffer *b;
 
-		if (buffers[i]->n_datas < 1) {
-			spa_log_error(impl->log, "invalid buffer data");
+		if (buffers[i]->n_datas != port->buffers_blocks) {
+			spa_log_error(impl->log, "invalid number of data planes");
 			return -EINVAL;
 		}
 
@@ -1243,6 +1243,8 @@ spa_libcamera_alloc_buffers(struct impl *impl, struct port *port,
 		const auto& planes = bufs[i]->planes();
 		spa_data *d = buffers[i]->datas;
 
+		spa_assert(buffers[i]->n_datas <= planes.size());
+
 		for(uint32_t j = 0; j < buffers[i]->n_datas; ++j) {
 			const auto memtype = choose_memtype(d[j].type);
 			if (memtype == SPA_DATA_Invalid) {
@@ -1258,30 +1260,22 @@ spa_libcamera_alloc_buffers(struct impl *impl, struct port *port,
 			d[j].chunk->stride = port->streamConfig.stride;
 			d[j].chunk->flags = 0;
 			/* Update parameters according to the plane information */
-			unsigned int numPlanes = planes.size();
-			if (buffers[i]->n_datas < numPlanes) {
+			if (buffers[i]->n_datas < planes.size()) {
 				if (j < buffers[i]->n_datas - 1) {
 					d[j].maxsize = planes[j].length;
 					d[j].chunk->offset = planes[j].offset;
 					d[j].chunk->size = planes[j].length;
 				} else {
 					d[j].chunk->offset = planes[j].offset;
-					for (uint8_t k = j; k < numPlanes; k++) {
+					for (uint8_t k = j; k < planes.size(); k++) {
 						d[j].maxsize += planes[k].length;
 						d[j].chunk->size += planes[k].length;
 					}
 				}
-			} else if (buffers[i]->n_datas == numPlanes) {
+			} else {
 				d[j].maxsize = planes[j].length;
 				d[j].chunk->offset = planes[j].offset;
 				d[j].chunk->size = planes[j].length;
-			} else {
-				spa_log_warn(impl->log, "buffer index: i: %d, data member "
-					"numbers: %d is greater than plane number: %d",
-					i, buffers[i]->n_datas, numPlanes);
-				d[j].maxsize = port->streamConfig.frameSize;
-				d[j].chunk->offset = 0;
-				d[j].chunk->size = port->streamConfig.frameSize;
 			}
 
 			switch (memtype) {
@@ -1329,10 +1323,8 @@ int spa_libcamera_stream_on(struct impl *impl)
 	struct port *port = &impl->out_ports[0];
 	int res;
 
-	if (!port->current_format) {
-		spa_log_error(impl->log, "Exiting %s with -EIO", __FUNCTION__);
+	if (!port->current_format || port->n_buffers == 0)
 		return -EIO;
-	}
 
 	if (impl->active)
 		return 0;
@@ -1524,6 +1516,9 @@ int impl_node_set_param(void *object,
 		libcamera::ControlList controls(impl->camera->controls());
 		int res;
 
+		if (!spa_pod_is_object_type(param, SPA_TYPE_OBJECT_Props))
+			return -EINVAL;
+
 		SPA_POD_OBJECT_FOREACH(obj, prop) {
 			switch (prop->key) {
 			default:
@@ -1578,22 +1573,16 @@ int impl_node_send_command(void *object, const struct spa_command *command)
 
 	switch (SPA_NODE_COMMAND_ID(command)) {
 	case SPA_NODE_COMMAND_Start:
-	{
-		struct port *port = GET_OUT_PORT(impl, 0);
-
-		if (!port->current_format)
-			return -EIO;
-		if (port->n_buffers == 0)
-			return -EIO;
-
 		if ((res = spa_libcamera_stream_on(impl)) < 0)
 			return res;
 		break;
-	}
 	case SPA_NODE_COMMAND_Pause:
 	case SPA_NODE_COMMAND_Suspend:
 		if ((res = spa_libcamera_stream_off(impl)) < 0)
 			return res;
+		break;
+	case SPA_NODE_COMMAND_ParamBegin:
+	case SPA_NODE_COMMAND_ParamEnd:
 		break;
 	default:
 		return -ENOTSUP;
@@ -1609,6 +1598,8 @@ void emit_node_info(struct impl *impl, bool full)
 		{ SPA_KEY_MEDIA_CLASS, "Video/Source" },
 		{ SPA_KEY_MEDIA_ROLE, "Camera" },
 		{ SPA_KEY_NODE_DRIVER, "true" },
+		{ KEY_VERSION_LIBRARY, libcamera_library_version() },
+		{ KEY_VERSION_HEADER, libcamera_header_version() },
 	};
 	uint64_t old = full ? impl->info.change_mask : 0;
 	if (full)
@@ -1751,7 +1742,7 @@ next:
 
 		param = (struct spa_pod*)spa_pod_builder_add_object(&b,
 			SPA_TYPE_OBJECT_ParamBuffers, id,
-			SPA_PARAM_BUFFERS_buffers, SPA_POD_CHOICE_RANGE_Int(n_buffers, n_buffers, n_buffers),
+			SPA_PARAM_BUFFERS_buffers, SPA_POD_Int(n_buffers),
 			SPA_PARAM_BUFFERS_blocks,  SPA_POD_Int(port->buffers_blocks),
 			SPA_PARAM_BUFFERS_size,    SPA_POD_Int(port->streamConfig.frameSize),
 			SPA_PARAM_BUFFERS_stride,  SPA_POD_Int(port->streamConfig.stride));

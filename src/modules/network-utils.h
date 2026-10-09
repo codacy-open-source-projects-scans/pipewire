@@ -14,6 +14,7 @@
 #include <netinet/in.h>
 
 #include <spa/utils/string.h>
+#include <spa/utils/json-core.h>
 
 #ifdef __FreeBSD__
 #define ifr_ifindex ifr_index
@@ -52,9 +53,19 @@ static inline int pw_net_parse_address(const char *address, uint16_t port,
 static inline uint16_t pw_net_parse_port(const char *str, uint16_t def)
 {
 	uint32_t val;
-	if (spa_atou32(str, &val, 0) && val <= 65535u)
+	if (str != NULL && spa_atou32(str, &val, 0) && val <= UINT16_MAX)
 		return val;
 	return def;
+}
+
+static inline int pw_net_parse_port_json(const char *str, int len, uint16_t *port)
+{
+	int value;
+	if (spa_json_parse_int(str, len, &value) <= 0 ||
+	    value <= 0 || value > UINT16_MAX)
+		return -EINVAL;
+	*port = value;
+	return 0;
 }
 
 static inline int pw_net_parse_address_port(const char *address,
@@ -152,13 +163,13 @@ static inline int pw_net_get_ip(const struct sockaddr_storage *sa, char *ip, siz
 
 	if (sa->ss_family == AF_INET) {
 		struct sockaddr_in *in = (struct sockaddr_in*)sa;
-		if (inet_ntop(sa->ss_family, &in->sin_addr, ip, len) == NULL)
+		if (ip && inet_ntop(sa->ss_family, &in->sin_addr, ip, len) == NULL)
 			return -errno;
 		if (port)
 			*port = ntohs(in->sin_port);
 	} else if (sa->ss_family == AF_INET6) {
 		struct sockaddr_in6 *in = (struct sockaddr_in6*)sa;
-		if (inet_ntop(sa->ss_family, &in->sin6_addr, ip, len) == NULL)
+		if (ip && inet_ntop(sa->ss_family, &in->sin6_addr, ip, len) == NULL)
 			return -errno;
 		if (port)
 			*port = ntohs(in->sin6_port);
@@ -191,7 +202,20 @@ static inline bool pw_net_addr_is_any(struct sockaddr_storage *addr)
 		return sa->sin_addr.s_addr == INADDR_ANY;
 	} else if (addr->ss_family == AF_INET6) {
 		struct sockaddr_in6 *sa = (struct sockaddr_in6*)addr;
-		return memcmp(&sa->sin6_addr, &in6addr_any, sizeof(sa->sin6_addr));
+		return memcmp(&sa->sin6_addr, &in6addr_any, sizeof(sa->sin6_addr)) == 0;
+	}
+	return false;
+}
+
+static inline bool pw_net_is_multicast(struct sockaddr_storage *addr)
+{
+	if (addr->ss_family == AF_INET) {
+		static const uint32_t ipv4_mcast_mask = 0xe0000000;
+		struct sockaddr_in *sa4 = (struct sockaddr_in*)addr;
+		return (ntohl(sa4->sin_addr.s_addr) & ipv4_mcast_mask) == ipv4_mcast_mask;
+	} else if (addr->ss_family == AF_INET6) {
+		struct sockaddr_in6 *sa6 = (struct sockaddr_in6*)addr;
+		return sa6->sin6_addr.s6_addr[0] == 0xff;
 	}
 	return false;
 }

@@ -27,7 +27,8 @@
 #include <spa/param/audio/format-utils.h>
 #include <spa/param/props.h>
 #include <spa/utils/ringbuffer.h>
-#include <spa/utils/json.h>
+#include <spa/utils/json-builder.h>
+#include <spa/utils/overflow.h>
 
 #include <pipewire/pipewire.h>
 #include <pipewire/extensions/metadata.h>
@@ -57,15 +58,18 @@
 #include "volume.h"
 
 #define DEFAULT_ALLOW_MODULE_LOADING 	"true"
-#define DEFAULT_MIN_REQ		"256/48000"
-#define DEFAULT_DEFAULT_REQ	"960/48000"
-#define DEFAULT_MIN_FRAG	"256/48000"
-#define DEFAULT_DEFAULT_FRAG	"96000/48000"
-#define DEFAULT_DEFAULT_TLENGTH	"96000/48000"
-#define DEFAULT_MIN_QUANTUM	"256/48000"
-#define DEFAULT_FORMAT		"F32"
-#define DEFAULT_POSITION	"[ FL FR ]"
-#define DEFAULT_IDLE_TIMEOUT	"0"
+#define DEFAULT_MIN_REQ			"256/48000"
+#define DEFAULT_DEFAULT_REQ		"960/48000"
+#define DEFAULT_MIN_FRAG		"256/48000"
+#define DEFAULT_DEFAULT_FRAG		"96000/48000"
+#define DEFAULT_DEFAULT_TLENGTH		"96000/48000"
+#define DEFAULT_MIN_QUANTUM		"256/48000"
+#define DEFAULT_FORMAT			"F32"
+#define DEFAULT_POSITION		"[ FL FR ]"
+#define DEFAULT_IDLE_TIMEOUT		"0"
+#define DEFAULT_MAX_STREAMS		"64"
+#define DEFAULT_MAX_SAMPLE_CACHE	"67108864"
+#define DEFAULT_ZERORAMP_GAP		"0"
 
 #define MAX_FORMATS	32
 /* The max amount of data we send in one block when capturing. In PulseAudio this
@@ -569,7 +573,8 @@ static int reply_create_playback_stream(struct stream *stream, struct pw_manager
 	const char *peer_name;
 	uint64_t lat_usec;
 
-	stream->buffer = calloc(1, MAXLENGTH);
+	stream->bufsize = MAXLENGTH;
+	stream->buffer = calloc(1, stream->bufsize);
 	if (stream->buffer == NULL)
 		return -errno;
 
@@ -583,6 +588,8 @@ static int reply_create_playback_stream(struct stream *stream, struct pw_manager
 			client->name, stream->create_tag, stream->index, missing, lat_usec);
 
 	reply = reply_new(client, stream->create_tag);
+	if (reply == NULL)
+		return -ENOMEM;
 	message_put(reply,
 		TAG_U32, stream->channel,		/* stream index/channel */
 		TAG_U32, stream->index,			/* sink_input/stream index */
@@ -726,7 +733,8 @@ static int reply_create_record_stream(struct stream *stream, struct pw_manager_o
 	uint32_t peer_index;
 	uint64_t lat_usec;
 
-	stream->buffer = calloc(1, MAXLENGTH);
+	stream->bufsize = MAXLENGTH;
+	stream->buffer = calloc(1, stream->bufsize);
 	if (stream->buffer == NULL)
 		return -errno;
 
@@ -739,6 +747,8 @@ static int reply_create_record_stream(struct stream *stream, struct pw_manager_o
 			client->name, stream->create_tag, stream->index, lat_usec);
 
 	reply = reply_new(client, stream->create_tag);
+	if (reply == NULL)
+		return -ENOMEM;
 	message_put(reply,
 		TAG_U32, stream->channel,	/* stream index/channel */
 		TAG_U32, stream->index,		/* source_output/stream index */
@@ -1000,12 +1010,29 @@ static void manager_metadata(void *data, struct pw_manager_object *o,
 			else
 				client->default_bluetooth_headset_autoswitch = spa_streq(default_, "true");
 		}
+
+		if (spa_streq(key, METADATA_BLUETOOTH_PROFILE_PREFERENCE)) {
+			char default_pref[16];
+
+			client->have_bluetooth_profile_preference = true;
+
+			free(client->default_bluetooth_profile_preference);
+			if (spa_json_str_object_find(value, strlen(value),
+						"default", default_pref, sizeof(default_pref)) < 0)
+				client->default_bluetooth_profile_preference = NULL;
+			else
+				client->default_bluetooth_profile_preference = strdup(default_pref);
+		}
 	}
 	if (subject == PW_ID_CORE && o == client->metadata_sm_settings) {
 		if (spa_streq(key, METADATA_FEATURES_AUDIO_MONO))
 			client->force_mono_audio = spa_streq(value, "true");
 		if (spa_streq(key, METADATA_BLUETOOTH_HEADSET_AUTOSWITCH))
 			client->bluetooth_headset_autoswitch = spa_streq(value, "true");
+		if (spa_streq(key, METADATA_BLUETOOTH_PROFILE_PREFERENCE)) {
+			free(client->bluetooth_profile_preference);
+			client->bluetooth_profile_preference = value ? strdup(value) : NULL;
+		}
 	}
 }
 
@@ -1170,16 +1197,16 @@ static void stream_state_changed(void *data, enum pw_stream_state old,
 		break;
 	}
 
-	/* Don't emit suspended if we are creating a corked stream, as that will have a quick
-	 * RUNNING/SUSPENDED transition for initial negotiation */
+	/* Only emit suspended if we are created and not a corked stream, this means the
+	 * paused on our stream needs to be caused by the sink suspend or an unlink. */
 	if (stream->create_tag == SPA_ID_INVALID && !stream->corked) {
 		if (old == PW_STREAM_STATE_PAUSED && state == PW_STREAM_STATE_STREAMING &&
-		    stream->is_suspended) {
+		    stream->dont_inhibit_auto_suspend && stream->is_suspended) {
 			stream_send_suspended(stream, false);
 			stream->is_suspended = false;
 		}
 		if (old == PW_STREAM_STATE_STREAMING && state == PW_STREAM_STATE_PAUSED &&
-		    !stream->is_suspended) {
+		    stream->dont_inhibit_auto_suspend && !stream->is_suspended) {
 			if (stream->fail_on_suspend) {
 				stream->killed = true;
 				destroy_stream = true;
@@ -1312,23 +1339,23 @@ do_process_done(struct spa_loop *loop,
 	int32_t avail;
 
 	stream->timestamp = pd->pwt.now;
-	stream->delay = pd->pwt.buffered * SPA_USEC_PER_SEC / stream->ss.rate;
-	if (pd->pwt.rate.denom > 0)
-		stream->delay += pd->pwt.delay * SPA_USEC_PER_SEC * pd->pwt.rate.num / pd->pwt.rate.denom;
+	stream->delay.buffered = pd->pwt.buffered;
+	stream->delay.delay = pd->pwt.delay;
+	stream->delay.rate = pd->pwt.rate;
 
 	if (stream->direction == PW_DIRECTION_OUTPUT) {
-		if (pd->quantum != stream->last_quantum)
+		if (SPA_UNLIKELY(pd->quantum != stream->last_quantum)) {
 			stream_update_minreq(stream, pd->minreq);
-		stream->last_quantum = pd->quantum;
-
+			stream->last_quantum = pd->quantum;
+		}
 		stream->read_index += pd->read_inc;
-		if (stream->corked) {
+		if (SPA_UNLIKELY(stream->corked)) {
 			if (stream->underrun_for != (uint64_t)-1)
 				stream->underrun_for += pd->underrun_for;
 			stream->playing_for = 0;
 			return 0;
 		}
-		if (pd->underrun != stream->is_underrun) {
+		if (SPA_UNLIKELY(pd->underrun != stream->is_underrun)) {
 			stream->is_underrun = pd->underrun;
 			stream->underrun_for = 0;
 			stream->playing_for = 0;
@@ -1337,7 +1364,7 @@ do_process_done(struct spa_loop *loop,
 			else
 				stream_send_started(stream);
 		}
-		if (pd->idle) {
+		if (SPA_UNLIKELY(pd->idle)) {
 			if (!stream->is_idle) {
 				stream->idle_time = stream->timestamp;
 			} else if (!stream->is_paused &&
@@ -1349,7 +1376,7 @@ do_process_done(struct spa_loop *loop,
 		}
 		stream->is_idle = pd->idle;
 		stream->playing_for += pd->playing_for;
-		if (stream->underrun_for != (uint64_t)-1)
+		if (SPA_UNLIKELY(stream->underrun_for != (uint64_t)-1))
 			stream->underrun_for += pd->underrun_for;
 
 		stream_send_request(stream);
@@ -1360,22 +1387,38 @@ do_process_done(struct spa_loop *loop,
 		avail = spa_ringbuffer_get_read_index(&stream->ring, &index);
 
 		if (!spa_list_is_empty(&client->out_messages)) {
-			pw_log_debug("%p: [%s] pending read:%u avail:%d",
-					stream, client->name, index, avail);
-			return 0;
+			/* Try to flush the pending messages first. A control
+			 * message queued for a sibling stream in this same
+			 * cycle (a playback stream's REQUEST) would otherwise
+			 * make us skip this cycle, and when one is queued
+			 * every cycle it starves this capture stream
+			 * persistently while the connection itself keeps
+			 * flowing. Only skip when the messages really cannot
+			 * be flushed (socket backed up). */
+			if (client_flush_messages(client) < 0 ||
+			    !spa_list_is_empty(&client->out_messages)) {
+				pw_log_debug("%p: [%s] pending read:%u avail:%d",
+						stream, client->name, index, avail);
+				return 0;
+			}
 		}
 
-		if (avail <= 0) {
+		if (SPA_UNLIKELY(avail <= 0)) {
 			/* underrun, can't really happen but if it does we
 			 * do nothing and wait for more data */
 			pw_log_warn("%p: [%s] underrun read:%u avail:%d",
 					stream, client->name, index, avail);
 		} else {
-			if ((uint32_t)avail > stream->attr.maxlength) {
+			if (SPA_UNLIKELY((uint32_t)avail > stream->attr.maxlength)) {
 				uint32_t skip = avail - stream->attr.fragsize;
+				int suppressed;
 				/* overrun, catch up to latest fragment and send it */
-				pw_log_warn("%p: [%s] overrun recover read:%u avail:%d max:%u skip:%u",
-					stream, client->name, index, avail, stream->attr.maxlength, skip);
+				if ((suppressed = spa_ratelimit_test(&impl->rate_limit, stream->timestamp)) >= 0) {
+					pw_log_warn("%p: [%s] overrun recover read:%u avail:%d max:%u"
+							" skip:%u (%d suppressed)",
+						stream, client->name, index, avail,
+						stream->attr.maxlength, skip, suppressed);
+				}
 				index += skip;
 				stream->read_index += skip;
 				avail = stream->attr.fragsize;
@@ -1392,8 +1435,8 @@ do_process_done(struct spa_loop *loop,
 					return -errno;
 
 				spa_ringbuffer_read_data(&stream->ring,
-						stream->buffer, MAXLENGTH,
-						index % MAXLENGTH,
+						stream->buffer, stream->bufsize,
+						index % stream->bufsize,
 						msg->data, towrite);
 
 				client_queue_message(client, msg);
@@ -1422,17 +1465,17 @@ static void stream_process(void *data)
 	struct process_data pd;
 	bool do_flush = false;
 
-	if (stream->create_tag != SPA_ID_INVALID)
+	if (SPA_UNLIKELY(stream->create_tag != SPA_ID_INVALID))
 		return;
 
 	pw_log_trace_fp("%p: process", stream);
 	buffer = pw_stream_dequeue_buffer(stream->stream);
-	if (buffer == NULL)
+	if (SPA_UNLIKELY(buffer == NULL))
 		return;
 
 	buf = buffer->buffer;
 	d = &buf->datas[0];
-	if ((p = d->data) == NULL)
+	if (SPA_UNLIKELY((p = d->data) == NULL))
 		return;
 
 	spa_zero(pd);
@@ -1442,13 +1485,13 @@ static void stream_process(void *data)
 		bool empty = false;
 
 		minreq = buffer->requested * stream->frame_size;
-		if (minreq == 0)
+		if (SPA_UNLIKELY(minreq == 0))
 			minreq = stream->attr.minreq;
 
 		pd.minreq = minreq;
 		pd.quantum = stream->position ? stream->position->clock.duration : minreq;
 
-		if (avail < (int32_t)minreq || stream->corked) {
+		if (SPA_UNLIKELY(avail < (int32_t)minreq || stream->corked)) {
 			/* underrun, produce a silence buffer */
 			size = SPA_MIN(d->maxsize, minreq);
 			sample_spec_silence(&stream->ss, p, size);
@@ -1465,8 +1508,8 @@ static void stream_process(void *data)
 				if (avail > 0) {
 					avail = SPA_MIN((uint32_t)avail, size);
 					spa_ringbuffer_read_data(&stream->ring,
-						stream->buffer, MAXLENGTH,
-						index % MAXLENGTH,
+						stream->buffer, stream->bufsize,
+						index % stream->bufsize,
 						p, avail);
 					empty = false;
 				}
@@ -1480,7 +1523,7 @@ static void stream_process(void *data)
 			pw_log_debug("%p: [%s] underrun read:%u avail:%d max:%u",
 					stream, client->name, index, avail, minreq);
 		} else {
-			if (avail > (int32_t)stream->attr.maxlength) {
+			if (SPA_UNLIKELY(avail > (int32_t)stream->attr.maxlength)) {
 				uint32_t skip = avail - stream->attr.maxlength;
 				/* overrun, reported by other side, here we skip
 				 * ahead to the oldest data. */
@@ -1495,8 +1538,8 @@ static void stream_process(void *data)
 			size = SPA_MIN(size, minreq);
 
 			spa_ringbuffer_read_data(&stream->ring,
-					stream->buffer, MAXLENGTH,
-					index % MAXLENGTH,
+					stream->buffer, stream->bufsize,
+					index % stream->bufsize,
 					p, size);
 
 			index += size;
@@ -1517,12 +1560,12 @@ static void stream_process(void *data)
 		offs = SPA_MIN(d->chunk->offset, d->maxsize);
 		size = SPA_MIN(d->chunk->size, d->maxsize - offs);
 
-		if (filled < 0) {
+		if (SPA_UNLIKELY(filled < 0)) {
 			/* underrun, can't really happen because we never read more
 			 * than what's available on the other side  */
 			pw_log_warn("%p: [%s] underrun write:%u filled:%d",
 					stream, client->name, index, filled);
-		} else if ((uint32_t)filled + size > stream->attr.maxlength) {
+		} else if (SPA_UNLIKELY((uint32_t)filled + size > stream->attr.maxlength)) {
 			/* overrun, can happen when the other side is not
 			 * reading fast enough. We still write our data into the
 			 * ringbuffer and expect the other side to warn and catch up. */
@@ -1532,10 +1575,10 @@ static void stream_process(void *data)
 		}
 
 		spa_ringbuffer_write_data(&stream->ring,
-				stream->buffer, MAXLENGTH,
-				index % MAXLENGTH,
+				stream->buffer, stream->bufsize,
+				index % stream->bufsize,
 				SPA_PTROFF(p, offs, void),
-				SPA_MIN(size, MAXLENGTH));
+				SPA_MIN(size, stream->bufsize));
 
 		index += size;
 		pd.write_inc = size;
@@ -1543,7 +1586,7 @@ static void stream_process(void *data)
 	}
 	pw_stream_queue_buffer(stream->stream, buffer);
 
-	if (do_flush)
+	if (SPA_UNLIKELY(do_flush))
 		pw_stream_flush(stream->stream, true);
 
 	pw_stream_get_time_n(stream->stream, &pd.pwt, sizeof(pd.pwt));
@@ -1590,12 +1633,11 @@ static void log_format_info(struct impl *impl, enum spa_log_level level, struct 
 static int do_create_playback_stream(struct client *client, uint32_t command, uint32_t tag, struct message *m)
 {
 	struct impl *impl = client->impl;
-	const char *name = NULL;
+	const char *name = NULL, *sink_name, *str;
 	int res;
 	struct sample_spec ss, fix_ss;
 	struct channel_map map, fix_map;
 	uint32_t sink_index, syncid, ss_rate = 0, rate = 0;
-	const char *sink_name;
 	struct buffer_attr attr = { 0 };
 	bool corked = false,
 		no_remap = false,
@@ -1795,6 +1837,7 @@ static int do_create_playback_stream(struct client *client, uint32_t command, ui
 	stream->is_underrun = true;
 	stream->underrun_for = -1;
 	stream->fail_on_suspend = fail_on_suspend;
+	stream->dont_inhibit_auto_suspend = dont_inhibit_auto_suspend;
 
 	pw_properties_set(props, "pulse.corked", corked ? "true" : "false");
 
@@ -1827,8 +1870,10 @@ static int do_create_playback_stream(struct client *client, uint32_t command, ui
 	if (dont_inhibit_auto_suspend)
 		pw_properties_set(props, PW_KEY_NODE_PASSIVE, "true");
 
-	stream->stream = pw_stream_new(client->core, name, props);
-	props = NULL;
+	if ((str = pw_properties_get(client->props, "pulse.fade.gap")) != NULL)
+		pw_properties_set(props, "fade.gap", str);
+
+	stream->stream = pw_stream_new(client->core, name, spa_steal_ptr(props));
 	if (stream->stream == NULL)
 		goto error_errno;
 
@@ -1877,12 +1922,11 @@ error:
 static int do_create_record_stream(struct client *client, uint32_t command, uint32_t tag, struct message *m)
 {
 	struct impl *impl = client->impl;
-	const char *name = NULL;
+	const char *name = NULL, *source_name;
 	int res;
 	struct sample_spec ss, fix_ss;
 	struct channel_map map, fix_map;
 	uint32_t source_index;
-	const char *source_name;
 	struct buffer_attr attr = { 0 };
 	bool corked = false,
 		no_remap = false,
@@ -2074,6 +2118,7 @@ static int do_create_record_stream(struct client *client, uint32_t command, uint
 	stream->muted = muted;
 	stream->muted_set = muted_set;
 	stream->fail_on_suspend = fail_on_suspend;
+	stream->dont_inhibit_auto_suspend = dont_inhibit_auto_suspend;
 
 	if (client->quirks & QUIRK_REMOVE_CAPTURE_DONT_MOVE)
 		no_move = false;
@@ -2120,15 +2165,14 @@ static int do_create_record_stream(struct client *client, uint32_t command, uint
 			pw_properties_set(props,
 					PW_KEY_TARGET_OBJECT, source_name);
 		}
-		if (is_monitor)
-			pw_properties_set(props,
-					PW_KEY_STREAM_CAPTURE_SINK, "true");
 	}
+	if (is_monitor)
+		pw_properties_set(props,
+				PW_KEY_STREAM_CAPTURE_SINK, "true");
 	if (dont_inhibit_auto_suspend)
-		pw_properties_set(props, PW_KEY_NODE_PASSIVE, "true");
+		pw_properties_set(props, PW_KEY_NODE_PASSIVE, "in-follow");
 
-	stream->stream = pw_stream_new(client->core, name, props);
-	props = NULL;
+	stream->stream = pw_stream_new(client->core, name, spa_steal_ptr(props));
 	if (stream->stream == NULL)
 		goto error_errno;
 
@@ -2208,7 +2252,7 @@ static int do_get_playback_latency(struct client *client, uint32_t command, uint
 	uint32_t channel;
 	struct timeval tv, now;
 	struct stream *stream;
-	uint64_t delay;
+	int64_t delay;
 	int res;
 
 	if ((res = message_get(m,
@@ -2222,15 +2266,22 @@ static int do_get_playback_latency(struct client *client, uint32_t command, uint
 	if (stream == NULL || stream->type != STREAM_TYPE_PLAYBACK)
 		return -ENOENT;
 
+	delay = 0;
+	if (stream->ss.rate > 0)
+		delay += stream->delay.buffered * SPA_USEC_PER_SEC / stream->ss.rate;
+	if (stream->delay.rate.denom > 0)
+		delay += stream->delay.delay * SPA_USEC_PER_SEC *
+			stream->delay.rate.num / stream->delay.rate.denom;
+
 	pw_log_debug("read:0x%"PRIx64" write:0x%"PRIx64" queued:%"PRIi64" delay:%"PRIi64
 			" playing:%"PRIu64,
 			stream->read_index, stream->write_index,
-			stream->write_index - stream->read_index, stream->delay,
+			stream->write_index - stream->read_index, delay,
 			stream->playing_for);
 
 	gettimeofday(&now, NULL);
 
-	delay = SPA_CLAMP(stream->delay, 0, INT64_MAX);
+	delay = SPA_CLAMP(delay, 0, INT64_MAX);
 
 	reply = reply_new(client, tag);
 	message_put(reply,
@@ -2260,7 +2311,7 @@ static int do_get_record_latency(struct client *client, uint32_t command, uint32
 	uint32_t channel;
 	struct timeval tv, now;
 	struct stream *stream;
-	uint64_t delay;
+	int64_t delay;
 	int res;
 
 	if ((res = message_get(m,
@@ -2274,14 +2325,20 @@ static int do_get_record_latency(struct client *client, uint32_t command, uint32
 	if (stream == NULL || stream->type != STREAM_TYPE_RECORD)
 		return -ENOENT;
 
+	delay = 0;
+	if (stream->ss.rate > 0)
+		delay += stream->delay.buffered * SPA_USEC_PER_SEC / stream->ss.rate;
+	if (stream->delay.rate.denom > 0)
+		delay += stream->delay.delay * SPA_USEC_PER_SEC *
+			stream->delay.rate.num / stream->delay.rate.denom;
+
 	pw_log_debug("read:0x%"PRIx64" write:0x%"PRIx64" queued:%"PRIi64" delay:%"PRIi64,
 			stream->read_index, stream->write_index,
-			stream->write_index - stream->read_index, stream->delay);
-
+			stream->write_index - stream->read_index, delay);
 
 	gettimeofday(&now, NULL);
 
-	delay = SPA_CLAMP(stream->delay, 0, INT64_MAX);
+	delay = SPA_CLAMP(delay, 0, INT64_MAX);
 
 	reply = reply_new(client, tag);
 	message_put(reply,
@@ -2352,9 +2409,10 @@ static int do_create_upload_stream(struct client *client, uint32_t command, uint
 	if (stream == NULL)
 		goto error_errno;
 
-	stream->props = props;
+	stream->props = spa_steal_ptr(props);
 
-	stream->buffer = calloc(1, MAXLENGTH);
+	stream->bufsize = stream->attr.maxlength;
+	stream->buffer = calloc(1, stream->bufsize);
 	if (stream->buffer == NULL)
 		goto error_errno;
 
@@ -2413,6 +2471,12 @@ static int do_finish_upload_stream(struct client *client, uint32_t command, uint
 			channel, name);
 
 	struct sample *old = find_sample(impl, SPA_ID_INVALID, name);
+	uint32_t new_length = stream->attr.maxlength;
+	uint32_t old_length = old != NULL ? old->length : 0;
+	if (impl->stat.sample_cache + new_length - old_length > impl->defs.max_sample_cache) {
+		res = -ENOSPC;
+		goto error;
+	}
 	if (old == NULL || old->ref > 1) {
 		sample = calloc(1, sizeof(*sample));
 		if (sample == NULL)
@@ -2445,16 +2509,14 @@ static int do_finish_upload_stream(struct client *client, uint32_t command, uint
 	sample->ref = 1;
 	sample->impl = impl;
 	sample->name = name;
-	sample->props = stream->props;
+	sample->props = spa_steal_ptr(stream->props);
 	sample->ss = stream->ss;
 	sample->map = stream->map;
-	sample->buffer = stream->buffer;
+	sample->buffer = spa_steal_ptr(stream->buffer);
 	sample->length = stream->attr.maxlength;
 
 	impl->stat.sample_cache += sample->length;
 
-	stream->props = NULL;
-	stream->buffer = NULL;
 	stream_free(stream);
 
 	broadcast_subscribe_event(impl,
@@ -2481,7 +2543,7 @@ static const char *get_default(struct client *client, bool sink)
 	struct selector sel;
 	struct pw_manager *manager = client->manager;
 	struct pw_manager_object *o;
-	const char *def, *str, *mon;
+	const char *def, *str;
 
 	spa_zero(sel);
 	if (sink) {
@@ -2490,7 +2552,7 @@ static const char *get_default(struct client *client, bool sink)
 		sel.value = client->default_sink;
 		def = DEFAULT_SINK;
 	} else {
-		sel.type = pw_manager_object_is_source_or_monitor;
+		sel.type = pw_manager_object_is_source;
 		sel.key = PW_KEY_NODE_NAME;
 		sel.value = client->default_source;
 		def = DEFAULT_SOURCE;
@@ -2501,17 +2563,6 @@ static const char *get_default(struct client *client, bool sink)
 	if (o == NULL || o->props == NULL)
 		return def;
 	str = pw_properties_get(o->props, PW_KEY_NODE_NAME);
-
-	if (!sink && pw_manager_object_is_monitor(o)) {
-		def = DEFAULT_MONITOR;
-		if (str != NULL &&
-		    (mon = pw_properties_get(o->props, PW_KEY_NODE_NAME".monitor")) == NULL) {
-			pw_properties_setf(o->props,
-					PW_KEY_NODE_NAME".monitor",
-					"%s.monitor", str);
-		}
-		str = pw_properties_get(o->props, PW_KEY_NODE_NAME".monitor");
-	}
 	if (str == NULL)
 		str = def;
 	return str;
@@ -2556,7 +2607,10 @@ static struct pw_manager_object *find_device(struct client *client,
 	if (name != NULL) {
 		if (spa_strendswith(name, ".monitor")) {
 			if (!sink) {
-				name = strndupa(name, strlen(name)-8);
+				size_t len = strlen(name) - 8;
+				if (len > MAX_NAME)
+					return NULL;
+				name = strndupa(name, len);
 				allow_monitor = true;
 			}
 		}
@@ -2700,6 +2754,8 @@ static int do_cork_stream(struct client *client, uint32_t command, uint32_t tag,
 	stream = pw_map_lookup(&client->streams, channel);
 	if (stream == NULL || stream->type == STREAM_TYPE_UPLOAD)
 		return -ENOENT;
+	if (stream->create_tag != SPA_ID_INVALID)
+		return -ENOENT;
 
 	stream_set_corked(stream, cork);
 	if (cork) {
@@ -2729,6 +2785,8 @@ static int do_flush_trigger_prebuf_stream(struct client *client, uint32_t comman
 
 	stream = pw_map_lookup(&client->streams, channel);
 	if (stream == NULL || stream->type == STREAM_TYPE_UPLOAD)
+		return -ENOENT;
+	if (stream->create_tag != SPA_ID_INVALID)
 		return -ENOENT;
 
 	switch (command) {
@@ -3171,7 +3229,8 @@ static int do_set_port_latency_offset(struct client *client, uint32_t command, u
 	if (port_name == NULL)
 		return -EINVAL;
 
-	value = offset * 1000;  /* to nsec */
+	if (spa_overflow_mul(offset, (int64_t)1000, &value))
+		return -EINVAL;
 
 	if ((card = select_object(manager, &sel)) == NULL)
 		return -ENOENT;
@@ -3180,7 +3239,7 @@ static int do_set_port_latency_offset(struct client *client, uint32_t command, u
 	if ((port_info = spa_alloca(card_info.n_ports, sizeof(*port_info), MAX_ALLOCA_SIZE)) == NULL)
 		return -errno;
 	card_info.active_profile = SPA_ID_INVALID;
-	n_ports = collect_port_info(card, &card_info, NULL, port_info);
+	n_ports = collect_port_info(card, &card_info, NULL, port_info, NULL);
 
 	/* Set offset on all devices of the port */
 	res = -ENOENT;
@@ -3229,6 +3288,8 @@ static int do_set_stream_name(struct client *client, uint32_t command, uint32_t 
 
 	stream = pw_map_lookup(&client->streams, channel);
 	if (stream == NULL || stream->type == STREAM_TYPE_UPLOAD)
+		return -ENOENT;
+	if (stream->create_tag != SPA_ID_INVALID)
 		return -ENOENT;
 
 	items[0] = SPA_DICT_ITEM_INIT(PW_KEY_MEDIA_NAME, name);
@@ -3285,7 +3346,7 @@ static int do_update_proplist(struct client *client, uint32_t command, uint32_t 
 static int do_remove_proplist(struct client *client, uint32_t command, uint32_t tag, struct message *m)
 {
 	uint32_t i, channel;
-	struct spa_dict dict;
+	struct spa_dict dict = SPA_DICT_INIT(NULL, 0);
 	struct spa_dict_item *items;
 
 	spa_autoptr(pw_properties) props = pw_properties_new(NULL, NULL);
@@ -3511,7 +3572,7 @@ static int fill_ext_module_info(struct client *client, struct message *m,
 	}
 	if (client->version >= 15) {
 		message_put(m,
-			TAG_PROPLIST, module->info->properties,
+			TAG_PROPLIST, module->props,
 			TAG_INVALID);
 	}
 	return 0;
@@ -3635,7 +3696,7 @@ static int fill_card_info(struct client *client, struct message *m,
 		if ((port_info = spa_alloca(card_info.n_ports, sizeof(*port_info), MAX_ALLOCA_SIZE)) == NULL)
 			return -errno;
 		card_info.active_profile = SPA_ID_INVALID;
-		n_ports = collect_port_info(o, &card_info, NULL, port_info);
+		n_ports = collect_port_info(o, &card_info, NULL, port_info, NULL);
 
 		message_put(m,
 			TAG_U32, n_ports,				/* n_ports */
@@ -3649,10 +3710,8 @@ static int fill_card_info(struct client *client, struct message *m,
 			pi = &port_info[n];
 
 			if (pi->info && pi->n_props > 0 &&
-			    (items = spa_alloca(pi->n_props, sizeof(*items), MAX_ALLOCA_SIZE)) != NULL) {
-				dict.items = items;
-				pdict = collect_props(pi->info, &dict);
-			}
+			    (items = spa_alloca(pi->n_props, sizeof(*items), MAX_ALLOCA_SIZE)) != NULL)
+				pdict = collect_props(pi->info, &dict, items, pi->n_props);
 
 			message_put(m,
 				TAG_STRING, pi->name,			/* port name */
@@ -3836,10 +3895,11 @@ static int fill_sink_info(struct client *client, struct message *m,
 	if (client->version >= 16) {
 		uint32_t n_ports, n;
 		struct port_info *port_info, *pi;
+		const char *active_port_name = NULL;
 
 		if ((port_info = spa_alloca(card_info.n_ports, sizeof(*port_info), MAX_ALLOCA_SIZE)) == NULL)
 			return -errno;
-		n_ports = collect_port_info(card, &card_info, &dev_info, port_info);
+		n_ports = collect_port_info(card, &card_info, &dev_info, port_info, &active_port_name);
 
 		message_put(m,
 			TAG_U32, n_ports,			/* n_ports */
@@ -3864,7 +3924,7 @@ static int fill_sink_info(struct client *client, struct message *m,
 			}
 		}
 		message_put(m,
-			TAG_STRING, dev_info.active_port_name,		/* active port name */
+			TAG_STRING, active_port_name,		/* active port name */
 			TAG_INVALID);
 	}
 	if (client->version >= 21) {
@@ -4033,10 +4093,11 @@ static int fill_source_info(struct client *client, struct message *m,
 	if (client->version >= 16) {
 		uint32_t n_ports, n;
 		struct port_info *port_info, *pi;
+		const char *active_port_name = NULL;
 
 		if ((port_info = spa_alloca(card_info.n_ports, sizeof(*port_info), MAX_ALLOCA_SIZE)) == NULL)
 			return -errno;
-		n_ports = collect_port_info(card, &card_info, &dev_info, port_info);
+		n_ports = collect_port_info(card, &card_info, &dev_info, port_info, &active_port_name);
 
 		message_put(m,
 			TAG_U32, n_ports,			/* n_ports */
@@ -4061,7 +4122,7 @@ static int fill_source_info(struct client *client, struct message *m,
 			}
 		}
 		message_put(m,
-			TAG_STRING, dev_info.active_port_name,		/* active port name */
+			TAG_STRING, active_port_name,		/* active port name */
 			TAG_INVALID);
 	}
 	if (client->version >= 21) {
@@ -4090,7 +4151,7 @@ static int fill_node_info_proplist(struct message *m, const struct spa_dict *nod
 {
 	struct pw_client_info *client_info = client ? client->info : NULL;
 	uint32_t n_items, n;
-	struct spa_dict dict, *client_props = NULL;
+	struct spa_dict dict = SPA_DICT_INIT(NULL, 0), *client_props = NULL;
 	const struct spa_dict_item *it;
 	struct spa_dict_item *items, *it2;
 
@@ -4587,7 +4648,7 @@ static int do_set_stream_buffer_attr(struct client *client, uint32_t command, ui
 			commands[command].name, tag, channel);
 
 	stream = pw_map_lookup(&client->streams, channel);
-	if (stream == NULL)
+	if (stream == NULL || stream->create_tag != SPA_ID_INVALID)
 		return -ENOENT;
 
 	if (command == COMMAND_SET_PLAYBACK_STREAM_BUFFER_ATTR) {
@@ -4677,6 +4738,11 @@ static int do_update_stream_sample_rate(struct client *client, uint32_t command,
 	stream = pw_map_lookup(&client->streams, channel);
 	if (stream == NULL || stream->type == STREAM_TYPE_UPLOAD)
 		return -ENOENT;
+	if (stream->create_tag != SPA_ID_INVALID)
+		return -ENOENT;
+
+	if (rate == 0 || rate > RATE_MAX)
+		return -EINVAL;
 
 	stream->rate = rate;
 
@@ -4790,13 +4856,30 @@ static int do_set_default(struct client *client, uint32_t command, uint32_t tag,
 			return -ENOENT;
 		if (o->props && (str = pw_properties_get(o->props, PW_KEY_NODE_NAME)) != NULL)
 			name = str;
-		else if (spa_strendswith(name, ".monitor"))
-			name = strndupa(name, strlen(name)-8);
+		else if (spa_strendswith(name, ".monitor")) {
+			size_t len = strlen(name) - 8;
+			if (len > MAX_NAME)
+				return -ENAMETOOLONG;
+			name = strndupa(name, len);
+		}
+
+		struct spa_json_builder b;
+		spa_autofree char *val = NULL;
+		size_t val_size;
+
+		if ((res = spa_json_builder_memstream(&b, &val, &val_size, 0)) < 0)
+			return res;
+
+		spa_json_builder_array_push(&b, "{");
+		spa_json_builder_object_string(&b, "name", name);
+		spa_json_builder_pop(&b,        "}");
+		if ((res = spa_json_builder_close(&b)) < 0)
+			return res;
 
 		res = pw_manager_set_metadata(manager, client->metadata_default,
 				PW_ID_CORE,
 				sink ? METADATA_CONFIG_DEFAULT_SINK : METADATA_CONFIG_DEFAULT_SOURCE,
-				"Spa:String:JSON", "{ \"name\": \"%s\" }", name);
+				"Spa:String:JSON", "%s", val);
 	} else {
 		res = pw_manager_set_metadata(manager, client->metadata_default,
 				PW_ID_CORE,
@@ -5151,13 +5234,15 @@ static int do_load_module(struct client *client, uint32_t command, uint32_t tag,
 	pw_log_info("[%s] %s name:%s argument:%s",
 			client->name, commands[command].name, name, argument);
 
-	module = module_create(impl, name, argument);
-	if (module == NULL)
-		return -errno;
-
 	pm = calloc(1, sizeof(*pm));
 	if (pm == NULL)
 		return -errno;
+
+	module = module_create(impl, name, argument);
+	if (module == NULL) {
+		free(pm);
+		return -errno;
+	}
 
 	pm->tag = tag;
 	pm->client = client;
@@ -5605,6 +5690,8 @@ static void load_defaults(struct defs *def, struct pw_properties *props)
 	parse_format(props, "pulse.default.format", DEFAULT_FORMAT, &def->sample_spec);
 	parse_position(props, "pulse.default.position", DEFAULT_POSITION, &def->channel_map);
 	parse_uint32(props, "pulse.idle.timeout", DEFAULT_IDLE_TIMEOUT, &def->idle_timeout);
+	parse_uint32(props, "pulse.max-streams", DEFAULT_MAX_STREAMS, &def->max_streams);
+	parse_uint32(props, "pulse.max-sample-cache", DEFAULT_MAX_SAMPLE_CACHE, &def->max_sample_cache);
 	def->sample_spec.channels = def->channel_map.channels;
 	def->quantum_limit = 8192;
 }

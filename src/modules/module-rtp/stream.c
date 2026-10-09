@@ -10,7 +10,6 @@
 #include <spa/utils/atomic.h>
 #include <spa/utils/result.h>
 #include <spa/utils/json.h>
-#include <spa/utils/ringbuffer.h>
 #include <spa/utils/dll.h>
 #include <spa/param/audio/format-utils.h>
 #include <spa/param/audio/raw-json.h>
@@ -20,6 +19,7 @@
 #include <spa/debug/types.h>
 #include <spa/debug/mem.h>
 #include <spa/debug/log.h>
+#include <spa/utils/burg-pred.h>
 
 #include <pipewire/pipewire.h>
 #include <pipewire/impl.h>
@@ -31,10 +31,7 @@
 PW_LOG_TOPIC_EXTERN(mod_topic);
 #define PW_LOG_TOPIC_DEFAULT mod_topic
 
-#define BUFFER_SIZE			(1u<<22)
-#define BUFFER_MASK			(BUFFER_SIZE-1)
-#define BUFFER_SIZE2			(BUFFER_SIZE>>1)
-#define BUFFER_MASK2			(BUFFER_SIZE2-1)
+#define BUFFER_SIZE1			(1u<<22)
 
 /* IMPORTANT: When using calls that have return values, like
  * rtp_stream_emit_open_connection, callers must set the variables
@@ -48,10 +45,11 @@ PW_LOG_TOPIC_EXTERN(mod_topic);
 #define rtp_stream_emit_open_connection(s,r)	rtp_stream_emit(s, open_connection, 0,r)
 #define rtp_stream_emit_close_connection(s,r)	rtp_stream_emit(s, close_connection, 0,r)
 #define rtp_stream_emit_param_changed(s,i,p)	rtp_stream_emit(s, param_changed,0,i,p)
+#define rtp_stream_emit_command(s,cmd)		rtp_stream_emit(s, command,0,cmd)
 
 #define rtp_stream_call(s,m,v,...)		spa_callbacks_call_fast(&s->rtp_callbacks, \
 							struct rtp_stream_events, m, v, ##__VA_ARGS__)
-#define rtp_stream_call_send_packet(s,i,l)	rtp_stream_call(s, send_packet,0,i,l)
+#define rtp_stream_call_send_packet(s,p)	rtp_stream_call(s, send_packet,0,p)
 #define rtp_stream_call_send_feedback(s,seq)	rtp_stream_call(s, send_feedback,0,seq)
 
 enum rtp_stream_internal_state {
@@ -78,8 +76,16 @@ enum rtp_stream_internal_state {
 	RTP_STREAM_INTERNAL_STATE_STARTED
 };
 
-struct impl {
+struct rtp_stream {
+	/* This audio info's content originates from the props that
+	 * are passed to rtp_stream_new(). */
 	struct spa_audio_info info;
+	/* The stream info that are used for connecting the pw_stream
+	 * and for defining the SPA_PARAM_EnumFormat value. This info
+	 * is derived from the info above, but may be tweaked as-needed,
+	 * for example, when a specific audio type only works with
+	 * a certain PCM format, or when the subtype needs to be set
+	 * to something that deviates from the info.subtype value. */
 	struct spa_audio_info stream_info;
 
 	struct pw_context *context;
@@ -93,7 +99,10 @@ struct impl {
 	struct spa_hook_list listener_list;
 	struct spa_hook listener;
 
-	const struct format_info *format_info;
+	/* This stores RTP specific format information, such as the
+	 * media type to use in the rtp.media and rtp.mime properties,
+	 * which are used in SDP announcements. */
+	const struct rtp_format_info *rtp_format_info;
 
 	enum spa_direction direction;
 	void *stream_data;
@@ -107,7 +116,6 @@ struct impl {
 	unsigned fixed_ssrc:1;
 	unsigned have_ssrc:1;
 	unsigned ignore_ssrc:1;
-	unsigned have_seq:1;
 	unsigned marker_on_first:1;
 	uint32_t ts_offset;
 	uint32_t psamples;
@@ -116,8 +124,14 @@ struct impl {
 	uint32_t payload_size;
 	uint32_t ts_align;
 
-	struct spa_ringbuffer ring;
-	uint8_t buffer[BUFFER_SIZE];
+	uint32_t n_packets;
+	struct spa_list free;
+	struct spa_list queued;
+	uint32_t num_queued;
+	uint32_t expected_timestamp;
+	uint32_t head_timestamp;
+	uint32_t tail_timestamp;
+
 	uint64_t last_recv_timestamp;
 
 	struct spa_io_rate_match *io_rate_match;
@@ -127,10 +141,10 @@ struct impl {
 	uint32_t target_buffer;
 	double max_error;
 
-	float last_timestamp;
-	float last_time;
+	uint32_t delay;
 
 	unsigned direct_timestamp:1;
+	unsigned delay_compensation:1;
 	unsigned always_process:1;
 	unsigned have_sync:1;
 	unsigned receiving:1;
@@ -157,21 +171,12 @@ struct impl {
 	 * access below for the reason why. */
 	uint8_t timer_running;
 
-	int (*receive_rtp)(struct impl *impl, uint8_t *buffer, ssize_t len,
-			uint64_t current_time);
-	/* Used for resetting the ring buffer before the stream starts, to prevent
-	 * reading from uninitialized memory. This can otherwise happen in direct
-	 * timestamp mode when the read index is set to an uninitialized location.
-	 * This is a function pointer to allow customizations in case resetting
-	 * requires filling the ring buffer with something other than nullbytes
-	 * (this can happen with DSD for example). */
-	void (*reset_ringbuffer)(struct impl *impl);
 	/* Called by stream_start() to stop any running timer before continuing to
 	 * start the stream. This is necessary, because by that point, any remaining
 	 * buffered data is stale, and the timer would keep sending it out. */
-	void (*stop_timer)(struct impl *impl);
-	void (*flush_timeout)(struct impl *impl, uint64_t expirations);
-	void (*deinit)(struct impl *impl, enum spa_direction direction);
+	void (*stop_timer)(struct rtp_stream *impl);
+	void (*flush_timeout)(struct rtp_stream *impl, uint64_t expirations);
+	void (*deinit)(struct rtp_stream *impl, enum spa_direction direction);
 
 	/*
 	 * pw_filter where the filter would be driven at the PTP clock
@@ -211,18 +216,18 @@ struct impl {
  *
  * Also, since GCC __atomic built-ins (which the SPA macros use) are
  * designed to work with integral scalar or pointer type that is 1,
- * 2, 4, or 8 bytes in length, impl->internal_state is of type uint33_t.
+ * 2, 4, or 8 bytes in length, impl->internal_state is of type uint32_t.
  * This guarantee a correct size for the built-ins. The accessors take
  * care of casting from/to rtp_stream_internal_state . The relevant
  * GCC manual page for this is:
  * https://gcc.gnu.org/onlinedocs/gcc/_005f_005fatomic-Builtins.html
  */
 
-static inline enum rtp_stream_internal_state get_internal_stream_state(struct impl *impl) {
+static inline enum rtp_stream_internal_state get_internal_stream_state(struct rtp_stream *impl) {
 	return (enum rtp_stream_internal_state)SPA_ATOMIC_LOAD(impl->internal_state);
 }
 
-static inline void set_internal_stream_state(struct impl *impl, enum rtp_stream_internal_state state) {
+static inline void set_internal_stream_state(struct rtp_stream *impl, enum rtp_stream_internal_state state) {
 	SPA_ATOMIC_STORE(impl->internal_state, (uint32_t)state);
 }
 
@@ -233,18 +238,18 @@ static inline void set_internal_stream_state(struct impl *impl, enum rtp_stream_
  * they are treated as two independent atomic variables instead of two
  * resources under a common mutex. */
 
-static inline bool is_timer_running(struct impl *impl) {
+static inline bool is_timer_running(struct rtp_stream *impl) {
 	return (bool)SPA_ATOMIC_LOAD(impl->timer_running);
 }
 
-static inline void set_timer_running(struct impl *impl, bool running) {
+static inline void set_timer_running(struct rtp_stream *impl, bool running) {
 	SPA_ATOMIC_STORE(impl->timer_running, (uint8_t)(running ? 1 : 0));
 }
 
 static int do_finish_stopping_state(struct spa_loop *loop, bool async, uint32_t seq, const void *data, size_t size, void *user_data)
 {
 	int res = 0;
-	struct impl *impl = user_data;
+	struct rtp_stream *impl = user_data;
 	enum rtp_stream_internal_state cur_state = get_internal_stream_state(impl);
 
 	/* The checks here cover a corner case that can happen when the
@@ -293,32 +298,61 @@ static int do_finish_stopping_state(struct spa_loop *loop, bool async, uint32_t 
 	return 0;
 }
 
-#include "module-rtp/audio.c"
-#include "module-rtp/midi.c"
-#include "module-rtp/opus.c"
 
-struct format_info {
+struct rtp_format_info {
 	uint32_t media_subtype;
 	uint32_t format;
 	uint32_t size;
 	const char *mime;
 	const char *media_type;
+	void (*to_float) (const void *src, int stride, float *dst, uint32_t n_samples);
+	void (*from_float) (const float *src, int stride, void *dst, uint32_t n_samples);
 };
 
-static const struct format_info audio_format_info[] = {
+#include "module-rtp/audio.c"
+#include "module-rtp/midi.c"
+#include "module-rtp/opus.c"
+
+static void s16be_to_float(const void *src, int stride, float *dst, uint32_t n_samples)
+{
+	uint32_t i;
+	const uint16_t *s = src;
+
+	for (i = 0; i < n_samples; i++)
+		dst[i] = ((int16_t)ntohs(s[i*stride])) / 32768.0f;
+}
+
+static void s16be_from_float(const float *src, int stride, void *dst, uint32_t n_samples)
+{
+	uint32_t i;
+	uint16_t *d = dst;
+
+	for (i = 0; i < n_samples; i++) {
+		int16_t vs = (int16_t)lrintf(SPA_CLAMPF(src[i] * 32768.0f, -32768, 32767));
+		d[i*stride] = htons(vs);
+	}
+}
+
+static const struct rtp_format_info rtp_pcm_audio_format_info[] = {
 	{ SPA_MEDIA_SUBTYPE_raw, SPA_AUDIO_FORMAT_U8, 1, "L8", "audio" },
 	{ SPA_MEDIA_SUBTYPE_raw, SPA_AUDIO_FORMAT_ALAW, 1, "PCMA", "audio" },
 	{ SPA_MEDIA_SUBTYPE_raw, SPA_AUDIO_FORMAT_ULAW, 1, "PCMU", "audio" },
-	{ SPA_MEDIA_SUBTYPE_raw, SPA_AUDIO_FORMAT_S16_BE, 2, "L16", "audio" },
+	{ SPA_MEDIA_SUBTYPE_raw, SPA_AUDIO_FORMAT_S16_BE, 2, "L16", "audio", s16be_to_float, s16be_from_float },
 	{ SPA_MEDIA_SUBTYPE_raw, SPA_AUDIO_FORMAT_S16_LE, 2, "L16", "audio" },
 	{ SPA_MEDIA_SUBTYPE_raw, SPA_AUDIO_FORMAT_S24_BE, 3, "L24", "audio" },
-	{ SPA_MEDIA_SUBTYPE_control, 0, 1, "rtp-midi", "audio" },
-	{ SPA_MEDIA_SUBTYPE_opus, 0, 4, "opus", "audio" },
+};
+
+static const struct rtp_format_info rtp_midi_format_info = {
+	SPA_MEDIA_SUBTYPE_control, 0, 1, "rtp-midi", "audio"
+};
+
+static const struct rtp_format_info rtp_opus_format_info = {
+	SPA_MEDIA_SUBTYPE_opus, 0, 4, "opus", "audio"
 };
 
 static void stream_io_changed(void *data, uint32_t id, void *area, uint32_t size)
 {
-	struct impl *impl = data;
+	struct rtp_stream *impl = data;
 	switch (id) {
 	case SPA_IO_RateMatch:
 		impl->io_rate_match = area;
@@ -331,12 +365,12 @@ static void stream_io_changed(void *data, uint32_t id, void *area, uint32_t size
 
 static void stream_destroy(void *d)
 {
-	struct impl *impl = d;
+	struct rtp_stream *impl = d;
 	spa_hook_remove(&impl->stream_listener);
 	impl->stream = NULL;
 }
 
-static int stream_start(struct impl *impl)
+static int stream_start(struct rtp_stream *impl)
 {
 	int res;
 	enum rtp_stream_internal_state cur_state;
@@ -385,7 +419,7 @@ static int stream_start(struct impl *impl)
 		pw_log_error("error while closing leftover connection: %s", spa_strerror(res));
 	}
 
-	impl->reset_ringbuffer(impl);
+	rtp_stream_clear_queued_packets((struct rtp_stream*)impl);
 
 	res = 0;
 	rtp_stream_emit_open_connection(impl, &res);
@@ -412,7 +446,7 @@ static int stream_start(struct impl *impl)
 	return 0;
 }
 
-static int stream_stop(struct impl *impl)
+static int stream_stop(struct rtp_stream *impl)
 {
 	bool timer_running;
 
@@ -460,10 +494,9 @@ static int stream_stop(struct impl *impl)
 	 * meaning that the timer was no longer running, and the connection
 	 * could be closed. */
 	if (!timer_running) {
-		/* Clear the ringbuffer to prevent old invalid packets from being
+		/* Clear the packet gbuffer to prevent old invalid packets from being
 		 * sent when processing resumes via rtp_audio_flush_packets() */
-		if (impl->reset_ringbuffer)
-			impl->reset_ringbuffer(impl);
+		rtp_stream_clear_queued_packets((struct rtp_stream*)impl);
 		set_internal_stream_state(impl, RTP_STREAM_INTERNAL_STATE_STOPPED);
 		pw_log_info("stream stopped");
 	}
@@ -474,7 +507,7 @@ static int stream_stop(struct impl *impl)
 static void on_stream_state_changed(void *d, enum pw_stream_state old,
 		enum pw_stream_state state, const char *error)
 {
-	struct impl *impl = d;
+	struct rtp_stream *impl = d;
 
 	switch (state) {
 		case PW_STREAM_STATE_UNCONNECTED:
@@ -497,7 +530,7 @@ static void on_stream_state_changed(void *d, enum pw_stream_state old,
 	}
 }
 
-static void update_latency_params(struct impl *impl)
+static void update_latency_params(struct rtp_stream *impl)
 {
 	uint32_t n_params = 0;
 	const struct spa_pod *params[2];
@@ -532,7 +565,7 @@ static void update_latency_params(struct impl *impl)
 	pw_stream_update_params(impl->stream, params, n_params);
 }
 
-static void param_process_latency_changed(struct impl *impl, const struct spa_pod *param)
+static void param_process_latency_changed(struct rtp_stream *impl, const struct spa_pod *param)
 {
 	struct spa_process_latency_info process_latency;
 
@@ -551,7 +584,7 @@ static void param_process_latency_changed(struct impl *impl, const struct spa_po
 
 static void on_stream_param_changed (void *d, uint32_t id, const struct spa_pod *param)
 {
-	struct impl *impl = d;
+	struct rtp_stream *impl = d;
 
 	switch (id) {
 	case SPA_PARAM_ProcessLatency:
@@ -563,17 +596,24 @@ static void on_stream_param_changed (void *d, uint32_t id, const struct spa_pod 
 	}
 };
 
+static void on_stream_command(void *d, const struct spa_command *command)
+{
+	struct rtp_stream *impl = d;
+	rtp_stream_emit_command(impl, command);
+}
+
 static const struct pw_stream_events stream_events = {
 	PW_VERSION_STREAM_EVENTS,
 	.destroy = stream_destroy,
 	.state_changed = on_stream_state_changed,
 	.param_changed = on_stream_param_changed,
+	.command = on_stream_command,
 	.io_changed = stream_io_changed,
 };
 
-static const struct format_info *find_audio_format_info(const struct spa_audio_info *info)
+static const struct rtp_format_info *find_rtp_pcm_audio_format_info(const struct spa_audio_info *info)
 {
-	SPA_FOR_EACH_ELEMENT_VAR(audio_format_info, f)
+	SPA_FOR_EACH_ELEMENT_VAR(rtp_pcm_audio_format_info, f)
 		if (f->media_subtype == info->media_subtype &&
 		    (f->format == 0 || f->format == info->info.raw.format))
 			return f;
@@ -584,7 +624,7 @@ static int parse_audio_info(const struct pw_properties *props, struct spa_audio_
 {
 	return spa_audio_info_raw_init_dict_keys(info,
 			&SPA_DICT_ITEMS(
-				 SPA_DICT_ITEM(SPA_KEY_AUDIO_FORMAT, DEFAULT_FORMAT),
+				 SPA_DICT_ITEM(SPA_KEY_AUDIO_FORMAT, DEFAULT_RAW_AUDIO_FORMAT),
 				 SPA_DICT_ITEM(SPA_KEY_AUDIO_RATE, SPA_STRINGIFY(DEFAULT_RATE)),
 				 SPA_DICT_ITEM(SPA_KEY_AUDIO_POSITION, DEFAULT_POSITION)),
 			&props->dict,
@@ -595,36 +635,31 @@ static int parse_audio_info(const struct pw_properties *props, struct spa_audio_
 			SPA_KEY_AUDIO_POSITION, NULL);
 }
 
-static uint32_t msec_to_samples(struct impl *impl, float msec)
+static uint32_t msec_to_samples(struct rtp_stream *impl, float msec)
 {
 	return (uint32_t)(msec * impl->rate / 1000);
 }
-static float samples_to_msec(struct impl *impl, uint32_t samples)
+static float samples_to_msec(struct rtp_stream *impl, uint32_t samples)
 {
 	return samples * 1000.0f / impl->rate;
 }
 
 static void on_flush_timeout(void *d, uint64_t expirations)
 {
-	struct impl *impl = d;
+	struct rtp_stream *impl = d;
 	impl->flush_timeout(d, expirations);
-}
-
-static void default_reset_ringbuffer(struct impl *impl)
-{
-	spa_memzero(impl->buffer, sizeof(impl->buffer));
 }
 
 struct rtp_stream *rtp_stream_new(struct pw_core *core,
 		enum spa_direction direction, struct pw_properties *props,
 		const struct rtp_stream_events *events, void *data)
 {
-	struct impl *impl;
+	struct rtp_stream *impl;
 	const char *str, *aes67_driver;
 	char tmp[64];
 	uint8_t buffer[1024];
 	struct spa_pod_builder b;
-	uint32_t n_params, min_samples, max_samples;
+	uint32_t i, n_params, min_samples, max_samples, min_packets = 1;
 	float min_ptime, max_ptime;
 	const struct spa_pod *params[3];
 	enum pw_stream_flags flags;
@@ -651,8 +686,8 @@ struct rtp_stream *rtp_stream_new(struct pw_core *core,
 		pw_log_error("can't create timer");
 		goto out;
 	}
-
-	impl->reset_ringbuffer = default_reset_ringbuffer;
+	spa_list_init(&impl->free);
+	spa_list_init(&impl->queued);
 
 	if ((str = pw_properties_get(props, "sess.media")) == NULL)
 		str = "audio";
@@ -692,29 +727,27 @@ struct rtp_stream *rtp_stream_new(struct pw_core *core,
 			goto out;
 		}
 		impl->stream_info = impl->info;
-		impl->format_info = find_audio_format_info(&impl->info);
-		if (impl->format_info == NULL) {
-			pw_log_error("unsupported audio format:%d channels:%d",
+		impl->rtp_format_info = find_rtp_pcm_audio_format_info(&impl->info);
+		if (impl->rtp_format_info == NULL) {
+			pw_log_error("unsupported audio format:%d (%s) channels:%d",
 					impl->stream_info.info.raw.format,
+					spa_type_audio_format_to_short_name(impl->stream_info.info.raw.format),
 					impl->stream_info.info.raw.channels);
 			res = -EINVAL;
 			goto out;
 		}
-		impl->stride = impl->format_info->size * impl->stream_info.info.raw.channels;
+		impl->stride = impl->rtp_format_info->size * impl->stream_info.info.raw.channels;
 		impl->rate = impl->stream_info.info.raw.rate;
 		break;
 	case SPA_MEDIA_SUBTYPE_control:
 		impl->stream_info = impl->info;
-		impl->format_info = find_audio_format_info(&impl->info);
-		if (impl->format_info == NULL) {
-			res = -EINVAL;
-			goto out;
-		}
+		impl->rtp_format_info = &rtp_midi_format_info;
 		pw_properties_set(props, PW_KEY_FORMAT_DSP, "8 bit raw midi");
-		impl->stride = impl->format_info->size;
+		impl->stride = impl->rtp_format_info->size;
 		impl->rate = pw_properties_get_uint32(props, "midi.rate", 10000);
 		if (impl->rate == 0)
 			impl->rate = 10000;
+		min_packets = 32;
 		break;
 	case SPA_MEDIA_SUBTYPE_opus:
 		impl->stream_info.media_type = SPA_MEDIA_TYPE_audio;
@@ -727,63 +760,17 @@ struct rtp_stream *rtp_stream_new(struct pw_core *core,
 		impl->info.info.opus.rate = impl->stream_info.info.raw.rate;
 		impl->info.info.opus.channels = impl->stream_info.info.raw.channels;
 
-		impl->format_info = find_audio_format_info(&impl->info);
-		if (impl->format_info == NULL) {
-			pw_log_error("unsupported audio format:%d channels:%d",
-					impl->stream_info.info.raw.format,
-					impl->stream_info.info.raw.channels);
-			res = -EINVAL;
-			goto out;
-		}
-		impl->stride = impl->format_info->size * impl->stream_info.info.raw.channels;
+		impl->rtp_format_info = &rtp_opus_format_info;
+		impl->stride = impl->rtp_format_info->size * impl->stream_info.info.raw.channels;
 		impl->rate = impl->stream_info.info.raw.rate;
+		min_packets = 128;
 		break;
 	default:
 		spa_assert_not_reached();
 		break;
 	}
 
-	/* Limit the actual maximum buffer size to the maximum integer multiple
-	 * amount of impl->stride that fits within BUFFER_SIZE. This is important
-	 * to prevent corner cases where the read pointer wrapped around at the
-	 * same time when the IO clock experiences a discontinuity.
-	 *
-	 * If the BUFFER_SIZE constant is not an integer multiple of impl->stride,
-	 * pointer wrap-arounds will result in positions that exhibit a nonzero
-	 * impl->stride division rest. Also, the write and read pointers are normally
-	 * increased monotonically and contiguously. But, if a discontinuity is
-	 * detected, these pointers may be resynchronized. Importantly, sometimes
-	 * only one of them may be resynchronized, while the other retains its existing
-	 * synchronization. (For example, the read and write side may use different
-	 * discontinuity thresholds.)
-	 *
-	 * What then can happen is that the resynchronized pointer exhibits a _different_
-	 * impl->stride division than the other pointer. Once the resynchronization takes
-	 * place, that pointer is again monotonically increased from then on, so those
-	 * division rests will stay different. This then means that the read and write
-	 * operations will not be aligned properly. For example, a write operation might
-	 * write to position 20 in the ring buffer, but the read operation might read
-	 * from position 22, and doing so with a stride value of 6. The end result is
-	 * invalid data.
-	 *
-	 * One way to visualize this is to think of the ring buffer as a grid. The grid
-	 * cell size equals impl->stride. If BUFFER_SIZE is not an integer multiple of
-	 * impl->stride, it means that the very last grid cell will have a size that is
-	 * smaller than impl->stride. The unaligned read/write operations mean that the
-	 * operations will not be done at the same grid cell boundaries, so for example
-	 * the read operation might think that a cell starts at byte 2, while the write
-	 * operation might think that the same cell starts at byte 4.
-	 *
-	 * By limiting the actual maximum buffer size to the maximum integer multiple
-	 * amount of impl->stride that fits within BUFFER_SIZE, this is avoided, since
-	 * then, all grid cells are guaranteed to have the size impl->stride, so the
-	 * aforementioned division rest will always be zero.
-	 */
-	impl->actual_max_buffer_size = SPA_ROUND_DOWN(BUFFER_SIZE, impl->stride);
-	pw_log_debug("possible / actual max buffer size: %" PRIu32 " / %" PRIu32,
-			(uint32_t)BUFFER_SIZE, impl->actual_max_buffer_size);
-
-	pw_properties_setf(props, "rtp.mime", "%s", impl->format_info->mime);
+	pw_properties_setf(props, "rtp.mime", "%s", impl->rtp_format_info->mime);
 
 	if (pw_properties_get(props, PW_KEY_NODE_VIRTUAL) == NULL)
 		pw_properties_set(props, PW_KEY_NODE_VIRTUAL, "true");
@@ -795,6 +782,7 @@ struct rtp_stream *rtp_stream_new(struct pw_core *core,
 		impl->marker_on_first = 1;
 	impl->ignore_ssrc = pw_properties_get_bool(props, "sess.ignore-ssrc", false);
 	impl->direct_timestamp = pw_properties_get_bool(props, "sess.ts-direct", false);
+	impl->delay_compensation = pw_properties_get_bool(props, "sess.delay-compensation", false);
 
 	if (direction == PW_DIRECTION_INPUT) {
 		impl->ssrc = pw_properties_get_uint32(props, "rtp.sender-ssrc", pw_rand32());
@@ -886,8 +874,8 @@ struct rtp_stream *rtp_stream_new(struct pw_core *core,
 
 	/* We're not expecting odd ptimes, so this modulo should be 0 */
 	if (fmodf(impl->target_buffer, impl->psamples) != 0) {
-		pw_log_warn("sess.latency.msec %f should be an integer multiple of rtp.ptime %f",
-				latency_msec, ptime);
+		pw_log_warn("sess.latency.msec %f should be an integer multiple of rtp.ptime %f %d",
+				latency_msec, ptime, impl->rate);
 		impl->target_buffer = SPA_ROUND_DOWN(impl->target_buffer, impl->psamples);
 	}
 
@@ -902,14 +890,34 @@ struct rtp_stream *rtp_stream_new(struct pw_core *core,
 	} else {
 		/* For receive, and with split sending, we break up the latency
 		 * as half being in stream latency, and the rest in our own
-		 * ringbuffer latency */
+		 * packet buffer latency */
 		pw_properties_setf(props, PW_KEY_NODE_LATENCY, "%d/%d",
 				impl->target_buffer / 2, impl->rate);
 	}
 
+	/* make packets */
+	impl->n_packets = (2*impl->target_buffer*impl->stride + impl->mtu-1) / impl->mtu;
+	impl->n_packets = SPA_MAX(impl->n_packets, min_packets);
+	for (i = 0; i < impl->n_packets; i++) {
+		struct rtp_packet *p;
+
+		p = calloc(1, sizeof(*p) + impl->mtu + 2880 * impl->stride);
+		if (p == NULL) {
+			res = -errno;
+			pw_log_error("can't create packet: %m");
+			goto out;
+		}
+		p->data = SPA_PTROFF(p, sizeof(*p), void);
+		p->maxsize = impl->mtu;
+		p->size = 0;
+		p->tmp_size = 2880 * 4;
+		p->tmp = SPA_PTROFF(p->data, p->maxsize, void);
+		spa_list_append(&impl->free, &p->link);
+	}
+
 	pw_properties_setf(props, "net.mtu", "%u", impl->mtu);
-	pw_properties_setf(props, "rtp.media", "%s", impl->format_info->media_type);
-	pw_properties_setf(props, "rtp.mime", "%s", impl->format_info->mime);
+	pw_properties_setf(props, "rtp.media", "%s", impl->rtp_format_info->media_type);
+	pw_properties_setf(props, "rtp.mime", "%s", impl->rtp_format_info->mime);
 	pw_properties_setf(props, "rtp.payload", "%u", impl->payload);
 	pw_properties_setf(props, "rtp.ssrc", "%u", impl->ssrc);
 	pw_properties_setf(props, "rtp.rate", "%u", impl->rate);
@@ -926,8 +934,7 @@ struct rtp_stream *rtp_stream_new(struct pw_core *core,
 	spa_dll_set_bw(&impl->dll, SPA_DLL_BW_MIN, 128, impl->rate);
 	impl->corr = 1.0;
 
-	impl->stream = pw_stream_new(core, "rtp-session", props);
-	props = NULL;
+	impl->stream = pw_stream_new(core, "rtp-session", spa_steal_ptr(props));
 	if (impl->stream == NULL) {
 		res = -errno;
 		pw_log_error("can't create stream: %m");
@@ -1014,130 +1021,317 @@ struct rtp_stream *rtp_stream_new(struct pw_core *core,
 	return (struct rtp_stream*)impl;
 out:
 	pw_properties_free(props);
+	if (impl) {
+		if (impl->stream)
+			pw_stream_destroy(impl->stream);
+		if (impl->data_loop)
+			pw_context_release_loop(impl->context, impl->data_loop);
+		free(impl);
+	}
 	errno = -res;
 	return NULL;
 }
 
 void rtp_stream_destroy(struct rtp_stream *s)
 {
-	struct impl *impl = (struct impl*)s;
+	rtp_stream_emit_destroy(s);
 
-	rtp_stream_emit_destroy(impl);
+	if (s->deinit)
+		s->deinit(s, s->direction);
 
-	if (impl->deinit)
-		impl->deinit(impl, impl->direction);
+	if (s->ptp_sender)
+		pw_filter_destroy(s->ptp_sender);
 
-	if (impl->ptp_sender)
-		pw_filter_destroy(impl->ptp_sender);
+	if (s->stream)
+		pw_stream_destroy(s->stream);
 
-	if (impl->stream)
-		pw_stream_destroy(impl->stream);
+	if (s->timer)
+		pw_loop_destroy_source(s->data_loop, s->timer);
 
-	if (impl->timer)
-		pw_loop_destroy_source(impl->data_loop, impl->timer);
+	if (s->data_loop)
+		pw_context_release_loop(s->context, s->data_loop);
 
-	if (impl->data_loop)
-		pw_context_release_loop(impl->context, impl->data_loop);
-
-	spa_hook_list_clean(&impl->listener_list);
-	free(impl);
+	spa_hook_list_clean(&s->listener_list);
+	free(s);
 }
 
 int rtp_stream_update_properties(struct rtp_stream *s, const struct spa_dict *dict)
 {
-	struct impl *impl = (struct impl*)s;
-	return pw_stream_update_properties(impl->stream, dict);
+	return pw_stream_update_properties(s->stream, dict);
 }
 
-int rtp_stream_receive_packet(struct rtp_stream *s, uint8_t *buffer, size_t len,
+struct rtp_packet *rtp_stream_peek_pending_packet(struct rtp_stream *s)
+{
+	struct rtp_packet *p;
+
+	if (spa_list_is_empty(&s->free)) {
+		if (spa_list_is_empty(&s->queued)) {
+			errno = EPIPE;
+			return NULL;
+		}
+		p = spa_list_first(&s->queued, struct rtp_packet, link);
+		s->num_queued--;
+		spa_list_remove(&p->link);
+		spa_list_append(&s->free, &p->link);
+
+		if (s->num_queued > 0) {
+			struct rtp_packet *q;
+			q = spa_list_first(&s->queued, struct rtp_packet, link);
+			s->head_timestamp = q->timestamp;
+		} else {
+			s->head_timestamp = s->tail_timestamp = 0;
+		}
+	}
+	p = spa_list_first(&s->free, struct rtp_packet, link);
+	return p;
+}
+
+void rtp_stream_queue_packet(struct rtp_stream *s, struct rtp_packet *p)
+{
+	spa_list_remove(&p->link);
+	spa_list_append(&s->queued, &p->link);
+	s->num_queued++;
+	if (p == spa_list_first(&s->queued, struct rtp_packet, link))
+		s->head_timestamp = p->timestamp;
+	s->tail_timestamp = p->timestamp;
+}
+
+void rtp_stream_dequeue_packet(struct rtp_stream *s, struct rtp_packet *p)
+{
+	spa_list_remove(&p->link);
+	s->num_queued--;
+	spa_list_append(&s->free, &p->link);
+}
+
+void rtp_stream_queue_iov(struct rtp_stream *s, struct iovec *iov, int n_iov)
+{
+	struct rtp_packet *p;
+	int i;
+
+	p = rtp_stream_get_free_packet(s);
+	for (i = 0; i < n_iov; i ++) {
+		memcpy(SPA_PTROFF(p->data, p->size, void), iov[i].iov_base, iov[i].iov_len);
+		p->size += iov[i].iov_len;
+	}
+	rtp_stream_queue_packet(s, p);
+}
+
+struct rtp_packet *rtp_stream_get_free_packet(struct rtp_stream *s)
+{
+	struct rtp_packet *p = rtp_stream_peek_pending_packet(s);
+	if (p) {
+		p->size = 0;
+		p->decoded = NULL;
+	}
+	return p;
+}
+
+void rtp_stream_clear_pending_packet(struct rtp_stream *s)
+{
+	rtp_stream_get_free_packet(s);
+}
+
+void rtp_stream_clear_queued_packets(struct rtp_stream *s)
+{
+	struct rtp_packet *q;
+	spa_list_consume(q, &s->queued, link) {
+		spa_list_remove(&q->link);
+		spa_list_append(&s->free, &q->link);
+	}
+	s->num_queued = 0;
+	s->head_timestamp = 0;
+	s->tail_timestamp = 0;
+}
+
+void rtp_stream_send_packet(struct rtp_stream *s, struct rtp_packet *p)
+{
+	rtp_stream_call_send_packet(s, p);
+	rtp_stream_dequeue_packet(s, p);
+}
+
+int rtp_stream_receive_packet(struct rtp_stream *s, struct rtp_packet *p,
 				uint64_t current_time)
 {
-	struct impl *impl = (struct impl*)s;
-	return impl->receive_rtp(impl, buffer, len, current_time);
+	struct rtp_header *hdr;
+	uint8_t *buffer;
+	size_t len;
+	ssize_t hlen;
+	uint32_t packet_ssrc;
+	uint16_t seq;
+	uint32_t timestamp;
+	int res = 0;
+	struct rtp_packet *q, *tq;
+
+	buffer = p->data;
+	len = p->size;
+
+	if (len < 12)
+		goto short_packet;
+
+	hdr = (struct rtp_header*)buffer;
+	if (hdr->v != 2)
+		goto invalid_version;
+
+	hlen = 12 + hdr->cc * 4;
+	if (hdr->x) {
+		if (hlen + 4 > (ssize_t)len)
+			goto invalid_len;
+		hlen += 4 + ntohs(*(uint16_t *)(buffer + hlen + 2)) * 4;
+	}
+	if (hlen > (ssize_t)len)
+		goto invalid_len;
+
+	packet_ssrc = ntohl(hdr->ssrc);
+
+	if (s->have_ssrc && s->ssrc != packet_ssrc)
+		goto unexpected_ssrc;
+	s->ssrc = packet_ssrc;
+	s->have_ssrc = !s->ignore_ssrc;
+
+	seq = ntohs(hdr->sequence_number);
+	timestamp = ntohl(hdr->timestamp) - s->ts_offset;
+
+	s->receiving = true;
+	s->last_recv_timestamp = current_time;
+
+	p->hlen = hlen;
+	p->seq = seq;
+	p->timestamp = timestamp + s->target_buffer;
+	p->nsec = current_time;
+
+	spa_list_for_each_safe_reverse(q, tq, &s->queued, link) {
+		if (rtp_seqnum_delta(q->seq, p->seq) < 0)
+			break;
+		if (q->seq == p->seq)
+			goto duplicate_seq;
+	}
+	spa_list_remove(&p->link);
+	spa_list_prepend(&q->link, &p->link);
+	s->num_queued++;
+
+	if (p == spa_list_first(&s->queued, struct rtp_packet, link))
+		s->head_timestamp = p->timestamp;
+	if (p == spa_list_last(&s->queued, struct rtp_packet, link))
+		s->tail_timestamp = p->timestamp;
+
+	pw_log_trace_fp("got packet %u %08x", p->seq, p->timestamp);
+
+	return res;
+
+short_packet:
+	pw_log_warn("short packet received");
+	return -EINVAL;
+invalid_version:
+	pw_log_warn("invalid RTP version");
+	spa_debug_log_mem(pw_log_get(), SPA_LOG_LEVEL_INFO, 0, buffer, len);
+	return -EPROTO;
+invalid_len:
+	pw_log_warn("invalid RTP length");
+	return -EINVAL;
+unexpected_ssrc:
+	if (!s->fixed_ssrc) {
+		/* We didn't have a configured SSRC, and there's more than one SSRC on
+		 * this address/port pair */
+		pw_log_warn("unexpected SSRC (expected %u != %u)", s->ssrc,
+			packet_ssrc);
+	}
+	return -EINVAL;
+duplicate_seq:
+	pw_log_warn("duplicate seq %u found", p->seq);
+	return -EINVAL;
+
+}
+int rtp_stream_resend_packets(struct rtp_stream *s, uint16_t seq, uint16_t num)
+{
+	struct rtp_packet *p;
+
+	pw_log_info("resend %d/%d", seq, num);
+
+	spa_list_for_each(p, &s->queued, link) {
+		if (num == 0 || p->seq > seq)
+			break;
+		if (p->seq < seq)
+			continue;
+
+		rtp_stream_call_send_packet(s, p);
+		seq++;
+		num--;
+	}
+	return 0;
 }
 
 uint64_t rtp_stream_get_nsec(struct rtp_stream *s)
 {
-	struct impl *impl = (struct impl*)s;
-	return pw_stream_get_nsec(impl->stream);
+	return pw_stream_get_nsec(s->stream);
 }
 
 uint64_t rtp_stream_get_time(struct rtp_stream *s, uint32_t *rate)
 {
-	struct impl *impl = (struct impl*)s;
-	struct spa_io_position *pos = impl->io_position;
+	struct spa_io_position *pos = s->io_position;
 
 	if (pos == NULL)
 		return -EIO;
 
-	*rate = impl->rate;
-	return pos->clock.position * impl->rate *
+	*rate = s->rate;
+	return pos->clock.position * s->rate *
 		pos->clock.rate.num / pos->clock.rate.denom;
 }
 
 uint16_t rtp_stream_get_seq(struct rtp_stream *s)
 {
-	struct impl *impl = (struct impl*)s;
-	return impl->seq;
+	return s->seq;
 }
 
 size_t rtp_stream_get_mtu(struct rtp_stream *s)
 {
-	struct impl *impl = (struct impl*)s;
-	return impl->mtu;
+	return s->mtu;
 }
 
 void rtp_stream_set_first(struct rtp_stream *s)
 {
-	struct impl *impl = (struct impl*)s;
-
-	impl->first = true;
+	s->first = true;
 }
 
 void rtp_stream_set_error(struct rtp_stream *s, int res, const char *error)
 {
-	struct impl *impl = (struct impl*)s;
-	pw_stream_set_error(impl->stream, res, "%s: %s", error, spa_strerror(res));
+	pw_stream_set_error(s->stream, res, "%s: %s", error, spa_strerror(res));
 }
 
 enum pw_stream_state rtp_stream_get_state(struct rtp_stream *s, const char **error)
 {
-	struct impl *impl = (struct impl*)s;
-
-	return pw_stream_get_state(impl->stream, error);
+	return pw_stream_get_state(s->stream, error);
 }
 int rtp_stream_set_active(struct rtp_stream *s, bool active)
 {
-	struct impl *impl = (struct impl*)s;
-
-	return pw_stream_set_active(impl->stream, active);
+	return pw_stream_set_active(s->stream, active);
 }
 
 int rtp_stream_set_param(struct rtp_stream *s, uint32_t id, const struct spa_pod *param)
 {
-	struct impl *impl = (struct impl*)s;
-
-	return pw_stream_set_param(impl->stream, id, param);
+	return pw_stream_set_param(s->stream, id, param);
 }
 
 int rtp_stream_update_params(struct rtp_stream *s,
 			const struct spa_pod **params,
 			uint32_t n_params)
 {
-	struct impl *impl = (struct impl*)s;
-	return pw_stream_update_params(impl->stream, params, n_params);
+	return pw_stream_update_params(s->stream, params, n_params);
 }
 
 void rtp_stream_update_process_latency(struct rtp_stream *s,
 				const struct spa_process_latency_info *process_latency)
 {
-	struct impl *impl = (struct impl*)s;
-
-	if (spa_process_latency_info_compare(&impl->process_latency, process_latency) == 0)
+	if (spa_process_latency_info_compare(&s->process_latency, process_latency) == 0)
 		return;
 
-	spa_memcpy(&(impl->process_latency), process_latency,
+	spa_memcpy(&(s->process_latency), process_latency,
 		sizeof(const struct spa_process_latency_info));
 
-	update_latency_params(impl);
+	update_latency_params(s);
+}
+
+int rtp_stream_run_in_data_loop(struct rtp_stream *s, spa_invoke_func_t func,
+	uint32_t seq, const void *data, size_t size, void *user_data)
+{
+	return pw_loop_locked(s->data_loop, func, seq, data, size, user_data);
 }

@@ -13,6 +13,7 @@ context.properties = {
     #library.name.system                   = support/libspa-support
     #context.data-loop.library.name.system = support/libspa-support
     #support.dbus                          = true
+    library.use-fallback                   = false
     #link.max-buffers                      = 64
     link.max-buffers                       = 16                       # version < 3 clients can't handle more
     #mem.warn-mlock                        = false
@@ -70,10 +71,27 @@ context.spa-libs = {
     # regular expression to a library name that should contain
     # that factory.
     #
+    support.*       = support/libspa-support
     audio.convert.* = audioconvert/libspa-audioconvert
     audio.adapt     = audioconvert/libspa-audioconvert
     api.alsa.*      = alsa/libspa-alsa
-    support.*       = support/libspa-support
+    #api.v4l2.*      = v4l2/libspa-v4l2
+    #api.libcamera.* = libcamera/libspa-libcamera
+    #api.bluez5.*    = bluez5/libspa-bluez5
+    #api.vulkan.*    = vulkan/libspa-vulkan
+    #video.convert.* = videoconvert/libspa-videoconvert
+    #video.adapt     = videoconvert/libspa-videoconvert
+    audio.mixer.*   = audiomixer/libspa-audiomixer
+    control.mixer   = control/libspa-control
+    #audio.aec       = aec/libspa-aec-webrtc
+    #filter.graph.plugin.ffmpeg  = filter-graph/libspa-filter-graph-plugin-ffmpeg
+    #filter.graph.plugin.onnx    = filter-graph/libspa-filter-graph-plugin-onnx
+    #filter.graph.plugin.ebur128 = filter-graph/libspa-filter-graph-plugin-ebur128
+    #filter.graph.plugin.sofa    = filter-graph/libspa-filter-graph-plugin-sofa
+    #filter.graph.plugin.ladspa  = filter-graph/libspa-filter-graph-plugin-ladspa
+    #filter.graph.plugin.lv2     = filter-graph/libspa-filter-graph-plugin-lv2
+    #filter.graph.plugin.builtin = filter-graph/libspa-filter-graph-plugin-builtin
+    #filter.graph    = filter-graph/libspa-filter-graph
 }
 
 context.modules = [
@@ -97,6 +115,11 @@ context.modules = [
             rt.prio      = @rtprio_server@
             #rt.time.soft = -1
             #rt.time.hard = -1
+            #rlimits.enabled = true
+            #rtportal.enabled = true
+            #rtkit.enabled = true
+            #uclamp.min = 0
+            #uclamp.max = 1024
         }
         flags = [ ifexists nofail ]
     }
@@ -338,7 +361,9 @@ context.objects = [
             #channelmix.hilbert-taps = 0
             #channelmix.disable     = false
             #dither.noise = 0
-            #node.param.Props      = {
+            #fade.gap               = 0
+            #fade.duration          = 0.020
+            #node.param.Props       = {
             #    params = [
             #        audio.channels 6
             #    ]
@@ -404,7 +429,9 @@ context.objects = [
             #channelmix.hilbert-taps = 0
             #channelmix.disable     = false
             #dither.noise = 0
-            #node.param.Props      = {
+            #fade.gap               = 0
+            #fade.duration          = 0.020
+            #node.param.Props       = {
             #    params = [
             #        audio.format  S16
             #    ]

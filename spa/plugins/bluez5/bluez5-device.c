@@ -410,7 +410,7 @@ static void emit_node_props(struct impl *this, struct node *node, bool full)
 			SPA_PROP_latencyOffsetNsec, SPA_POD_Long(node->latency_offset),
 			0);
 	}
-	event = spa_pod_builder_pop(&b, &f[0]);
+	event = (struct spa_event*)spa_pod_builder_pop(&b, &f[0]);
 
 	spa_device_emit_event(&this->hooks, event);
 }
@@ -893,6 +893,7 @@ static void dynamic_node_transport_state_changed(void *data,
 		if (SPA_FLAG_IS_SET(this->id, DYNAMIC_NODE_ID_FLAG)) {
 			SPA_FLAG_CLEAR(this->id, DYNAMIC_NODE_ID_FLAG);
 			spa_bt_transport_keepalive(t, false);
+			spa_bt_transport_emit_remove_node(t);
 			spa_device_emit_object_info(&impl->hooks, this->id, NULL);
 		}
 	}
@@ -929,7 +930,7 @@ static void dynamic_node_volume_changed(void *data)
 	spa_pod_builder_add_object(&b,
 			SPA_TYPE_OBJECT_Props, SPA_EVENT_DEVICE_Props,
 			SPA_PROP_volume, SPA_POD_Float(t_volume->volume));
-	event = spa_pod_builder_pop(&b, &f[0]);
+	event = (struct spa_event*)spa_pod_builder_pop(&b, &f[0]);
 
 	spa_log_debug(impl->log, "dynamic node %d: volume %d changed %f, profile %d",
 			node->id, volume_id, t_volume->volume, node->transport->profile);
@@ -1311,6 +1312,9 @@ static int emit_nodes(struct impl *this)
 {
 	struct spa_bt_transport *t;
 
+	if (!this->bt_dev)
+		return 0;
+
 	switch (this->profile) {
 	case DEVICE_PROFILE_BAP:
 	case DEVICE_PROFILE_BAP_SINK:
@@ -1517,6 +1521,8 @@ static void emit_remove_nodes(struct impl *this)
 		struct node * node = &this->nodes[i];
 		node_offload_set_active(node, false);
 		if (node->transport) {
+			if (node->active)
+				spa_bt_transport_emit_remove_node(node->transport);
 			spa_hook_remove(&node->transport_listener);
 			node->transport = NULL;
 		}
@@ -1860,6 +1866,15 @@ static void device_switch_profile(void *userdata)
 	set_profile(this, profile, 0, false);
 }
 
+static void device_destroy(void *userdata)
+{
+	struct impl *this = userdata;
+
+	/* The device is being freed; it must not be dereferenced anymore. */
+	spa_hook_remove(&this->bt_dev_listener);
+	this->bt_dev = NULL;
+}
+
 static const struct spa_bt_device_events bt_dev_events = {
 	SPA_VERSION_BT_DEVICE_EVENTS,
 	.connected = device_connected,
@@ -1868,6 +1883,7 @@ static const struct spa_bt_device_events bt_dev_events = {
 	.profiles_changed = profiles_changed,
 	.device_set_changed = device_set_changed,
 	.switch_profile = device_switch_profile,
+	.destroy = device_destroy,
 };
 
 static int impl_add_listener(void *object,
@@ -2935,6 +2951,9 @@ static int impl_enum_params(void *object, int seq,
 	spa_return_val_if_fail(this != NULL, -EINVAL);
 	spa_return_val_if_fail(num != 0, -EINVAL);
 
+	if (!this->bt_dev)
+		return -ENODEV;
+
 	result.id = id;
 	result.next = start;
       next:
@@ -3144,7 +3163,7 @@ static int node_set_mute(struct impl *this, struct node *node, bool mute)
 			SPA_TYPE_OBJECT_Props, SPA_EVENT_DEVICE_Props,
 			SPA_PROP_mute, SPA_POD_Bool(mute),
 			SPA_PROP_softMute, SPA_POD_Bool(mute));
-	event = spa_pod_builder_pop(&b, &f[0]);
+	event = (struct spa_event*)spa_pod_builder_pop(&b, &f[0]);
 
 	spa_device_emit_event(&this->hooks, event);
 
@@ -3174,7 +3193,7 @@ static int node_set_latency_offset(struct impl *this, struct node *node, int64_t
 	spa_pod_builder_add_object(&b,
 			SPA_TYPE_OBJECT_Props, SPA_EVENT_DEVICE_Props,
 			SPA_PROP_latencyOffsetNsec, SPA_POD_Long(latency_offset));
-	event = spa_pod_builder_pop(&b, &f[0]);
+	event = (struct spa_event*)spa_pod_builder_pop(&b, &f[0]);
 
 	spa_device_emit_event(&this->hooks, event);
 
@@ -3320,6 +3339,9 @@ static int impl_set_param(void *object,
 
 	spa_return_val_if_fail(this != NULL, -EINVAL);
 
+	if (!this->bt_dev)
+		return -ENODEV;
+
 	switch (id) {
 	case SPA_PARAM_Profile:
 	{
@@ -3362,7 +3384,7 @@ static int impl_set_param(void *object,
 				SPA_TYPE_OBJECT_ParamRoute, NULL,
 				SPA_PARAM_ROUTE_index, SPA_POD_Int(&idx),
 				SPA_PARAM_ROUTE_device, SPA_POD_Int(&device),
-				SPA_PARAM_ROUTE_props, SPA_POD_OPT_Pod(&props),
+				SPA_PARAM_ROUTE_props, SPA_POD_OPT_PodObject(&props),
 				SPA_PARAM_ROUTE_save, SPA_POD_OPT_Bool(&save))) < 0) {
 			spa_log_warn(this->log, "can't parse route");
 			spa_debug_log_pod(this->log, SPA_LOG_LEVEL_DEBUG, 0, NULL, param);
@@ -3497,8 +3519,15 @@ filter_bluez_device_setting(struct impl *this, const struct spa_dict *dict)
 	{
 		const struct spa_dict_item *it = &dict->items[i];
 		if (it->key != NULL && strncmp(it->key, "bluez", 5) == 0 && it->value != NULL) {
+			char *key = strdup(it->key);
+			char *value = strdup(it->value);
+			if (key == NULL || value == NULL) {
+				free(key);
+				free(value);
+				continue;
+			}
 			this->setting_items[n_items++] =
-				SPA_DICT_ITEM_INIT(strdup(it->key), strdup(it->value));
+				SPA_DICT_ITEM_INIT(key, value);
 		}
 	}
 	this->setting_dict = SPA_DICT_INIT(this->setting_items, n_items);

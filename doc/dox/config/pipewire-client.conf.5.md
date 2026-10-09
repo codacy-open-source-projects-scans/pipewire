@@ -87,6 +87,8 @@ stream.properties = {
     #dither.noise = 0
     #dither.method = none # rectangular, triangular, triangular-hf, wannamaker3, shaped5
     #debug.wav-path = ""
+    #fade.gap = 0
+    #fade.duration = 0.020
 }
 ```
 
@@ -102,7 +104,7 @@ Some of the properties refer to different aspects of the stream:
 A list of object properties that can be applied to streams can be found in
 \ref props__common_node_properties "pipewire-props(7) Common Node Properties"
 and
-\ref props__audio_converter_properties "pipewire-props(7) Audio Adapter Properties"
+\ref props__audio_adapter_properties "pipewire-props(7) Audio Adapter Properties"
 
 # STREAM RULES  @IDX@ client.conf stream.rules
 

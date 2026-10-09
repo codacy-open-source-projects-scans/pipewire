@@ -45,6 +45,8 @@ module_sources = [
   'module-snapcast-discover.c',
   'module-vban-recv.c',
   'module-vban-send.c',
+  'module-sendspin-recv.c',
+  'module-sendspin-send.c',
   'module-session-manager.c',
   'module-scheduler-v1.c',
   'module-zeroconf-discover.c',
@@ -332,38 +334,38 @@ pipewire_module_protocol_pulse_sources = [
   'module-protocol-pulse/stream.c',
   'module-protocol-pulse/utils.c',
   'module-protocol-pulse/volume.c',
-  'module-protocol-pulse/modules/module-alsa-sink.c',
-  'module-protocol-pulse/modules/module-alsa-source.c',
-  'module-protocol-pulse/modules/module-always-sink.c',
-  'module-protocol-pulse/modules/module-combine-sink.c',
-  'module-protocol-pulse/modules/module-device-manager.c',
-  'module-protocol-pulse/modules/module-device-restore.c',
-  'module-protocol-pulse/modules/module-echo-cancel.c',
-  'module-protocol-pulse/modules/module-jackdbus-detect.c',
-  'module-protocol-pulse/modules/module-ladspa-sink.c',
-  'module-protocol-pulse/modules/module-ladspa-source.c',
-  'module-protocol-pulse/modules/module-loopback.c',
-  'module-protocol-pulse/modules/module-native-protocol-tcp.c',
-  'module-protocol-pulse/modules/module-null-sink.c',
-  'module-protocol-pulse/modules/module-pipe-source.c',
-  'module-protocol-pulse/modules/module-pipe-sink.c',
-  'module-protocol-pulse/modules/module-raop-discover.c',
-  'module-protocol-pulse/modules/module-remap-sink.c',
-  'module-protocol-pulse/modules/module-remap-source.c',
-  'module-protocol-pulse/modules/module-roc-sink.c',
-  'module-protocol-pulse/modules/module-roc-sink-input.c',
-  'module-protocol-pulse/modules/module-roc-source.c',
-  'module-protocol-pulse/modules/module-rtp-recv.c',
-  'module-protocol-pulse/modules/module-rtp-send.c',
-  'module-protocol-pulse/modules/module-simple-protocol-tcp.c',
-  'module-protocol-pulse/modules/module-stream-restore.c',
-  'module-protocol-pulse/modules/module-switch-on-connect.c',
-  'module-protocol-pulse/modules/module-tunnel-sink.c',
-  'module-protocol-pulse/modules/module-tunnel-source.c',
-  'module-protocol-pulse/modules/module-virtual-sink.c',
-  'module-protocol-pulse/modules/module-virtual-source.c',
-  'module-protocol-pulse/modules/module-x11-bell.c',
-  'module-protocol-pulse/modules/module-zeroconf-discover.c',
+  'module-protocol-pulse/modules/pulse-module-alsa-sink.c',
+  'module-protocol-pulse/modules/pulse-module-alsa-source.c',
+  'module-protocol-pulse/modules/pulse-module-always-sink.c',
+  'module-protocol-pulse/modules/pulse-module-combine-sink.c',
+  'module-protocol-pulse/modules/pulse-module-device-manager.c',
+  'module-protocol-pulse/modules/pulse-module-device-restore.c',
+  'module-protocol-pulse/modules/pulse-module-echo-cancel.c',
+  'module-protocol-pulse/modules/pulse-module-jackdbus-detect.c',
+  'module-protocol-pulse/modules/pulse-module-ladspa-sink.c',
+  'module-protocol-pulse/modules/pulse-module-ladspa-source.c',
+  'module-protocol-pulse/modules/pulse-module-loopback.c',
+  'module-protocol-pulse/modules/pulse-module-native-protocol-tcp.c',
+  'module-protocol-pulse/modules/pulse-module-null-sink.c',
+  'module-protocol-pulse/modules/pulse-module-pipe-source.c',
+  'module-protocol-pulse/modules/pulse-module-pipe-sink.c',
+  'module-protocol-pulse/modules/pulse-module-raop-discover.c',
+  'module-protocol-pulse/modules/pulse-module-remap-sink.c',
+  'module-protocol-pulse/modules/pulse-module-remap-source.c',
+  'module-protocol-pulse/modules/pulse-module-roc-sink.c',
+  'module-protocol-pulse/modules/pulse-module-roc-sink-input.c',
+  'module-protocol-pulse/modules/pulse-module-roc-source.c',
+  'module-protocol-pulse/modules/pulse-module-rtp-recv.c',
+  'module-protocol-pulse/modules/pulse-module-rtp-send.c',
+  'module-protocol-pulse/modules/pulse-module-simple-protocol-tcp.c',
+  'module-protocol-pulse/modules/pulse-module-stream-restore.c',
+  'module-protocol-pulse/modules/pulse-module-switch-on-connect.c',
+  'module-protocol-pulse/modules/pulse-module-tunnel-sink.c',
+  'module-protocol-pulse/modules/pulse-module-tunnel-source.c',
+  'module-protocol-pulse/modules/pulse-module-virtual-sink.c',
+  'module-protocol-pulse/modules/pulse-module-virtual-source.c',
+  'module-protocol-pulse/modules/pulse-module-x11-bell.c',
+  'module-protocol-pulse/modules/pulse-module-zeroconf-discover.c',
 ]
 
 if snap_dep.found() and glib2_snap_dep.found() and gio2_snap_dep.found() and apparmor_snap_dep.found()
@@ -382,7 +384,7 @@ endif
 
 if avahi_dep.found()
   pipewire_module_protocol_pulse_sources += [
-    'module-protocol-pulse/modules/module-zeroconf-publish.c',
+    'module-protocol-pulse/modules/pulse-module-zeroconf-publish.c',
   ]
   pipewire_module_protocol_pulse_sources += zeroconf_sources
   pipewire_module_protocol_pulse_deps += zeroconf_deps
@@ -390,7 +392,7 @@ endif
 
 if gsettings_gio_dep.found()
   pipewire_module_protocol_pulse_sources += [
-    'module-protocol-pulse/modules/module-gsettings.c',
+    'module-protocol-pulse/modules/pulse-module-gsettings.c',
   ]
   pipewire_module_protocol_pulse_deps += gsettings_gio_dep
   cdata.set('HAVE_GIO', true)
@@ -644,6 +646,30 @@ if build_module_raop
     install_rpath: modules_install_dir,
     dependencies : [pipewire_module_rtp_common_dep, openssl_lib],
   )
+  if get_option('tests').allowed()
+    test('pw-test-raop-auth',
+      executable('pw-test-raop-auth',
+        [ 'module-raop/test-auth.c',
+          'module-raop/rtsp-client.c' ],
+        include_directories : [configinc],
+        dependencies : [pipewire_module_rtp_common_dep, openssl_lib],
+      ),
+      env : [
+        'SPA_PLUGIN_DIR=@0@'.format(spa_dep.get_variable('plugindir')),
+      ],
+    )
+    test('pw-test-raop-rtsp-client',
+      executable('pw-test-raop-rtsp-client',
+        [ 'module-raop/test-rtsp-client.c',
+          'module-raop/rtsp-client.c' ],
+        include_directories : [configinc],
+        dependencies : [spa_dep, spa_support_dep, pipewire_dep],
+      ),
+      env : [
+        'SPA_PLUGIN_DIR=@0@'.format(spa_dep.get_variable('plugindir')),
+      ],
+    )
+  endif
 endif
 summary({'raop-sink (requires OpenSSL)': build_module_raop}, bool_yn: true, section: 'Optional Modules')
 
@@ -821,13 +847,15 @@ if build_module_avb
       'module-avb/es-builder.c',
       'module-avb/avdecc.c',
       'module-avb/descriptors.c',
+      'module-avb/gptp.c',
       'module-avb/maap.c',
       'module-avb/mmrp.c',
       'module-avb/mrp.c',
       'module-avb/msrp.c',
       'module-avb/mvrp.c',
       'module-avb/srp.c',
-      'module-avb/stream.c'
+      'module-avb/stream.c',
+      'module-avb/strings.c'
       ],
     include_directories : [configinc],
     install : true,

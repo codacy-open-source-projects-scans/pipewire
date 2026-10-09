@@ -39,6 +39,7 @@ SPA_LOG_TOPIC_DEFINE_STATIC(log_topic, "spa.driver");
 #define DEFAULT_CLOCK_PREFIX	"clock.system"
 #define DEFAULT_CLOCK_ID	CLOCK_MONOTONIC
 #define DEFAULT_RESYNC_MS	10
+#define DEFAULT_FORCE_TRACKING	false
 
 #define CLOCK_OFFSET_NAVG	20
 #define CLOCK_OFFSET_MAX_ERR	(50 * SPA_NSEC_PER_USEC)
@@ -60,6 +61,7 @@ struct props {
 	float resync_ms;
 	char clock_device[CLOCK_NAME_MAX];
 	char clock_interface[CLOCK_NAME_MAX];
+	bool force_tracking;
 };
 
 struct clock_offset {
@@ -121,6 +123,7 @@ static void reset_props(struct props *props)
 	props->freewheel_wait = DEFAULT_FREEWHEEL_WAIT;
 	props->resync_ms = DEFAULT_RESYNC_MS;
 	reset_props_strings(props);
+	props->force_tracking = DEFAULT_FORCE_TRACKING;
 }
 
 static const struct clock_info {
@@ -358,10 +361,12 @@ static void on_timeout(struct spa_source *source)
 {
 	struct impl *this = source->data;
 	uint64_t expirations, nsec, duration, current_time, current_position, position;
+	uint64_t time_since_nsec;
 	uint32_t rate;
-	double corr = 1.0, err = 0.0;
+	double corr = 1.0, err = 0.0, abs_err = 0.0;
 	int res;
 	bool timer_was_canceled = false;
+	bool report_discont = false;
 
 	/* See set_timeout() for an explanation about timer cancelation. */
 
@@ -379,6 +384,7 @@ static void on_timeout(struct spa_source *source)
 			return;
 		}
 	}
+	report_discont = timer_was_canceled;
 
 	if (SPA_LIKELY(this->position)) {
 		duration = this->position->clock.target_duration;
@@ -404,11 +410,22 @@ static void on_timeout(struct spa_source *source)
 	 * and this->clock->position values are correct anymore. (Timer
 	 * cancellations happen when the realtime clock is being used by
 	 * this driver and the user modified the realtime clock for example.)
+	 *
+	 * time_since_nsec is an extra factor that corrects inaccuracies when
+	 * the on_timeout() callback is executed with a slight delay. This
+	 * delay is factored into current_time and later in the err value,
+	 * which means that the DLL has to compensate for it. time_since_nsec
+	 * estimates the delay, and subtracts that estimation, leading to
+	 * a reduced impact on current_time, and thus, the DLL does not have
+	 * to compensate as much, which increases the control loop stability.
 	 */
-	if (this->props.freewheel || SPA_UNLIKELY(timer_was_canceled))
+	if (this->props.freewheel || SPA_UNLIKELY(timer_was_canceled)) {
 		nsec = gettime_nsec(this, this->timer_clockid);
-	else
+		time_since_nsec = 0;
+	} else {
 		nsec = this->next_time;
+		time_since_nsec = gettime_nsec(this, this->timer_clockid) - this->next_time;
+	}
 
 	/* "tracking" means that the driver is following a clock that is not
 	 * usable by timerfd. It is an entirely separate clock, for example,
@@ -416,10 +433,14 @@ static void on_timeout(struct spa_source *source)
 	 * always the monotonic clock, and this->props.clock_id is that entirely
 	 * separate clock. If tracking is false, then this->props.clock_id
 	 * equals timer_clockid, so "nsec" can directly be used as the current
-	 * driver clock time in that case. */
-	if (this->tracking)
+	 * driver clock time in that case.
+	 * (See the comment above for the purpose of time_since_nsec.)
+	 * Note that it is possible to force tracking even if the clock is usable
+	 * by timerfd, by setting the "sync.force-tracking" property to true. */
+	if (this->tracking) {
 		current_time = gettime_nsec(this, this->props.clock_id);
-	else
+		current_time -= SPA_LIKELY(current_time >= time_since_nsec) ? time_since_nsec : 0;
+	} else
 		current_time = nsec;
 
 	current_position = scale_u64(current_time, rate, SPA_NSEC_PER_SEC);
@@ -459,13 +480,21 @@ static void on_timeout(struct spa_source *source)
 		 * the graph clock elapsed time, feed this error into the
 		 * dll and adjust the timeout of our MONOTONIC clock. */
 		err = (double)position - (double)current_position;
-		if (fabs(err) > this->max_error) {
-			if (fabs(err) > this->max_resync) {
-				spa_log_warn(this->log, "err %f > max_resync %f, resetting",
-						err, this->max_resync);
-				spa_dll_set_bw(&this->dll, SPA_DLL_BW_MIN, duration, rate);
+		abs_err = fabs(err);
+		if (abs_err > this->max_error) {
+			if (abs_err > this->max_resync) {
+				if (abs_err > (2 * this->max_resync)) {
+					spa_log_warn(this->log, "err %f > 2 * max_resync %f, reinitializing",
+							err, this->max_resync);
+					spa_dll_init(&this->dll);
+				} else {
+					spa_log_warn(this->log, "err %f > max_resync %f, resetting",
+							err, this->max_resync);
+				}
+				spa_dll_set_bw(&this->dll, SPA_DLL_BW_MAX, duration, rate);
 				position = current_position;
 				err = 0.0;
+				report_discont = true;
 			} else {
 				err = SPA_CLAMPD(err, -this->max_error, this->max_error);
 			}
@@ -479,7 +508,11 @@ static void on_timeout(struct spa_source *source)
 
 	if (SPA_UNLIKELY((this->next_time - this->base_time) > BW_PERIOD)) {
 		this->base_time = this->next_time;
-		spa_log_debug(this->log, "%p: rate:%f "
+		/* Downgrade to TRACE in nominal operation to avoid log flooding. */
+		spa_log_lev(this->log,
+				(fabs(corr - 1.0) > 0.001 || fabs(err) > this->max_error * 0.5)
+					? SPA_LOG_LEVEL_DEBUG : SPA_LOG_LEVEL_TRACE,
+			"%p: rate:%f "
 			"bw:%f dur:%"PRIu64" max:%f drift:%f",
 				this, corr, this->dll.bw, duration,
 				this->max_error, err);
@@ -498,7 +531,7 @@ static void on_timeout(struct spa_source *source)
 		this->clock->next_nsec = this->next_time + nsec_offset;
 
 		SPA_FLAG_UPDATE(this->clock->flags, SPA_IO_CLOCK_FLAG_DISCONT,
-			timer_was_canceled);
+			report_discont);
 	}
 
 	spa_node_call_ready(&this->callbacks,
@@ -543,6 +576,9 @@ static int impl_node_send_command(void *object, const struct spa_command *comman
 	case SPA_NODE_COMMAND_Suspend:
 	case SPA_NODE_COMMAND_Pause:
 		do_stop(this);
+		break;
+	case SPA_NODE_COMMAND_ParamBegin:
+	case SPA_NODE_COMMAND_ParamEnd:
 		break;
 	default:
 		return -ENOTSUP;
@@ -758,7 +794,7 @@ static bool parse_clock_id(struct impl *this, const char *s)
 
 static bool parse_clock_device(struct impl *this, const char *s)
 {
-	int fd = open(s, O_RDONLY);
+	int fd = open(s, O_RDONLY | O_CLOEXEC);
 	if (fd == -1) {
 		spa_log_info(this->log, "failed to open clock device '%s': %m", s);
 		return false;
@@ -927,9 +963,10 @@ static int impl_clear(struct spa_handle *handle)
 
 	this = (struct impl *) handle;
 
-	spa_loop_locked(this->data_loop, do_remove_timer, 0, NULL, 0, this);
-	spa_system_close(this->data_system, this->timer_source.fd);
-
+	if (this->timer_source.data) {
+		spa_loop_locked(this->data_loop, do_remove_timer, 0, NULL, 0, this);
+		spa_system_close(this->data_system, this->timer_source.fd);
+	}
 	if (this->clock_fd != -1)
 		close(this->clock_fd);
 
@@ -952,6 +989,7 @@ impl_init(const struct spa_handle_factory *factory,
 {
 	struct impl *this;
 	uint32_t i;
+	int res;
 
 	spa_return_val_if_fail(factory != NULL, -EINVAL);
 	spa_return_val_if_fail(handle != NULL, -EINVAL);
@@ -1022,6 +1060,9 @@ impl_init(const struct spa_handle_factory *factory,
 			this->props.freewheel_wait = atoi(s);
 		} else if (spa_streq(k, "resync.ms")) {
 			this->props.resync_ms = (float)atof(s);
+		} else if (spa_streq(k, "sync.force-tracking")) {
+			this->props.force_tracking = spa_atob(s);
+			spa_log_info(this->log, "forcing DLL based clock tracking: %d", this->props.force_tracking);
 		}
 	}
 	if (this->props.clock_name[0] == '\0') {
@@ -1031,24 +1072,29 @@ impl_init(const struct spa_handle_factory *factory,
 	}
 	ensure_clock_name(this);
 
-	this->tracking = !clock_for_timerfd(this->props.clock_id);
+	this->tracking = this->props.force_tracking || !clock_for_timerfd(this->props.clock_id);
 	this->timer_clockid = this->tracking ? CLOCK_MONOTONIC : this->props.clock_id;
 	this->max_error = 128;
 
 	this->nsec_offset.offset = get_nsec_offset(this, NULL);
 	this->nsec_offset.err = 0;
 
+	if ((res = spa_system_timerfd_create(this->data_system,
+			this->timer_clockid, SPA_FD_CLOEXEC | SPA_FD_NONBLOCK)) < 0)
+		goto error;
+
 	this->timer_source.func = on_timeout;
 	this->timer_source.data = this;
-	this->timer_source.fd = spa_system_timerfd_create(this->data_system,
-			this->timer_clockid, SPA_FD_CLOEXEC | SPA_FD_NONBLOCK);
-
+	this->timer_source.fd = res;
 	this->timer_source.mask = SPA_IO_IN;
 	this->timer_source.rmask = 0;
 
 	spa_loop_add_source(this->data_loop, &this->timer_source);
 
 	return 0;
+error:
+	impl_clear(handle);
+	return res;
 }
 
 static const struct spa_interface_info impl_interfaces[] = {

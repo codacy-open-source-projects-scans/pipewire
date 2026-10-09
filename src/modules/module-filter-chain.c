@@ -18,6 +18,7 @@
 #include <spa/utils/overflow.h>
 #include <spa/param/audio/raw-json.h>
 #include <spa/pod/dynamic.h>
+#include <spa/node/type-info.h>
 #include <spa/filter-graph/filter-graph.h>
 
 #include <pipewire/impl.h>
@@ -604,6 +605,15 @@ extern struct spa_handle_factory spa_filter_graph_factory;
  * All input ports samples are checked to find the maximum value per sample. Unused
  * input ports will be ignored and not cause overhead.
  *
+ * ### Min
+ *
+ * Use the `min` plugin if you need to select the minimum value of a number of input ports.
+ *
+ * It has 8 input ports named "In 1" to "In 8" and one output port "Out".
+ *
+ * All input ports samples are checked to find the minimum value per sample. Unused
+ * input ports will be ignored and not cause overhead.
+ *
  * ### dcblock
  *
  * Use the `dcblock` plugin implements a [DC blocker](https://www.dsprelated.com/freebooks/filters/DC_Blocker.html).
@@ -636,38 +646,6 @@ extern struct spa_handle_factory spa_filter_graph_factory;
  * There is also a "Control" input port and an "Notify" output control ports. The
  * control from "Control" will be copied to "Notify" and the control value will be
  * dumped into the INFO log.
- *
- * ### Pipe
- *
- * The `pipe` plugin can be used to filter the audio with another application using pipes
- * for sending and receiving the raw audio.
- *
- * The application needs to consume raw float32 samples from stdin and produce filtered
- * float32 samples on stdout.
- *
- * It has an "In" input port and an "Out" output data ports.
- *
- * The node requires a `config` section with extra configuration:
- *
- *\code{.unparsed}
- * filter.graph = {
- *     nodes = [
- *         {
- *             type   = builtin
- *             name   = ...
- *             label  = pipe
- *             config = {
- *                 command = "ffmpeg -f f32le -ac 1 -ar 48000 -blocksize 1024 -fflags nobuffer -i \"pipe:\"  \"-filter:a\" \"loudnorm=I=-18:TP=-3:LRA=4\" -f f32le -ac 1 -ar 48000 \"pipe:\""
- *             }
- *             ...
- *         }
- *     }
- *     ...
- * }
- *\endcode
- *
- * - `command` the command to execute. It should consume samples from stdin and produce
- *             samples on stdout.
  *
  * ### Zeroramp
  *
@@ -766,6 +744,7 @@ extern struct spa_handle_factory spa_filter_graph_factory;
  *                 filename = ...
  *                 gain = ...
  *                 latency = ...
+ *                 normalize = ...
  *             }
  *             control = {
  *                 "Azimuth" = ...
@@ -787,6 +766,7 @@ extern struct spa_handle_factory spa_filter_graph_factory;
  *               and contain the HRTF for the various spatial positions.
  * - `gain`      the overall gain to apply to the IR file, default 1.0.
  * - `latency`   the latency introduced by the filter, default 0
+ * - `normalize` automatically normalize the loudness of the IR, default false
  *
  * - `Azimuth`   controls the azimuth, this is the direction the sound is coming from
  *               in degrees between 0 and 360. 0 is straight ahead. 90 is left, 180
@@ -1030,16 +1010,16 @@ extern struct spa_handle_factory spa_filter_graph_factory;
  *            therefore at least be blocksize + retain samples large.
  * - `data` where the data for the tensor is comming from. There are different options
  *          based on the value of this file, selected with a prefix:
- *      - `port:<portname>` a new input/output port is created on the plugin with the
- *                          name <portname> and the data for the tensor will be obtained
+ *      - `port:\<portname\>` a new input/output port is created on the plugin with the
+ *                          name \<portname\> and the data for the tensor will be obtained
  *                          or copied from/to the port data.
- *      - `tensor:<tensorname>` the data of this tensor is copied from the given
- *                              <tensorname>. You can use this to copy output state
+ *      - `tensor:\<tensorname\>` the data of this tensor is copied from the given
+ *                              \<tensorname\>. You can use this to copy output state
  *                              info to the input state, for example.
- *      - `param:<paramname>` the data of this tensor is obtained from a parameter with
- *                            <paramname>. Currently only `rate` is a valid paramname,
+ *      - `param:\<paramname\>` the data of this tensor is obtained from a parameter with
+ *                            \<paramname\>. Currently only `rate` is a valid paramname,
  *                            which has the value of the filter samplerate.
- *      - `control:<portname>` a new input/output control port is created and the tensor
+ *      - `control:\<portname\>` a new input/output control port is created and the tensor
  *                             data will be obtained/copied from/to the control data.
  *
  * Here is an example of the silero VAD model:
@@ -1256,6 +1236,8 @@ static const struct spa_dict_item module_props[] = {
 
 #define DEFAULT_RATE	48000
 
+#define MAX_DATAS	1024u
+
 struct impl {
 	struct pw_context *context;
 
@@ -1295,6 +1277,7 @@ struct impl {
 
 	struct spa_latency_info latency[2];
 	struct spa_process_latency_info process_latency;
+	struct spa_io_latency io_latency;
 };
 
 static void capture_destroy(void *d)
@@ -1309,8 +1292,8 @@ static void do_process(struct impl *impl)
 	struct pw_buffer *in, *out;
 	uint32_t i, n_in = 0, n_out = 0, data_size = 0;
 	struct spa_data *bd;
-	const void *cin[128];
-	void *cout[128];
+	const void *cin[MAX_DATAS];
+	void *cout[MAX_DATAS];
 
 	in = out = NULL;
 	if (impl->capture) {
@@ -1325,7 +1308,8 @@ static void do_process(struct impl *impl)
 		if (in == NULL) {
 			pw_log_debug("%p: out of capture buffers: %m", impl);
 		} else {
-			for (i = 0; i < in->buffer->n_datas; i++) {
+			uint32_t n_datas = SPA_MIN(MAX_DATAS, in->buffer->n_datas);
+			for (i = 0; i < n_datas; i++) {
 				uint32_t offs, size;
 
 				bd = &in->buffer->datas[i];
@@ -1344,10 +1328,12 @@ static void do_process(struct impl *impl)
 		if (out == NULL) {
 			pw_log_debug("%p: out of playback buffers: %m", impl);
 		} else {
+			uint32_t n_datas = SPA_MIN(MAX_DATAS, out->buffer->n_datas);
+
 			if (data_size == 0)
 				data_size = out->requested * sizeof(float);
 
-			for (i = 0; i < out->buffer->n_datas; i++) {
+			for (i = 0; i < n_datas; i++) {
 				bd = &out->buffer->datas[i];
 
 				data_size = SPA_MIN(data_size, bd->maxsize);
@@ -1359,17 +1345,20 @@ static void do_process(struct impl *impl)
 				bd->chunk->stride = sizeof(float);
 			}
 		}
-		pw_log_trace_fp("%p: size:%d requested:%"PRIu64, impl,
-				data_size, out->requested);
+		if (out != NULL) {
+			pw_log_trace_fp("%p: size:%d requested:%"PRIu64, impl,
+					data_size, out->requested);
+		}
 	}
 
-	for (; n_in < impl->n_inputs; i++)
-		cin[n_in++] = NULL;
-	for (; n_out < impl->n_outputs; i++)
-		cout[n_out++] = NULL;
+	if (impl->graph_active) {
+		for (; n_in < impl->n_inputs; i++)
+			cin[n_in++] = NULL;
+		for (; n_out < impl->n_outputs; i++)
+			cout[n_out++] = NULL;
 
-	if (impl->graph_active)
 		spa_filter_graph_process(impl->graph, cin, cout, data_size / sizeof(float));
+	}
 
 	if (in != NULL)
 		pw_stream_queue_buffer(impl->capture, in);
@@ -1419,6 +1408,8 @@ static int activate_graph(struct impl *impl)
 
 	if (res >= 0) {
 		struct pw_loop *data_loop = pw_stream_get_data_loop(impl->playback);
+
+
 		pw_loop_lock(data_loop);
 		impl->graph_active = true;
 		pw_loop_unlock(data_loop);
@@ -1492,8 +1483,29 @@ static void update_latencies(struct impl *impl, bool process)
 	update_latency(impl, SPA_DIRECTION_OUTPUT, process);
 }
 
+static void update_io_latency(struct impl *impl, enum spa_direction direction)
+{
+	struct pw_stream *stream;
+	struct pw_time time;
+
+	if (direction == SPA_DIRECTION_OUTPUT)
+		stream = impl->capture;
+	else
+		stream = impl->playback;
+
+	pw_stream_get_time_n(stream, &time, sizeof(time));
+	impl->io_latency.rate = time.rate;
+	if (direction == SPA_DIRECTION_OUTPUT)
+		impl->io_latency.capture_latency = time.delay;
+	else
+		impl->io_latency.playback_latency = time.delay;
+
+	spa_filter_graph_set_io(impl->graph, SPA_TYPE_INFO_IO_BASE "Latency",
+		&impl->io_latency, sizeof(impl->io_latency));
+}
+
 static void param_latency_changed(struct impl *impl, const struct spa_pod *param,
-		enum spa_direction direction)
+		enum spa_direction direction, struct pw_stream *stream)
 {
 	struct spa_latency_info latency;
 
@@ -1502,6 +1514,8 @@ static void param_latency_changed(struct impl *impl, const struct spa_pod *param
 
 	impl->latency[latency.direction] = latency;
 	update_latency(impl, latency.direction, false);
+
+	update_io_latency(impl, latency.direction);
 }
 
 static void param_process_latency_changed(struct impl *impl, const struct spa_pod *param,
@@ -1556,6 +1570,8 @@ static void capture_state_changed(void *data, enum pw_stream_state old,
 		pw_log_info("module %p: error: %s", impl, error);
 		break;
 	case PW_STREAM_STATE_STREAMING:
+		update_io_latency(impl, SPA_DIRECTION_OUTPUT);
+		break;
 	default:
 		break;
 	}
@@ -1568,6 +1584,8 @@ static void io_changed(void *data, uint32_t id, void *area, uint32_t size)
 	switch (id) {
 	case SPA_IO_Position:
 		impl->position = area;
+		spa_filter_graph_set_io(impl->graph, SPA_TYPE_INFO_IO_BASE "Position",
+				impl->position, sizeof(struct spa_io_position));
 		break;
 	default:
 		break;
@@ -1596,11 +1614,10 @@ static void param_changed(struct impl *impl, uint32_t id, const struct spa_pod *
 		break;
 	}
 	case SPA_PARAM_Props:
-		if (param != NULL)
-			spa_filter_graph_set_props(impl->graph, direction, param);
+		spa_filter_graph_set_props(impl->graph, direction, param);
 		break;
 	case SPA_PARAM_Latency:
-		param_latency_changed(impl, param, direction);
+		param_latency_changed(impl, param, direction, stream);
 		break;
 	case SPA_PARAM_ProcessLatency:
 		param_process_latency_changed(impl, param, direction);
@@ -1651,6 +1668,7 @@ static void playback_state_changed(void *data, enum pw_stream_state old,
 	case PW_STREAM_STATE_STREAMING:
 	{
 		uint32_t target = impl->info.rate;
+
 		if (target == 0)
 			target = impl->position ?
 				impl->position->clock.target_rate.denom : DEFAULT_RATE;
@@ -1658,6 +1676,9 @@ static void playback_state_changed(void *data, enum pw_stream_state old,
 			res = -EINVAL;
 			goto error;
 		}
+
+		update_io_latency(impl, SPA_DIRECTION_INPUT);
+
 		if (impl->rate != target) {
 			impl->rate = target;
 			deactivate_graph(impl);
@@ -1843,10 +1864,23 @@ static void graph_info(void *object, const struct spa_filter_graph_info *info)
 {
 	struct impl *impl = object;
 	struct spa_dict *props = info->props;
-	uint32_t i, val = 0;
+	uint32_t i, val = 0, n_inputs, n_outputs;
 
-	impl->n_inputs = info->n_inputs;
-	impl->n_outputs = info->n_outputs;
+	n_inputs = info->n_inputs;
+	n_outputs = info->n_outputs;
+
+	if (n_inputs > MAX_DATAS) {
+		pw_log_warn("filter has too many inputs %d > %d",
+				n_inputs, MAX_DATAS);
+		n_inputs = MAX_DATAS;
+	}
+	if (n_outputs > MAX_DATAS) {
+		pw_log_warn("filter has too many outputs %d > %d",
+				n_outputs, MAX_DATAS);
+		n_outputs = MAX_DATAS;
+	}
+	impl->n_inputs = n_inputs;
+	impl->n_outputs = n_outputs;
 
 	for (i = 0; props && i < props->n_items; i++) {
 		const char *k = props->items[i].key;
@@ -2096,7 +2130,7 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	} else if (impl->capture_info.rate && !impl->playback_info.rate)
 		impl->playback_info.rate = impl->capture_info.rate;
 	else if (impl->playback_info.rate && !impl->capture_info.rate)
-		impl->capture_info.rate = !impl->playback_info.rate;
+		impl->capture_info.rate = impl->playback_info.rate;
 	else if (impl->capture_info.rate != impl->playback_info.rate) {
 		pw_log_warn("Both capture and playback rate are set, but"
 			" they are different. Using the highest of two. This behaviour"
@@ -2170,7 +2204,8 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 			&impl->core_listener,
 			&core_events, impl);
 
-	setup_streams(impl);
+	if ((res = setup_streams(impl)) < 0)
+		goto error;
 
 	pw_impl_module_add_listener(module, &impl->module_listener, &module_events, impl);
 

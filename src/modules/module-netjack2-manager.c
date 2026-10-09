@@ -34,8 +34,9 @@
 #include <pipewire/impl.h>
 #include <pipewire/i18n.h>
 
-#include "module-netjack2/packets.h"
+#undef N2J_PACKET_DEBUG
 
+#include "module-netjack2/packets.h"
 #include "module-netjack2/peer.c"
 #include "network-utils.h"
 
@@ -80,6 +81,7 @@
  * - `netjack2.period-size`: the buffer size to use, default 1024
  * - `netjack2.encoding`: the encoding, float|opus|int, default float
  * - `netjack2.kbps`: the number of kilobits per second when encoding, default 64
+ * - `netjack2.max-followers`: the maximum number of concurrent followers, default 64
  * - `audio.ports`: the number of audio ports. Can also be added to the stream props. This
  *     is the default suggestion for drivers that don't specify any number of audio channels.
  * - `midi.ports`: the number of midi ports. Can also be added to the stream props. This
@@ -116,6 +118,7 @@
  *         #netjack2.period-size = 1024
  *         #netjack2.encoding    = float # float|opus
  *         #netjack2.kbps        = 64
+ *         #netjack2.max-followers = 64
  *         #audio.ports          = 0
  *         #midi.ports           = 0
  *         #audio.channels       = 2
@@ -137,8 +140,6 @@
 PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
 #define PW_LOG_TOPIC_DEFAULT mod_topic
 
-#define MAX_PORTS	128
-
 #define DEFAULT_NET_IP		"225.3.19.154"
 #define DEFAULT_NET_PORT	19000
 #define DEFAULT_NET_TTL		1
@@ -157,6 +158,7 @@ PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
 #define DEFAULT_KBPS		64
 #define DEFAULT_AUDIO_PORTS	2
 #define DEFAULT_MIDI_PORTS	1
+#define DEFAULT_MAX_FOLLOWERS	64
 
 #define MODULE_USAGE	"( remote.name=<remote> ) "				\
 			"( local.ifname=<interface name> ) "			\
@@ -168,6 +170,7 @@ PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
 			"( netjack2.connect=<autoconnect ports, default false> ) "	\
 			"( netjack2.sample-rate=<sampl erate, default 48000> ) "\
 			"( netjack2.period-size=<period size, default 1024> ) "	\
+			"( netjack2.max-followers=<max followers, default 64> ) "	\
 			"( midi.ports=<number of midi ports, default 1> ) "	\
 			"( audio.channels=<number of channels, default 2> ) "	\
 			"( audio.position=<channel map> ) "			\
@@ -286,6 +289,8 @@ struct impl {
 	struct spa_source *setup_socket;
 	struct spa_list follower_list;
 	uint32_t follower_id;
+	uint32_t n_followers;
+	uint32_t max_followers;
 
 	unsigned int do_disconnect:1;
 };
@@ -421,6 +426,7 @@ static void follower_free(struct follower *follower)
 
 	follower->freeing = true;
 
+	impl->n_followers--;
 	spa_list_remove(&follower->link);
 
 	if (follower->socket) {
@@ -621,6 +627,10 @@ static void make_stream_ports(struct stream *s)
 
 			is_midi = true;
 		}
+		if (props == NULL) {
+			pw_log_error("Can't create properties: %m");
+			return;
+		}
 		spa_zero(latency);
 		latency = SPA_LATENCY_INFO(s->direction,
 				.min_quantum = follower->peer.params.network_latency,
@@ -664,6 +674,9 @@ static void parse_props(struct stream *s, const struct spa_pod *param)
 	uint8_t buffer[1024];
 	struct spa_pod_builder b;
 	const struct spa_pod *params[1];
+
+	if (!spa_pod_is_object_type(param, SPA_TYPE_OBJECT_Props))
+		return;
 
 	SPA_POD_OBJECT_FOREACH(obj, prop) {
 		switch (prop->key) {
@@ -801,19 +814,6 @@ static int create_filters(struct follower *follower)
 	return res;
 }
 
-static bool is_multicast(struct sockaddr *sa, socklen_t salen)
-{
-	if (sa->sa_family == AF_INET) {
-		static const uint32_t ipv4_mcast_mask = 0xe0000000;
-		struct sockaddr_in *sa4 = (struct sockaddr_in*)sa;
-		return (ntohl(sa4->sin_addr.s_addr) & ipv4_mcast_mask) == ipv4_mcast_mask;
-	} else if (sa->sa_family == AF_INET6) {
-		struct sockaddr_in6 *sa6 = (struct sockaddr_in6*)sa;
-		return sa6->sin6_addr.s6_addr[0] == 0xff;
-	}
-	return false;
-}
-
 static int make_data_socket(struct sockaddr_storage *sa, socklen_t salen,
 		bool loop, int ttl, int dscp, const char *ifname)
 {
@@ -848,7 +848,7 @@ static int make_data_socket(struct sockaddr_storage *sa, socklen_t salen,
 		if (setsockopt(fd, IPPROTO_IP, IP_TOS, &val, sizeof(val)) < 0)
 			pw_log_warn("setsockopt(IP_TOS) failed: %m");
 	}
-	if (is_multicast((struct sockaddr*)sa, salen)) {
+	if (pw_net_is_multicast(sa)) {
 		val = loop;
 		if (setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &val, sizeof(val)) < 0)
 			pw_log_warn("setsockopt(IP_MULTICAST_LOOP) failed: %m");
@@ -945,6 +945,11 @@ static int handle_follower_available(struct impl *impl, struct nj2_session_param
 	pw_log_info("got follower available");
 	nj2_dump_session_params(params);
 
+	if (impl->n_followers >= impl->max_followers) {
+		pw_log_warn("max followers reached (%u), rejecting", impl->max_followers);
+		return -EBUSY;
+	}
+
 	if (ntohl(params->version) != NJ2_NETWORK_PROTOCOL) {
 		pw_log_warn("invalid version");
 		return -EINVAL;
@@ -957,6 +962,7 @@ static int handle_follower_available(struct impl *impl, struct nj2_session_param
 	follower->impl = impl;
 	follower->id = impl->follower_id;
 	spa_list_append(&impl->follower_list, &follower->link);
+	impl->n_followers++;
 
 	peer = &follower->peer;
 
@@ -969,10 +975,16 @@ static int handle_follower_available(struct impl *impl, struct nj2_session_param
 	follower->sink.direction = PW_DIRECTION_INPUT;
 	follower->sink.props = pw_properties_copy(impl->sink_props);
 
+	if (follower->source.props == NULL || follower->sink.props == NULL) {
+		res = -errno;
+		pw_log_error("can't create properties: %m");
+		goto cleanup;
+	}
+
 	if ((res = parse_audio_info(follower->source.props, &follower->source.info)) < 0 ||
 	    (res = parse_audio_info(follower->sink.props, &follower->sink.info)) < 0) {
 		pw_log_error("can't parse format: %s", spa_strerror(res));
-		return res;
+		goto cleanup;
 	}
 
 	follower->source.n_audio = pw_properties_get_uint32(follower->source.props,
@@ -1003,9 +1015,9 @@ static int handle_follower_available(struct impl *impl, struct nj2_session_param
 	nj2_session_params_ntoh(&peer->params, params);
 
 	pw_properties_setf(follower->source.props, PW_KEY_NODE_DESCRIPTION, "%s NETJACK2 from %s",
-			params->name, params->follower_name);
+			peer->params.name, peer->params.follower_name);
 	pw_properties_setf(follower->sink.props, PW_KEY_NODE_DESCRIPTION, "%s NETJACK2 to %s",
-			params->name, params->follower_name);
+			peer->params.name, peer->params.follower_name);
 
 	peer->params.mtu = impl->mtu;
 	peer->params.id = follower->id;
@@ -1027,25 +1039,28 @@ static int handle_follower_available(struct impl *impl, struct nj2_session_param
 		peer->params.recv_midi_channels = follower->source.n_midi;
 
 	follower->source.n_ports = peer->params.recv_audio_channels + peer->params.recv_midi_channels;
+	follower->sink.n_ports = peer->params.send_audio_channels + peer->params.send_midi_channels;
+
+	if (follower->source.n_ports > MAX_PORTS || follower->sink.n_ports > MAX_PORTS ||
+	    (uint32_t)peer->params.recv_audio_channels > MAX_CHANNELS ||
+	    (uint32_t)peer->params.send_audio_channels > MAX_CHANNELS) {
+		pw_log_error("too many ports source:%d sink:%d max:%d", follower->source.n_ports,
+				follower->sink.n_ports, MAX_PORTS);
+		res = -EINVAL;
+		goto cleanup;
+	}
+
 	follower->source.info.rate = peer->params.sample_rate;
 	if ((uint32_t)peer->params.recv_audio_channels != follower->source.info.channels) {
 		follower->source.info.channels = peer->params.recv_audio_channels;
 		for (i = 0; i < follower->source.info.channels; i++)
 			follower->source.info.position[i] = SPA_AUDIO_CHANNEL_AUX0 + i;
 	}
-	follower->sink.n_ports = peer->params.send_audio_channels + peer->params.send_midi_channels;
 	follower->sink.info.rate = peer->params.sample_rate;
 	if ((uint32_t)peer->params.send_audio_channels != follower->sink.info.channels) {
 		follower->sink.info.channels = peer->params.send_audio_channels;
 		for (i = 0; i < follower->sink.info.channels; i++)
 			follower->sink.info.position[i] = SPA_AUDIO_CHANNEL_AUX0 + i;
-	}
-
-	if (follower->source.n_ports > MAX_PORTS || follower->sink.n_ports > MAX_PORTS) {
-		pw_log_error("too many ports source:%d sink:%d max:%d", follower->source.n_ports,
-				follower->sink.n_ports, MAX_PORTS);
-		res = -EINVAL;
-		goto cleanup;
 	}
 	media = follower->sink.info.channels > 0 ? "Audio" : "Midi";
 	if (pw_properties_get_bool(follower->sink.props, "netjack2.connect", DEFAULT_CONNECT)) {
@@ -1088,7 +1103,7 @@ static int handle_follower_available(struct impl *impl, struct nj2_session_param
 	if (follower->setup_socket == NULL) {
 		res = -errno;
 		pw_log_error("can't create setup source: %m");
-		goto socket_failed;
+		goto cleanup;
 	}
 
 	follower->socket = pw_loop_add_io(impl->data_loop, fd,
@@ -1096,7 +1111,7 @@ static int handle_follower_available(struct impl *impl, struct nj2_session_param
 	if (follower->socket == NULL) {
 		res = -errno;
 		pw_log_error("can't create data source: %m");
-		goto socket_failed;
+		goto cleanup;
 	}
 	peer->fd = fd;
 	peer->our_stream = 's';
@@ -1104,7 +1119,10 @@ static int handle_follower_available(struct impl *impl, struct nj2_session_param
 	peer->send_volume = &follower->sink.volume;
 	peer->recv_volume = &follower->source.volume;
 	peer->quantum_limit = impl->quantum_limit;
-	netjack2_init(peer);
+	if ((res = netjack2_init(peer)) < 0) {
+		pw_log_error("can't init peer: %s", spa_strerror(res));
+		goto cleanup;
+	}
 
 	int bufsize = SPA_MIN((size_t)NETWORK_MAX_LATENCY * (peer->params.mtu +
 		(size_t)follower->period_size * sizeof(float) *
@@ -1388,6 +1406,8 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	}
 	impl->kbps = pw_properties_get_uint32(impl->props, "netjack2.kbps",
 			DEFAULT_KBPS);
+	impl->max_followers = pw_properties_get_uint32(impl->props, "netjack2.max-followers",
+			DEFAULT_MAX_FOLLOWERS);
 
 	pw_properties_set(props, PW_KEY_NODE_LOOP_NAME, impl->data_loop->name);
 	if (pw_properties_get(props, PW_KEY_NODE_VIRTUAL) == NULL)

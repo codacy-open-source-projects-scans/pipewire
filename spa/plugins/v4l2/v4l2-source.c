@@ -81,6 +81,7 @@ struct port {
 	bool probed_expbuf;
 	bool have_expbuf;
 	bool first_buffer;
+	bool warned_unqueued;
 	uint32_t max_buffers;
 
 	bool next_fmtdesc;
@@ -396,12 +397,13 @@ static int impl_node_set_param(void *object,
 			reset_props(p);
 			return 0;
 		}
+		if (!spa_pod_is_object_type(param, SPA_TYPE_OBJECT_Props))
+			return -EINVAL;
 		SPA_POD_OBJECT_FOREACH(obj, prop) {
 			switch (prop->key) {
 			case SPA_PROP_device:
-				strncpy(p->device,
-						(char *)SPA_POD_CONTENTS(struct spa_pod_string, &prop->value),
-						sizeof(p->device)-1);
+				spa_scnprintf(p->device, sizeof(p->device), "%s",
+						(char *)SPA_POD_CONTENTS(struct spa_pod_string, &prop->value));
 				break;
 			default:
 				spa_v4l2_set_control(this, prop, SPA_POD_BODY_CONST(&prop->value));
@@ -1100,7 +1102,7 @@ impl_init(const struct spa_handle_factory *factory,
 		const char *k = info->items[i].key;
 		const char *s = info->items[i].value;
 		if (spa_streq(k, SPA_KEY_API_V4L2_PATH)) {
-			strncpy(this->props.device, s, 63);
+			spa_scnprintf(this->props.device, sizeof(this->props.device), "%s", s);
 		} else if (spa_streq(k, "meta.videotransform.transform")) {
 			this->transform = spa_debug_type_find_type_short(spa_type_meta_videotransform_type, s);
 		} else if (spa_streq(k, "clock.name")) {

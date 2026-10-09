@@ -19,9 +19,10 @@
 #include <net/if.h>
 #include <ifaddrs.h>
 
+#include <spa/utils/cleanup.h>
 #include <spa/utils/result.h>
 #include <spa/utils/string.h>
-#include <spa/utils/json.h>
+#include <spa/utils/json-builder.h>
 #include <spa/param/audio/format.h>
 #include <spa/param/audio/raw-json.h>
 #include <spa/debug/types.h>
@@ -59,7 +60,9 @@
  *
  * - `snapcast.discover-local` = allow discovery of local services as well.
  *    false by default.
- * - `stream.rules` = <rules>: match rules, use create-stream actions. See
+ * - `capture.latency.ms` = latency for all streams in microseconds. This
+ *    can be overwritten in the stream rules.
+ * - `stream.rules` = \<rules\>: match rules, use create-stream actions. See
  *   \ref page_module_protocol_simple for module properties.
  *
  * ### stream.rules matches
@@ -323,12 +326,16 @@ static int handle_connect(struct tunnel *t, int fd)
 
 	str = spa_aprintf("{\"id\":%u,\"jsonrpc\": \"2.0\",\"method\":\"Server.GetRPCVersion\"}\r\n",
 			impl->id++);
+	if (str == NULL)
+		return -errno;
 	res = write(t->source->fd, str, strlen(str));
 	pw_log_info("wrote %s: %d", str, res);
 	free(str);
 
 	str = spa_aprintf("{\"id\":%u,\"jsonrpc\":\"2.0\",\"method\":\"Stream.RemoveStream\","
 			"\"params\":{\"id\":\"%s\"}}\r\n", impl->id++, t->stream_name);
+	if (str == NULL)
+		return -errno;
 	res = write(t->source->fd, str, strlen(str));
 	pw_log_info("wrote %s: %d", str, res);
 	free(str);
@@ -338,6 +345,8 @@ static int handle_connect(struct tunnel *t, int fd)
 		"sampleformat=%d:%d:%d&codec=pcm&chunk_ms=20\"}}\r\n", impl->id++,
 		t->server_address, t->stream_name, t->audio_info.rate,
 		get_bps(t->audio_info.format), t->audio_info.channels);
+	if (str == NULL)
+		return -errno;
 	res = write(t->source->fd, str, strlen(str));
 	pw_log_info("wrote %s: %d", str, res);
 	free(str);
@@ -351,7 +360,7 @@ static int process_input(struct tunnel *t)
 	int res = 0;
 
 	while (true) {
-		res = read(t->source->fd, buffer, sizeof(buffer));
+		res = read(t->source->fd, buffer, sizeof(buffer) - 1);
 		if (res == 0)
 			return -EPIPE;
 		if (res < 0) {
@@ -362,6 +371,7 @@ static int process_input(struct tunnel *t)
 				return res;
 			break;
 		}
+		buffer[res] = '\0';
 	}
 
 	pw_log_info("received: %s", buffer);
@@ -490,6 +500,8 @@ static int add_snapcast_stream(struct impl *impl, struct tunnel *t,
 
 	while (spa_json_get_string(&it[0], v, sizeof(v)) > 0) {
 		t->server_address = strdup(v);
+		if (t->server_address == NULL)
+			return -errno;
 		snapcast_connect(t);
 		return 0;
 	}
@@ -523,8 +535,8 @@ static int parse_audio_info(struct pw_properties *props, struct spa_audio_info_r
 static int create_stream(struct impl *impl, struct pw_properties *props,
 		struct tunnel *t)
 {
-	FILE *f;
-	char *args;
+	struct spa_json_builder b;
+	spa_autofree char *args = NULL;
 	size_t size;
 	int res = 0;
 	struct pw_impl_module *mod;
@@ -537,6 +549,8 @@ static int create_stream(struct impl *impl, struct pw_properties *props,
 	if ((str = pw_properties_get(props, "snapcast.stream-name")) == NULL)
 		str = "PipeWire";
 	t->stream_name = strdup(str);
+	if (t->stream_name == NULL)
+		return -errno;
 
 	if ((str = pw_properties_get(props, "capture")) == NULL)
 		pw_properties_set(props, "capture", "true");
@@ -548,22 +562,21 @@ static int create_stream(struct impl *impl, struct pw_properties *props,
 		goto done;
 	}
 
-	if ((f = open_memstream(&args, &size)) == NULL) {
-		res = -errno;
+	if ((res = spa_json_builder_memstream(&b, &args, &size, 0)) < 0) {
 		pw_log_error("Can't open memstream: %m");
 		goto done;
 	}
 
-	fprintf(f, "{");
-	pw_properties_serialize_dict(f, &props->dict, 0);
-	fprintf(f, "}");
-        fclose(f);
+	spa_json_builder_array_push(&b, "{");
+	pw_properties_serialize_dict(b.f, &props->dict, 0);
+	spa_json_builder_pop(&b,        "}");
+	if ((res = spa_json_builder_close(&b)) < 0)
+		goto done;
 
 	pw_log_info("loading module args:'%s'", args);
 	mod = pw_context_load_module(impl->context,
 			"libpipewire-module-protocol-simple",
 			args, NULL);
-	free(args);
 
 	if (mod == NULL) {
 		res = -errno;
@@ -656,6 +669,8 @@ static void on_zeroconf_added(void *data, const void *user, const struct spa_dic
 
 	free((char*)t->info.host);
 	t->info.host = strdup(pw_properties_get(props, "snapcast.ip"));
+	if (t->info.host == NULL)
+		return;
 
 	family = protocol == 4 ? AF_INET : AF_INET6;
 
@@ -699,6 +714,9 @@ static void on_zeroconf_added(void *data, const void *user, const struct spa_dic
 
 	spa_dict_for_each(it, info)
 		pw_properties_from_zeroconf(it->key, it->value, props);
+
+	if ((str = pw_properties_get(impl->properties, "capture.latency.ms")) != NULL)
+		pw_properties_set(props, "capture.latency.ms", str);
 
 	if ((str = pw_properties_get(impl->properties, "stream.rules")) == NULL)
 		str = DEFAULT_CREATE_RULES;

@@ -55,6 +55,7 @@ struct spa_fga_descriptor {
 	const char *name;
 #define SPA_FGA_DESCRIPTOR_SUPPORTS_NULL_DATA	(1ULL << 0)
 #define SPA_FGA_DESCRIPTOR_COPY			(1ULL << 1)
+#define SPA_FGA_DESCRIPTOR_PORT_PAIR		(1ULL << 2)
 	uint64_t flags;
 
 	void (*free) (const struct spa_fga_descriptor *desc);
@@ -62,10 +63,12 @@ struct spa_fga_descriptor {
 	uint32_t n_ports;
 	struct spa_fga_port *ports;
 
-	void *(*instantiate) (const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor *desc,
-			unsigned long SampleRate, int index, const char *config);
+	int (*instantiate) (const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor *desc,
+			uint32_t rate, const char *config, uint32_t n_hndl, void *hndl[]);
 
 	void (*cleanup) (void *instance);
+
+	void (*set_io) (void *instance, const char *type, void *data, size_t size);
 
 	void (*connect_port) (void *instance, unsigned long port, void *data);
 	void (*control_changed) (void *instance);

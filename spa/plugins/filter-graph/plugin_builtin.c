@@ -33,6 +33,7 @@
 #include "audio-dsp.h"
 
 #define MAX_RATES	32u
+#define GAIN_MAX	(20 * FLT_MAX_10_EXP)
 
 struct plugin {
 	struct spa_handle handle;
@@ -68,22 +69,40 @@ struct builtin {
 	float hold;
 };
 
-static void *builtin_instantiate(const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor * Descriptor,
-		unsigned long SampleRate, int index, const char *config)
+static int instantiate_helper(const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor *desc,
+		uint32_t rate, const char *config, uint32_t n_hndl, void *hndl[],
+		int (*instantiate1_func) (const struct spa_fga_plugin *plugin,
+			const struct spa_fga_descriptor *desc,
+			uint32_t rate, uint32_t index, const char *config, void **hndl))
+{
+	int res;
+	for (uint32_t i = 0; i < n_hndl; i++) {
+		if ((res = instantiate1_func(plugin, desc, rate, i, config, &hndl[i])) < 0)
+			return res;
+	}
+	return 0;
+}
+
+static int builtin_instantiate(const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor *desc,
+		uint32_t rate, const char *config, uint32_t n_hndl, void *hndl[])
 {
 	struct plugin *pl = SPA_CONTAINER_OF(plugin, struct plugin, plugin);
-	struct builtin *impl;
 
-	impl = calloc(1, sizeof(*impl));
-	if (impl == NULL)
-		return NULL;
+	for (uint32_t i = 0; i < n_hndl; i++) {
+		struct builtin *impl;
 
-	impl->plugin = pl;
-	impl->rate = SampleRate;
-	impl->dsp = impl->plugin->dsp;
-	impl->log = impl->plugin->log;
+		impl = calloc(1, sizeof(*impl));
+		if (impl == NULL)
+			return -errno;
 
-	return impl;
+		impl->plugin = pl;
+		impl->rate = rate;
+		impl->dsp = impl->plugin->dsp;
+		impl->log = impl->plugin->log;
+
+		hndl[i] = impl;
+	}
+	return 0;
 }
 
 static void builtin_connect_port(void *Instance, unsigned long Port, void * DataLocation)
@@ -203,42 +222,42 @@ static struct spa_fga_port mixer_ports[] = {
 	{ .index = 9,
 	  .name = "Gain 1",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
-	  .def = 1.0f, .min = -10.0f, .max = 10.0f
+	  .def = 1.0f, .min = -FLT_MAX, .max = FLT_MAX
 	},
 	{ .index = 10,
 	  .name = "Gain 2",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
-	  .def = 1.0f, .min = -10.0f, .max = 10.0f
+	  .def = 1.0f, .min = -FLT_MAX, .max = FLT_MAX
 	},
 	{ .index = 11,
 	  .name = "Gain 3",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
-	  .def = 1.0f, .min = -10.0f, .max = 10.0f
+	  .def = 1.0f, .min = -FLT_MAX, .max = FLT_MAX
 	},
 	{ .index = 12,
 	  .name = "Gain 4",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
-	  .def = 1.0f, .min = -10.0f, .max = 10.0f
+	  .def = 1.0f, .min = -FLT_MAX, .max = FLT_MAX
 	},
 	{ .index = 13,
 	  .name = "Gain 5",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
-	  .def = 1.0f, .min = -10.0f, .max = 10.0f
+	  .def = 1.0f, .min = -FLT_MAX, .max = FLT_MAX
 	},
 	{ .index = 14,
 	  .name = "Gain 6",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
-	  .def = 1.0f, .min = -10.0f, .max = 10.0f
+	  .def = 1.0f, .min = -FLT_MAX, .max = FLT_MAX
 	},
 	{ .index = 15,
 	  .name = "Gain 7",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
-	  .def = 1.0f, .min = -10.0f, .max = 10.0f
+	  .def = 1.0f, .min = -FLT_MAX, .max = FLT_MAX
 	},
 	{ .index = 16,
 	  .name = "Gain 8",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
-	  .def = 1.0f, .min = -10.0f, .max = 10.0f
+	  .def = 1.0f, .min = -FLT_MAX, .max = FLT_MAX
 	},
 };
 
@@ -334,8 +353,8 @@ static void bq_raw_update(struct builtin *impl, float b0, float b1, float b2,
  *     ]
  * }
  */
-static void *bq_instantiate(const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor * Descriptor,
-		unsigned long SampleRate, int index, const char *config)
+static int bq_instantiate1(const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor * Descriptor,
+		uint32_t rate, uint32_t index, const char *config, void **hndl)
 {
 	struct plugin *pl = SPA_CONTAINER_OF(plugin, struct plugin, plugin);
 	struct builtin *impl;
@@ -347,16 +366,16 @@ static void *bq_instantiate(const struct spa_fga_plugin *plugin, const struct sp
 
 	impl = calloc(1, sizeof(*impl));
 	if (impl == NULL)
-		return NULL;
+		return -errno;
 
 	impl->plugin = pl;
 	impl->log = impl->plugin->log;
 	impl->dsp = impl->plugin->dsp;
-	impl->rate = SampleRate;
+	impl->rate = rate;
 	impl->b0 = impl->a0 = 1.0f;
 	impl->type = bq_type_from_name(Descriptor->name);
 	if (impl->type != BQ_NONE)
-		return impl;
+		goto done;
 
 	if (config == NULL) {
 		spa_log_error(impl->log, "biquads:bq_raw requires a config section");
@@ -427,8 +446,9 @@ static void *bq_instantiate(const struct spa_fga_plugin *plugin, const struct sp
 						spa_log_warn(impl->log, "biquads: ignoring coefficients key: '%s'", key);
 					}
 				}
-				if (labs((long)rate - (long)SampleRate) <
-				    labs((long)best_rate - (long)SampleRate)) {
+				/* impl->rate is the graph rate; local rate shadows the param */
+				if (labs((long)rate - (long)impl->rate) <
+				    labs((long)best_rate - (long)impl->rate)) {
 					best_rate = rate;
 					bq_raw_update(impl, b0, b1, b2, a0, a1, a2);
 				}
@@ -438,12 +458,18 @@ static void *bq_instantiate(const struct spa_fga_plugin *plugin, const struct sp
 			spa_log_warn(impl->log, "biquads: ignoring config key: '%s'", key);
 		}
 	}
-
-	return impl;
+done:
+	*hndl = impl;
+	return 0;
 error:
 	free(impl);
-	errno = EINVAL;
-	return NULL;
+	return -EINVAL;
+}
+
+static int bq_instantiate(const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor *desc,
+		uint32_t rate, const char *config, uint32_t n_hndl, void *hndl[])
+{
+	return instantiate_helper(plugin, desc, rate, config, n_hndl, hndl, bq_instantiate1);
 }
 
 #define BQ_NUM_PORTS		11
@@ -465,42 +491,42 @@ static struct spa_fga_port bq_ports[] = {
 	{ .index = 3,
 	  .name = "Q",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
-	  .def = 0.0f, .min = 0.0f, .max = 10.0f,
+	  .def = 0.0f, .min = 0.0f, .max = FLT_MAX,
 	},
 	{ .index = 4,
 	  .name = "Gain",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
-	  .def = 0.0f, .min = -120.0f, .max = 20.0f,
+	  .def = 0.0f, .min = (float)(-GAIN_MAX), .max = (float)GAIN_MAX,
 	},
 	{ .index = 5,
 	  .name = "b0",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
-	  .def = 1.0f, .min = -10.0f, .max = 10.0f,
+	  .def = 1.0f, .min = -FLT_MAX, .max = FLT_MAX,
 	},
 	{ .index = 6,
 	  .name = "b1",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
-	  .def = 0.0f, .min = -10.0f, .max = 10.0f,
+	  .def = 0.0f, .min = -FLT_MAX, .max = FLT_MAX,
 	},
 	{ .index = 7,
 	  .name = "b2",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
-	  .def = 0.0f, .min = -10.0f, .max = 10.0f,
+	  .def = 0.0f, .min = -FLT_MAX, .max = FLT_MAX,
 	},
 	{ .index = 8,
 	  .name = "a0",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
-	  .def = 1.0f, .min = -10.0f, .max = 10.0f,
+	  .def = 1.0f, .min = -FLT_MAX, .max = FLT_MAX,
 	},
 	{ .index = 9,
 	  .name = "a1",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
-	  .def = 0.0f, .min = -10.0f, .max = 10.0f,
+	  .def = 0.0f, .min = -FLT_MAX, .max = FLT_MAX,
 	},
 	{ .index = 10,
 	  .name = "a2",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
-	  .def = 0.0f, .min = -10.0f, .max = 10.0f,
+	  .def = 0.0f, .min = -FLT_MAX, .max = FLT_MAX,
 	},
 
 };
@@ -826,7 +852,9 @@ static void impulse_clear(struct impulse *ir)
 static int finfo_read_samples(struct plugin *pl, struct finfo *info, struct impulse *ir)
 {
 	float *samples, v;
-	int i, n, h, delay = (int)(ir->delay * info->rate);
+	int i, h;
+	int64_t delay = (int64_t)(ir->delay * info->rate), n;
+	size_t alloc_size;
 
 	if (ir->length <= 0)
 		ir->length = info->def_frames;
@@ -835,11 +863,13 @@ static int finfo_read_samples(struct plugin *pl, struct finfo *info, struct impu
 
 	ir->length -= SPA_MIN(ir->offset, ir->length);
 
-	n = delay + ir->length;
-	if (n == 0)
+	if (spa_overflow_add(delay, ir->length, &n) || n == 0)
 		return -EINVAL;
 
-	samples = calloc(n * info->channels, sizeof(float));
+	if (spa_overflow_mul(n, info->channels, &alloc_size))
+		return -ENOMEM;
+
+	samples = calloc(alloc_size, sizeof(float));
 	if (samples == NULL)
 		return -errno;
 
@@ -947,10 +977,15 @@ static float *resample_buffer(struct plugin *pl, float *samples, int *n_samples,
 {
 #ifdef HAVE_SPA_PLUGINS
 	uint32_t in_len, out_len, total_out = 0;
-	int out_n_samples;
-	float *out_samples, *out_buf, *in_buf;
+	uint64_t out_n_samples;
+	float *out_samples = NULL, *out_buf, *in_buf;
 	struct resample r;
 	int res;
+
+	if (*n_samples <= 0 || in_rate == 0 || out_rate == 0) {
+		errno = EINVAL;
+		return NULL;
+	}
 
 	spa_zero(r);
 	r.channels = 1;
@@ -961,10 +996,16 @@ static float *resample_buffer(struct plugin *pl, float *samples, int *n_samples,
 	if ((res = resample_native_init(&r)) < 0) {
 		spa_log_error(pl->log, "resampling failed: %s", spa_strerror(res));
 		errno = -res;
-		return NULL;
+		goto error;
 	}
 
-	out_n_samples = SPA_ROUND_UP(*n_samples * out_rate, in_rate) / in_rate;
+	if (spa_overflow_mul(*n_samples, out_rate, &out_n_samples) ||
+	    spa_overflow_add(out_n_samples, in_rate-1, &out_n_samples)) {
+		errno = ENOMEM;
+		goto error;
+	}
+	out_n_samples /= in_rate;
+
 	out_samples = calloc(out_n_samples, sizeof(float));
 	if (out_samples == NULL)
 		goto error;
@@ -1090,6 +1131,10 @@ static int convolver_read_impulse(struct plugin *pl, struct spa_json *obj,
 				goto error;
 			}
 		}
+		else if (spa_streq(key, "blocksize") ||
+		    spa_streq(key, "tailsize") || spa_streq(key, "latency")) {
+			continue;
+		}
 		else {
 			spa_log_warn(pl->log, "convolver: ignoring config key: '%s'", key);
 		}
@@ -1099,8 +1144,8 @@ static int convolver_read_impulse(struct plugin *pl, struct spa_json *obj,
 		goto error;
 	}
 
-	if (ir->delay < 0.0f)
-		ir->delay = 0.0f;
+	/* 10 seconds delay max */
+	ir->delay = SPA_CLAMPF(ir->delay, 0.0f, 10.0f);
 	if (ir->offset < 0)
 		ir->offset = 0;
 
@@ -1122,8 +1167,8 @@ error:
 	return res;
 }
 
-static void * convolver_instantiate(const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor * Descriptor,
-		unsigned long SampleRate, int index, const char *config)
+static int convolver_instantiate1(const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor * Descriptor,
+		uint32_t rate, uint32_t index, const char *config, void **hndl)
 {
 	struct plugin *pl = SPA_CONTAINER_OF(plugin, struct plugin, plugin);
 	struct convolver_impl *impl = NULL;
@@ -1135,42 +1180,39 @@ static void * convolver_instantiate(const struct spa_fga_plugin *plugin, const s
 	float latency = -1.0f;
 	struct impulse ir = IMPULSE_INIT(index);
 
-	errno = EINVAL;
 	if (config == NULL) {
 		spa_log_error(pl->log, "convolver: requires a config section");
-		return NULL;
+		return -EINVAL;
 	}
 
 	if (spa_json_begin_object(&it[0], config, strlen(config)) <= 0) {
 		spa_log_error(pl->log, "convolver:config must be an object");
-		return NULL;
+		return -EINVAL;
 	}
 
 	while ((len = spa_json_object_next(&it[0], key, sizeof(key), &val)) > 0) {
 		if (spa_streq(key, "blocksize")) {
 			if (spa_json_parse_int(val, len, &blocksize) <= 0) {
 				spa_log_error(pl->log, "convolver:blocksize requires a number");
-				return NULL;
+				return -EINVAL;
 			}
 		}
 		else if (spa_streq(key, "tailsize")) {
 			if (spa_json_parse_int(val, len, &tailsize) <= 0) {
 				spa_log_error(pl->log, "convolver:tailsize requires a number");
-				return NULL;
+				return -EINVAL;
 			}
 		}
 		else if (spa_streq(key, "latency")) {
 			if (spa_json_parse_float(val, len, &latency) <= 0) {
 				spa_log_error(pl->log, "convolver:latency requires a number");
-				return NULL;
+				return -EINVAL;
 			}
 		}
 	}
 	spa_json_begin_object(&it[0], config, strlen(config));
-	if ((res = convolver_read_impulse(pl, &it[0], SampleRate, &ir)) < 0) {
-		errno = -res;
-		return NULL;
-	}
+	if ((res = convolver_read_impulse(pl, &it[0], rate, &ir)) < 0)
+		return res;
 
 	if (blocksize <= 0)
 		blocksize = SPA_CLAMP(ir.n_samples, 64, 256);
@@ -1182,12 +1224,12 @@ static void * convolver_instantiate(const struct spa_fga_plugin *plugin, const s
 
 	impl = calloc(1, sizeof(*impl));
 	if (impl == NULL)
-		goto error;
+		goto error_errno;
 
 	impl->plugin = pl;
 	impl->log = pl->log;
 	impl->dsp = pl->dsp;
-	impl->rate = SampleRate;
+	impl->rate = rate;
 	if (latency < 0.0f)
 		impl->latency = ir.latency;
 	else
@@ -1195,15 +1237,25 @@ static void * convolver_instantiate(const struct spa_fga_plugin *plugin, const s
 
 	impl->conv = convolver_new(impl->dsp, blocksize, tailsize, ir.samples, ir.n_samples);
 	if (impl->conv == NULL)
-		goto error;
+		goto error_errno;
+
+	*hndl = impl;
 
 	impulse_clear(&ir);
 
-	return impl;
-error:
+	return 0;
+
+error_errno:
+	res = -errno;
 	impulse_clear(&ir);
 	free(impl);
-	return NULL;
+	return res;
+}
+
+static int convolver_instantiate(const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor *desc,
+		uint32_t rate, const char *config, uint32_t n_hndl, void *hndl[])
+{
+	return instantiate_helper(plugin, desc, rate, config, n_hndl, hndl, convolver_instantiate1);
 }
 
 static void convolver_connect_port(void * Instance, unsigned long Port,
@@ -1275,8 +1327,8 @@ static const struct spa_fga_descriptor convolve_desc = {
 };
 
 /** convolver2 */
-static void * convolver2_instantiate(const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor * Descriptor,
-		unsigned long SampleRate, int index, const char *config)
+static int convolver2_instantiate1(const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor * Descriptor,
+		uint32_t rate, uint32_t index, const char *config, void **hndl)
 {
 	struct plugin *pl = SPA_CONTAINER_OF(plugin, struct plugin, plugin);
 	struct convolver_impl *impl = NULL;
@@ -1290,46 +1342,49 @@ static void * convolver2_instantiate(const struct spa_fga_plugin *plugin, const 
 	struct convolver_ir cir[8];
 	int n_ir = 0;
 
-	errno = EINVAL;
 	if (config == NULL) {
 		spa_log_error(pl->log, "convolver: requires a config section");
-		return NULL;
+		return -EINVAL;
 	}
 
 	if (spa_json_begin_object(&it[0], config, strlen(config)) <= 0) {
 		spa_log_error(pl->log, "convolver:config must be an object");
-		return NULL;
+		return -EINVAL;
 	}
 
 	while ((len = spa_json_object_next(&it[0], key, sizeof(key), &val)) > 0) {
 		if (spa_streq(key, "blocksize")) {
 			if (spa_json_parse_int(val, len, &blocksize) <= 0) {
 				spa_log_error(pl->log, "convolver2:blocksize requires a number");
-				return NULL;
+				return -EINVAL;
 			}
 		}
 		else if (spa_streq(key, "tailsize")) {
 			if (spa_json_parse_int(val, len, &tailsize) <= 0) {
 				spa_log_error(pl->log, "convolver2:tailsize requires a number");
-				return NULL;
+				return -EINVAL;
 			}
 		}
 		else if (spa_streq(key, "latency")) {
 			if (spa_json_parse_float(val, len, &latency) <= 0) {
 				spa_log_error(pl->log, "convolver2:latency requires a number");
-				return NULL;
+				return -EINVAL;
 			}
 		}
 		else if (spa_streq(key, "impulses")) {
 			if (!spa_json_is_array(val, len)) {
 				spa_log_error(pl->log, "convolver2:impulses require an array");
-				return NULL;
+				return -EINVAL;
 			}
 			spa_json_enter(&it[0], &it[1]);
 			while (spa_json_enter_object(&it[1], &it[2]) > 0) {
+				if (n_ir >= (int)SPA_N_ELEMENTS(ir)) {
+					spa_log_error(pl->log, "convolver2:too many impulses (%d)", n_ir);
+					goto error;
+				}
 				ir[n_ir] = IMPULSE_INIT(n_ir);
-				if ((res = convolver_read_impulse(pl, &it[2], SampleRate, &ir[n_ir])) < 0)
-					return NULL;
+				if ((res = convolver_read_impulse(pl, &it[2], rate, &ir[n_ir])) < 0)
+					return res;
 
 				max_samples = SPA_MAX(max_samples, ir[n_ir].n_samples);
 				cir[n_ir].ir = ir[n_ir].samples;
@@ -1361,7 +1416,7 @@ static void * convolver2_instantiate(const struct spa_fga_plugin *plugin, const 
 	impl->plugin = pl;
 	impl->log = pl->log;
 	impl->dsp = pl->dsp;
-	impl->rate = SampleRate;
+	impl->rate = rate;
 	if (latency < 0.0f)
 		impl->latency = ir[0].latency;
 	else
@@ -1371,13 +1426,20 @@ static void * convolver2_instantiate(const struct spa_fga_plugin *plugin, const 
 	if (impl->conv == NULL)
 		goto error;
 
+	*hndl = impl;
 
-	return impl;
+	return 0;
 error:
 	for (i = 0; i < n_ir; i++)
 		impulse_clear(&ir[i]);
 	free(impl);
-	return NULL;
+	return -EINVAL;
+}
+
+static int convolver2_instantiate(const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor *desc,
+		uint32_t rate, const char *config, uint32_t n_hndl, void *hndl[])
+{
+	return instantiate_helper(plugin, desc, rate, config, n_hndl, hndl, convolver2_instantiate1);
 }
 
 static void convolver2_run(void * Instance, unsigned long SampleCount)
@@ -1481,8 +1543,8 @@ static void delay_cleanup(void * Instance)
 	free(impl);
 }
 
-static void *delay_instantiate(const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor * Descriptor,
-		unsigned long SampleRate, int index, const char *config)
+static int delay_instantiate1(const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor * Descriptor,
+		uint32_t rate, uint32_t index, const char *config, void **hndl)
 {
 	struct plugin *pl = SPA_CONTAINER_OF(plugin, struct plugin, plugin);
 	struct delay_impl *impl;
@@ -1494,25 +1556,24 @@ static void *delay_instantiate(const struct spa_fga_plugin *plugin, const struct
 
 	if (config == NULL) {
 		spa_log_error(pl->log, "delay: requires a config section");
-		errno = EINVAL;
-		return NULL;
+		return -EINVAL;
 	}
 
 	if (spa_json_begin_object(&it[0], config, strlen(config)) <= 0) {
 		spa_log_error(pl->log, "delay:config must be an object");
-		return NULL;
+		return -EINVAL;
 	}
 
 	while ((len = spa_json_object_next(&it[0], key, sizeof(key), &val)) > 0) {
 		if (spa_streq(key, "max-delay")) {
 			if (spa_json_parse_float(val, len, &max_delay) <= 0) {
 				spa_log_error(pl->log, "delay:max-delay requires a number");
-				return NULL;
+				return -EINVAL;
 			}
 		} else if (spa_streq(key, "latency")) {
 			if (spa_json_parse_float(val, len, &latency) <= 0) {
 				spa_log_error(pl->log, "delay:latency requires a number");
-				return NULL;
+				return -EINVAL;
 			}
 		} else {
 			spa_log_warn(pl->log, "delay: ignoring config key: '%s'", key);
@@ -1525,12 +1586,12 @@ static void *delay_instantiate(const struct spa_fga_plugin *plugin, const struct
 
 	impl = calloc(1, sizeof(*impl));
 	if (impl == NULL)
-		return NULL;
+		return -errno;
 
 	impl->plugin = pl;
 	impl->dsp = pl->dsp;
 	impl->log = pl->log;
-	impl->rate = SampleRate;
+	impl->rate = rate;
 	impl->buffer_samples = SPA_ROUND_UP_N((uint32_t)(max_delay * impl->rate), 64);
 	impl->latency = latency * impl->rate;
 	spa_log_info(impl->log, "max-delay:%f seconds rate:%lu samples:%d latency:%f",
@@ -1540,14 +1601,21 @@ static void *delay_instantiate(const struct spa_fga_plugin *plugin, const struct
 	if (spa_overflow_mul((size_t)impl->buffer_samples, (size_t)2, &buf_count) ||
 	    spa_overflow_add(buf_count, (size_t)64, &buf_count)) {
 		delay_cleanup(impl);
-		return NULL;
+		return -ERANGE;
 	}
 	impl->buffer = calloc(buf_count, sizeof(float));
 	if (impl->buffer == NULL) {
 		delay_cleanup(impl);
-		return NULL;
+		return -errno;
 	}
-	return impl;
+	*hndl = impl;
+	return 0;
+}
+
+static int delay_instantiate(const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor *desc,
+		uint32_t rate, const char *config, uint32_t n_hndl, void *hndl[])
+{
+	return instantiate_helper(plugin, desc, rate, config, n_hndl, hndl, delay_instantiate1);
 }
 
 static void delay_connect_port(void * Instance, unsigned long Port,
@@ -1699,12 +1767,12 @@ static struct spa_fga_port clamp_ports[] = {
 	{ .index = 4,
 	  .name = "Min",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
-	  .def = 0.0f, .min = -100.0f, .max = 100.0f
+	  .def = 0.0f, .min = -FLT_MAX, .max = FLT_MAX
 	},
 	{ .index = 5,
 	  .name = "Max",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
-	  .def = 1.0f, .min = -100.0f, .max = 100.0f
+	  .def = 1.0f, .min = -FLT_MAX, .max = FLT_MAX
 	},
 };
 
@@ -1757,12 +1825,12 @@ static struct spa_fga_port linear_ports[] = {
 	{ .index = 4,
 	  .name = "Mult",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
-	  .def = 1.0f, .min = -10.0f, .max = 10.0f
+	  .def = 1.0f, .min = -FLT_MAX, .max = FLT_MAX
 	},
 	{ .index = 5,
 	  .name = "Add",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
-	  .def = 0.0f, .min = -10.0f, .max = 10.0f
+	  .def = 0.0f, .min = -FLT_MAX, .max = FLT_MAX
 	},
 };
 
@@ -1875,7 +1943,7 @@ static struct spa_fga_port exp_ports[] = {
 	{ .index = 4,
 	  .name = "Base",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
-	  .def = (float)M_E, .min = -10.0f, .max = 10.0f
+	  .def = (float)M_E, .min = -FLT_MAX, .max = FLT_MAX
 	},
 };
 
@@ -1933,17 +2001,17 @@ static struct spa_fga_port log_ports[] = {
 	{ .index = 4,
 	  .name = "Base",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
-	  .def = (float)M_E, .min = 2.0f, .max = 100.0f
+	  .def = (float)M_E, .min = 2.0f, .max = FLT_MAX
 	},
 	{ .index = 5,
 	  .name = "M1",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
-	  .def = 1.0f, .min = -10.0f, .max = 10.0f
+	  .def = 1.0f, .min = -FLT_MAX, .max = FLT_MAX
 	},
 	{ .index = 6,
 	  .name = "M2",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
-	  .def = 1.0f, .min = -10.0f, .max = 10.0f
+	  .def = 1.0f, .min = -FLT_MAX, .max = FLT_MAX
 	},
 };
 
@@ -2076,7 +2144,7 @@ static struct spa_fga_port sine_ports[] = {
 	{ .index = 3,
 	  .name = "Ampl",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
-	  .def = 1.0, .min = 0.0f, .max = 10.0f
+	  .def = 1.0, .min = -FLT_MAX, .max = FLT_MAX
 	},
 	{ .index = 4,
 	  .name = "Phase",
@@ -2086,7 +2154,7 @@ static struct spa_fga_port sine_ports[] = {
 	{ .index = 5,
 	  .name = "Offset",
 	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_CONTROL,
-	  .def = 0.0f, .min = -10.0f, .max = 10.0f
+	  .def = 0.0f, .min = -FLT_MAX, .max = FLT_MAX
 	},
 };
 
@@ -2279,8 +2347,8 @@ static int parse_filters(struct plugin *pl, struct spa_json *iter, int rate,
  *   filtersX = [ ... ] # to load channel X
  * }
  */
-static void *param_eq_instantiate(const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor * Descriptor,
-		unsigned long SampleRate, int index, const char *config)
+static int param_eq_instantiate1(const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor * Descriptor,
+		uint32_t rate, uint32_t index, const char *config, void **hndl)
 {
 	struct plugin *pl = SPA_CONTAINER_OF(plugin, struct plugin, plugin);
 	struct spa_json it[3];
@@ -2292,23 +2360,22 @@ static void *param_eq_instantiate(const struct spa_fga_plugin *plugin, const str
 
 	if (config == NULL) {
 		spa_log_error(pl->log, "param_eq: requires a config section");
-		errno = EINVAL;
-		return NULL;
+		return  -EINVAL;
 	}
 
 	if (spa_json_begin_object(&it[0], config, strlen(config)) <= 0) {
 		spa_log_error(pl->log, "param_eq: config must be an object");
-		return NULL;
+		return -EINVAL;
 	}
 
 	impl = calloc(1, sizeof(*impl));
 	if (impl == NULL)
-		return NULL;
+		return -errno;
 
 	impl->plugin = pl;
 	impl->dsp = pl->dsp;
 	impl->log = pl->log;
-	impl->rate = SampleRate;
+	impl->rate = rate;
 	for (i = 0; i < SPA_N_ELEMENTS(impl->bq); i++)
 		biquad_set(&impl->bq[i], BQ_NONE, 0.0f, 0.0f, 0.0f);
 
@@ -2358,10 +2425,17 @@ static void *param_eq_instantiate(const struct spa_fga_plugin *plugin, const str
 						sizeof(struct biquad) * PARAM_EQ_MAX);
 		}
 	}
-	return impl;
+	*hndl = impl;
+	return 0;
 error:
 	free(impl);
-	return NULL;
+	return -EINVAL;
+}
+
+static int param_eq_instantiate(const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor *desc,
+		uint32_t rate, const char *config, uint32_t n_hndl, void *hndl[])
+{
+	return instantiate_helper(plugin, desc, rate, config, n_hndl, hndl, param_eq_instantiate1);
 }
 
 static void param_eq_connect_port(void * Instance, unsigned long Port,
@@ -2448,7 +2522,8 @@ static struct spa_fga_port param_eq_ports[] = {
 
 static const struct spa_fga_descriptor param_eq_desc = {
 	.name = "param_eq",
-	.flags = SPA_FGA_DESCRIPTOR_SUPPORTS_NULL_DATA,
+	.flags = SPA_FGA_DESCRIPTOR_SUPPORTS_NULL_DATA |
+		SPA_FGA_DESCRIPTOR_PORT_PAIR,
 
 	.n_ports = SPA_N_ELEMENTS(param_eq_ports),
 	.ports = param_eq_ports,
@@ -2480,15 +2555,11 @@ static void max_run(void * Instance, unsigned long SampleCount)
 	} else if (n_srcs == 1) {
 		spa_memcpy(out, src[0], SampleCount * sizeof(float));
 	} else {
-		for (p = 0; p < n_srcs; p++) {
-			if (p == 0) {
-				for (n = 0; n < SampleCount; n++)
-					out[n] = SPA_MAX(src[p][n], src[p + 1][n]);
-				p++;
-			} else {
-				for (n = 0; n < SampleCount; n++)
-					out[n] = SPA_MAX(out[n], src[p][n]);
-			}
+		for (n = 0; n < SampleCount; n++)
+			out[n] = SPA_MAX(src[0][n], src[1][n]);
+		for (p = 2; p < n_srcs; p++) {
+			for (n = 0; n < SampleCount; n++)
+				out[n] = SPA_MAX(out[n], src[p][n]);
 		}
 	}
 }
@@ -2546,6 +2617,89 @@ static const struct spa_fga_descriptor max_desc = {
 	.cleanup = builtin_cleanup,
 };
 
+/** min */
+static void min_run(void * Instance, unsigned long SampleCount)
+{
+	struct builtin *impl = Instance;
+	float *out = impl->port[0];
+	float *src[8];
+	unsigned long n, p, n_srcs = 0;
+
+	if (out == NULL)
+		return;
+
+	for (p = 1; p < 9; p++) {
+		if (impl->port[p] != NULL)
+			src[n_srcs++] = impl->port[p];
+	}
+
+	if (n_srcs == 0) {
+		spa_memzero(out, SampleCount * sizeof(float));
+	} else if (n_srcs == 1) {
+		spa_memcpy(out, src[0], SampleCount * sizeof(float));
+	} else {
+		for (n = 0; n < SampleCount; n++)
+			out[n] = SPA_MIN(src[0][n], src[1][n]);
+		for (p = 2; p < n_srcs; p++) {
+			for (n = 0; n < SampleCount; n++)
+				out[n] = SPA_MIN(out[n], src[p][n]);
+		}
+	}
+}
+
+static struct spa_fga_port min_ports[] = {
+	{ .index = 0,
+	  .name = "Out",
+	  .flags = SPA_FGA_PORT_OUTPUT | SPA_FGA_PORT_AUDIO,
+	},
+
+	{ .index = 1,
+	  .name = "In 1",
+	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_AUDIO,
+	},
+	{ .index = 2,
+	  .name = "In 2",
+	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_AUDIO,
+	},
+	{ .index = 3,
+	  .name = "In 3",
+	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_AUDIO,
+	},
+	{ .index = 4,
+	  .name = "In 4",
+	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_AUDIO,
+	},
+	{ .index = 5,
+	  .name = "In 5",
+	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_AUDIO,
+	},
+	{ .index = 6,
+	  .name = "In 6",
+	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_AUDIO,
+	},
+	{ .index = 7,
+	  .name = "In 7",
+	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_AUDIO,
+	},
+	{ .index = 8,
+	  .name = "In 8",
+	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_AUDIO,
+	},
+};
+
+static const struct spa_fga_descriptor min_desc = {
+	.name = "min",
+	.flags = SPA_FGA_DESCRIPTOR_SUPPORTS_NULL_DATA,
+
+	.n_ports = SPA_N_ELEMENTS(min_ports),
+	.ports = min_ports,
+
+	.instantiate = builtin_instantiate,
+	.connect_port = builtin_connect_port,
+	.run = min_run,
+	.cleanup = builtin_cleanup,
+};
+
 /* DC blocking */
 struct dcblock {
 	float xm1;
@@ -2564,21 +2718,28 @@ struct dcblock_impl {
 	struct dcblock dc[8];
 };
 
-static void *dcblock_instantiate(const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor * Descriptor,
-		unsigned long SampleRate, int index, const char *config)
+static int dcblock_instantiate1(const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor * Descriptor,
+		uint32_t rate, uint32_t index, const char *config, void **hndl)
 {
 	struct plugin *pl = SPA_CONTAINER_OF(plugin, struct plugin, plugin);
 	struct dcblock_impl *impl;
 
 	impl = calloc(1, sizeof(*impl));
 	if (impl == NULL)
-		return NULL;
+		return -errno;
 
 	impl->plugin = pl;
 	impl->dsp = pl->dsp;
 	impl->log = pl->log;
-	impl->rate = SampleRate;
-	return impl;
+	impl->rate = rate;
+	*hndl = impl;
+	return 0;
+}
+
+static int dcblock_instantiate(const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor *desc,
+		uint32_t rate, const char *config, uint32_t n_hndl, void *hndl[])
+{
+	return instantiate_helper(plugin, desc, rate, config, n_hndl, hndl, dcblock_instantiate1);
 }
 
 static void dcblock_run_n(struct dcblock dc[], float *dst[], const float *src[],
@@ -2698,7 +2859,8 @@ static struct spa_fga_port dcblock_ports[] = {
 
 static const struct spa_fga_descriptor dcblock_desc = {
 	.name = "dcblock",
-	.flags = SPA_FGA_DESCRIPTOR_SUPPORTS_NULL_DATA,
+	.flags = SPA_FGA_DESCRIPTOR_SUPPORTS_NULL_DATA |
+		SPA_FGA_DESCRIPTOR_PORT_PAIR,
 
 	.n_ports = SPA_N_ELEMENTS(dcblock_ports),
 	.ports = dcblock_ports,
@@ -2911,225 +3073,6 @@ static const struct spa_fga_descriptor debug_desc = {
 	.connect_port = builtin_connect_port,
 	.run = debug_run,
 	.cleanup = builtin_cleanup,
-};
-
-/* pipe */
-struct pipe_impl {
-	struct plugin *plugin;
-
-	struct spa_log *log;
-	struct spa_fga_dsp *dsp;
-	unsigned long rate;
-	float *port[3];
-	float latency;
-
-	int write_fd;
-	int read_fd;
-	size_t written;
-	size_t read;
-};
-
-static int do_exec(struct pipe_impl *impl, const char *command)
-{
-	int pid, res, len, argc = 0;
-	char *argv[512];
-	struct spa_json it[2];
-	const char *value;
-	int stdin_pipe[2];
-	int stdout_pipe[2];
-
-        if (spa_json_begin_array_relax(&it[0], command, strlen(command)) <= 0)
-                return -EINVAL;
-
-        while ((len = spa_json_next(&it[0], &value)) > 0) {
-                char *s;
-
-                if (argc >= (int)SPA_N_ELEMENTS(argv) - 1) {
-                        spa_log_error(impl->log, "too many exec arguments");
-                        return -E2BIG;
-                }
-                if ((s = malloc(len+1)) == NULL)
-                        return -errno;
-
-                spa_json_parse_stringn(value, len, s, len+1);
-
-		argv[argc++] = s;
-        }
-	argv[argc++] = NULL;
-
-	pipe2(stdin_pipe, 0);
-	pipe2(stdout_pipe, 0);
-
-	impl->write_fd = stdin_pipe[1];
-	impl->read_fd = stdout_pipe[0];
-
-	pid = fork();
-
-	if (pid == 0) {
-		char buf[1024];
-		char *const *p;
-		struct spa_strbuf s;
-
-		/* Double fork to avoid zombies; we don't want to set SIGCHLD handler */
-		pid = fork();
-
-		if (pid < 0) {
-			spa_log_error(impl->log, "fork error: %m");
-			goto done;
-		} else if (pid != 0) {
-			exit(0);
-		}
-
-		dup2(stdin_pipe[0], 0);
-		dup2(stdout_pipe[1], 1);
-
-		spa_strbuf_init(&s, buf, sizeof(buf));
-		for (p = argv; *p; ++p)
-			spa_strbuf_append(&s, " '%s'", *p);
-
-		spa_log_info(impl->log, "exec%s", s.buffer);
-		res = execvp(argv[0], argv);
-
-		if (res == -1) {
-			res = -errno;
-			spa_log_error(impl->log, "execvp error '%s': %m", argv[0]);
-		}
-done:
-		exit(1);
-	} else if (pid < 0) {
-		spa_log_error(impl->log, "fork error: %m");
-	} else {
-		int status = 0;
-		do {
-			errno = 0;
-			res = waitpid(pid, &status, 0);
-		} while (res < 0 && errno == EINTR);
-		spa_log_debug(impl->log, "exec got pid %d res:%d status:%d", (int)pid, res, status);
-	}
-	return 0;
-}
-
-static void pipe_transfer(struct pipe_impl *impl, float *in, float *out, int count)
-{
-	ssize_t sz;
-
-	sz = read(impl->read_fd, out, count * sizeof(float));
-	if (sz > 0) {
-		impl->read += sz;
-		if (impl->read == (size_t)sz) {
-			while ((sz = read(impl->read_fd, out, count * sizeof(float))) != -1)
-				impl->read += sz;
-		}
-	} else {
-		memset(out, 0, count * sizeof(float));
-	}
-	if ((sz = write(impl->write_fd, in, count * sizeof(float))) != -1)
-		impl->written += sz;
-}
-
-static void *pipe_instantiate(const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor * Descriptor,
-		unsigned long SampleRate, int index, const char *config)
-{
-	struct plugin *pl = SPA_CONTAINER_OF(plugin, struct plugin, plugin);
-	struct pipe_impl *impl;
-	struct spa_json it[2];
-	const char *val;
-	char key[256];
-	spa_autofree char*command = NULL;
-	int len;
-
-	errno = EINVAL;
-	if (config == NULL) {
-		spa_log_error(pl->log, "pipe: requires a config section");
-		return NULL;
-	}
-
-	if (spa_json_begin_object(&it[0], config, strlen(config)) <= 0) {
-		spa_log_error(pl->log, "pipe: config must be an object");
-		return NULL;
-	}
-
-	while ((len = spa_json_object_next(&it[0], key, sizeof(key), &val)) > 0) {
-		if (spa_streq(key, "command")) {
-			if ((command = malloc(len+1)) == NULL)
-				return NULL;
-
-			if (spa_json_parse_stringn(val, len, command, len+1) <= 0) {
-				spa_log_error(pl->log, "pipe: command requires a string");
-				return NULL;
-			}
-		}
-		else {
-			spa_log_warn(pl->log, "pipe: ignoring config key: '%s'", key);
-		}
-	}
-	if (command == NULL || command[0] == '\0') {
-		spa_log_error(pl->log, "pipe: command must be given and can not be empty");
-		return NULL;
-	}
-
-	impl = calloc(1, sizeof(*impl));
-	if (impl == NULL)
-		return NULL;
-
-	impl->plugin = pl;
-	impl->log = pl->log;
-	impl->dsp = pl->dsp;
-	impl->rate = SampleRate;
-
-	do_exec(impl, command);
-
-	fcntl(impl->write_fd, F_SETFL, fcntl(impl->write_fd, F_GETFL) | O_NONBLOCK);
-	fcntl(impl->read_fd, F_SETFL, fcntl(impl->read_fd, F_GETFL) | O_NONBLOCK);
-
-	return impl;
-}
-
-static void pipe_connect_port(void *Instance, unsigned long Port, void * DataLocation)
-{
-	struct pipe_impl *impl = Instance;
-	impl->port[Port] = DataLocation;
-}
-
-static void pipe_run(void * Instance, unsigned long SampleCount)
-{
-	struct pipe_impl *impl = Instance;
-	float *in = impl->port[0], *out = impl->port[1];
-
-	if (in != NULL && out != NULL)
-		pipe_transfer(impl, in, out, SampleCount);
-}
-
-static void pipe_cleanup(void * Instance)
-{
-	struct pipe_impl *impl = Instance;
-	close(impl->write_fd);
-	close(impl->read_fd);
-	free(impl);
-}
-
-static struct spa_fga_port pipe_ports[] = {
-	{ .index = 0,
-	  .name = "In",
-	  .flags = SPA_FGA_PORT_INPUT | SPA_FGA_PORT_AUDIO,
-	},
-	{ .index = 1,
-	  .name = "Out",
-	  .flags = SPA_FGA_PORT_OUTPUT | SPA_FGA_PORT_AUDIO,
-	},
-};
-
-static const struct spa_fga_descriptor pipe_desc = {
-	.name = "pipe",
-	.flags = SPA_FGA_DESCRIPTOR_SUPPORTS_NULL_DATA,
-
-	.n_ports = SPA_N_ELEMENTS(pipe_ports),
-	.ports = pipe_ports,
-
-	.instantiate = pipe_instantiate,
-	.connect_port = pipe_connect_port,
-	.run = pipe_run,
-	.cleanup = pipe_cleanup,
 };
 
 /* zeroramp */
@@ -3383,8 +3326,8 @@ struct busy_impl {
 	float cpu_scale;
 };
 
-static void *busy_instantiate(const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor * Descriptor,
-		unsigned long SampleRate, int index, const char *config)
+static int busy_instantiate1(const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor * Descriptor,
+		uint32_t rate, uint32_t index, const char *config, void **hndl)
 {
 	struct plugin *pl = SPA_CONTAINER_OF(plugin, struct plugin, plugin);
 	struct busy_impl *impl;
@@ -3397,19 +3340,18 @@ static void *busy_instantiate(const struct spa_fga_plugin *plugin, const struct 
 	if (config != NULL) {
 		if (spa_json_begin_object(&it[0], config, strlen(config)) <= 0) {
 			spa_log_error(pl->log, "busy:config must be an object");
-			return NULL;
+			return -EINVAL;
 		}
-
 		while ((len = spa_json_object_next(&it[0], key, sizeof(key), &val)) > 0) {
 			if (spa_streq(key, "wait-percent")) {
 				if (spa_json_parse_float(val, len, &wait_percent) <= 0) {
 					spa_log_error(pl->log, "busy:wait-percent requires a number");
-					return NULL;
+					return -EINVAL;
 				}
 			} else if (spa_streq(key, "cpu-percent")) {
 				if (spa_json_parse_float(val, len, &cpu_percent) <= 0) {
 					spa_log_error(pl->log, "busy:cpu-percent requires a number");
-					return NULL;
+					return -EINVAL;
 				}
 			} else {
 				spa_log_warn(pl->log, "busy: ignoring config key: '%s'", key);
@@ -3423,17 +3365,24 @@ static void *busy_instantiate(const struct spa_fga_plugin *plugin, const struct 
 
 	impl = calloc(1, sizeof(*impl));
 	if (impl == NULL)
-		return NULL;
+		return -errno;
 
 	impl->plugin = pl;
 	impl->dsp = pl->dsp;
 	impl->log = pl->log;
-	impl->rate = SampleRate;
-	impl->wait_scale = wait_percent * SPA_NSEC_PER_SEC / (100.0f * SampleRate);
-	impl->cpu_scale = cpu_percent * SPA_NSEC_PER_SEC / (100.0f * SampleRate);
+	impl->rate = rate;
+	impl->wait_scale = wait_percent * SPA_NSEC_PER_SEC / (100.0f * rate);
+	impl->cpu_scale = cpu_percent * SPA_NSEC_PER_SEC / (100.0f * rate);
 	spa_log_info(impl->log, "wait-percent:%f cpu-percent:%f", wait_percent, cpu_percent);
+	*hndl = impl;
 
-	return impl;
+	return 0;
+}
+
+static int busy_instantiate(const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor *desc,
+		uint32_t rate, const char *config, uint32_t n_hndl, void *hndl[])
+{
+	return instantiate_helper(plugin, desc, rate, config, n_hndl, hndl, busy_instantiate1);
 }
 
 static void busy_run(void * Instance, unsigned long SampleCount)
@@ -3561,17 +3510,17 @@ static const struct spa_fga_descriptor * builtin_descriptor(unsigned long Index)
 	case 27:
 		return &debug_desc;
 	case 28:
-		return &pipe_desc;
-	case 29:
 		return &zeroramp_desc;
-	case 30:
+	case 29:
 		return &noisegate_desc;
-	case 31:
+	case 30:
 		return &busy_desc;
-	case 32:
+	case 31:
 		return &null_desc;
-	case 33:
+	case 32:
 		return &convolver2_desc;
+	case 33:
+		return &min_desc;
 	}
 	return NULL;
 }

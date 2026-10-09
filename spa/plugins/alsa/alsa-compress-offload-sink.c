@@ -586,7 +586,7 @@ static int device_write(struct impl *this, const void *data, uint32_t size)
 	res = compress_offload_api_write(this->device_context, data, num_bytes_to_write);
 
 	if (SPA_UNLIKELY(res < 0)) {
-		if (res == -EBADFD)
+		if (res == -EBADF)
 			spa_log_debug(this->log, "%p: device is paused", this);
 		else
 			spa_log_error(this->log, "%p: write error: %s", this, spa_strerror(res));
@@ -1264,10 +1264,10 @@ static int impl_node_set_param(void *object, uint32_t id, uint32_t flags,
 			return 0;
 		}
 
-		spa_pod_parse_object(param,
-			SPA_TYPE_OBJECT_Props, NULL,
-			SPA_PROP_device,       SPA_POD_OPT_Stringn(p->device, sizeof(p->device))
-		);
+		if ((res = spa_pod_parse_object(param,
+				SPA_TYPE_OBJECT_Props, NULL,
+				SPA_PROP_device,       SPA_POD_OPT_Stringn(p->device, sizeof(p->device)))) < 0)
+			return res;
 
 		spa_log_debug(this->log, "%p: setting device name to \"%s\"", this, p->device);
 
@@ -1971,7 +1971,7 @@ impl_init(const struct spa_handle_factory *factory, struct spa_handle *handle,
 		if (spa_streq(k, SPA_KEY_API_ALSA_PATH)) {
 			snprintf(this->props.device, sizeof(this->props.device), "%s", s);
 			if ((res = parse_device(this)) < 0)
-				return res;
+				goto error;
 		}
 	}
 

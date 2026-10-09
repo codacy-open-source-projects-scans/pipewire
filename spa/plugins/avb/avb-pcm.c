@@ -89,36 +89,31 @@ static int avb_set_param(struct state *state, const char *k, const char *s)
 
 static int position_to_string(struct channel_map *map, char *val, size_t len)
 {
-	uint32_t i, o = 0;
-	int r;
+	uint32_t i;
 	char pos[8];
-	o += snprintf(val, len, "[ ");
+	struct spa_strbuf b;
+
+	spa_strbuf_init(&b, val, len);
+	spa_strbuf_append(&b, "[ ");
 	for (i = 0; i < map->channels; i++) {
-		r = snprintf(val+o, len-o, "%s%s", i == 0 ? "" : ", ",
+		spa_strbuf_append(&b, "%s%s", i == 0 ? "" : ", ",
 				spa_type_audio_channel_make_short_name(map->pos[i],
 					pos, sizeof(pos), "UNK"));
-		if (r < 0 || o + r >= len)
-			return -ENOSPC;
-		o += r;
 	}
-	if (len > o)
-		o += snprintf(val+o, len-o, " ]");
+	spa_strbuf_append(&b, " ]");
 	return 0;
 }
 
 static int uint32_array_to_string(uint32_t *vals, uint32_t n_vals, char *val, size_t len)
 {
-	uint32_t i, o = 0;
-	int r;
-	o += snprintf(val, len, "[ ");
-	for (i = 0; i < n_vals; i++) {
-		r = snprintf(val+o, len-o, "%s%d", i == 0 ? "" : ", ", vals[i]);
-		if (r < 0 || o + r >= len)
-			return -ENOSPC;
-		o += r;
-	}
-	if (len > o)
-		o += snprintf(val+o, len-o, " ]");
+	uint32_t i;
+	struct spa_strbuf b;
+
+	spa_strbuf_init(&b, val, len);
+	spa_strbuf_append(&b, "[ ");
+	for (i = 0; i < n_vals; i++)
+		spa_strbuf_append(&b, "%s%d", i == 0 ? "" : ", ", vals[i]);
+	spa_strbuf_append(&b, " ]");
 	return 0;
 }
 
@@ -359,14 +354,20 @@ int spa_avb_parse_prop_params(struct state *state, struct spa_pod *params)
 		const char *name;
 		struct spa_pod *pod;
 		char value[512];
+		int res;
 
 		if (spa_pod_parser_get_string(&prs, &name) < 0)
 			break;
 
 		if (spa_pod_parser_get_pod(&prs, &pod) < 0)
 			break;
+
 		if (spa_pod_is_string(pod)) {
-			spa_pod_copy_string(pod, sizeof(value), value);
+			if ((res = spa_pod_copy_string(pod, sizeof(value), value)) < 0) {
+				spa_log_error(state->log, "can't copy value for '%s' (max %zu bytes): %s",
+						name, sizeof(value)-1, spa_strerror(res));
+				continue;
+			}
 		} else if (spa_pod_is_int(pod)) {
 			snprintf(value, sizeof(value), "%d",
 					SPA_POD_VALUE(struct spa_pod_int, pod));
@@ -416,6 +417,8 @@ int spa_avb_init(struct state *state, const struct spa_dict *info)
 
 int spa_avb_clear(struct state *state)
 {
+	free(state->ringbuffer_data);
+	state->ringbuffer_data = NULL;
 	return 0;
 }
 
@@ -546,7 +549,7 @@ static int setup_socket(struct state *state)
 	struct ifreq req;
 	struct props *p = &state->props;
 
-	fd = socket(AF_PACKET, SOCK_DGRAM|SOCK_NONBLOCK, htons(ETH_P_TSN));
+	fd = socket(AF_PACKET, SOCK_DGRAM | SOCK_CLOEXEC | SOCK_NONBLOCK, htons(ETH_P_TSN));
 	if (fd < 0) {
 		spa_log_error(state->log, "socket() failed: %m");
 		return -errno;
@@ -708,16 +711,20 @@ int spa_avb_set_format(struct state *state, struct spa_audio_info *fmt, uint32_t
 	state->timerfd = res;
 
 	if ((res = setup_packet(state, fmt)) < 0)
-		return res;
+		goto error_close_timerfd;
 
 	if ((res = setup_msg(state)) < 0)
-		return res;
+		goto error_free_pdu;
 
 	state->pdu_period = SPA_NSEC_PER_SEC * p->frames_per_pdu /
                           state->rate;
 
 	return 0;
 
+error_free_pdu:
+	free(state->pdu);
+error_close_timerfd:
+	close(state->timerfd);
 error_close_sockfd:
 	close(state->sockfd);
 	return res;
@@ -889,7 +896,7 @@ static int flush_write(struct state *state, uint64_t current_time)
 
 		n = sendmsg(state->sockfd, &state->msg, MSG_NOSIGNAL);
 		if (n < 0 || n != (ssize_t)state->pdu_size) {
-			spa_log_error(state->log, "sendmdg() failed: %m");
+			spa_log_error(state->log, "sendmsg() failed: %m");
 		}
 		txtime += state->pdu_period;
 		ptime += state->pdu_period;

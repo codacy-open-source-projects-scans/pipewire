@@ -99,9 +99,9 @@ static int ensure_state(struct pw_impl_node *node, bool running, bool idle)
 {
 	enum pw_node_state state = node->info.state;
 	bool need_config = SPA_FLAG_IS_SET(node->spa_flags, SPA_NODE_FLAG_NEED_CONFIGURE);
-	if (node->active && node->runnable && !need_config & running)
+	if (node->active && node->runnable && !need_config && running)
 		state = PW_NODE_STATE_RUNNING;
-	else if (!node->active && !need_config & idle)
+	else if (!need_config && idle)
 		state = PW_NODE_STATE_IDLE;
 	else if (state > PW_NODE_STATE_IDLE)
 		state = PW_NODE_STATE_IDLE;
@@ -431,14 +431,6 @@ static uint32_t flp2(uint32_t x)
 	return x - (x >> 1);
 }
 
-/* cmp fractions, avoiding overflows */
-static int fraction_compare(const struct spa_fraction *a, const struct spa_fraction *b)
-{
-	uint64_t fa = (uint64_t)a->num * (uint64_t)b->denom;
-	uint64_t fb = (uint64_t)b->num * (uint64_t)a->denom;
-	return fa < fb ? -1 : (fa > fb ? 1 : 0);
-}
-
 static inline uint32_t calc_gcd(uint32_t a, uint32_t b)
 {
 	while (b != 0) {
@@ -751,17 +743,17 @@ again:
 			/* smallest latencies */
 			if (latency.denom == 0 ||
 			    (s->latency.denom > 0 &&
-			     fraction_compare(&s->latency, &latency) < 0))
+			     spa_fraction_cmp(&s->latency, &latency) < 0))
 				latency = s->latency;
 			if (max_latency.denom == 0 ||
 			    (s->max_latency.denom > 0 &&
-			     fraction_compare(&s->max_latency, &max_latency) < 0))
+			     spa_fraction_cmp(&s->max_latency, &max_latency) < 0))
 				max_latency = s->max_latency;
 
 			/* largest rate, which is in fact the smallest fraction */
 			if (rate.denom == 0 ||
 			    (s->rate.denom > 0 &&
-			     fraction_compare(&s->rate, &rate) < 0))
+			     spa_fraction_cmp(&s->rate, &rate) < 0))
 				rate = s->rate;
 
 			if (s->active)
@@ -959,7 +951,7 @@ again:
 				continue;
 			pw_log_debug("%p: follower %p: active:%d '%s'",
 					context, s, s->active, s->name);
-			ensure_state(s, running, true);
+			ensure_state(s, running, !s->can_suspend);
 		}
 
 		if (transport != PW_NODE_ACTIVATION_COMMAND_NONE) {

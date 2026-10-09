@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stddef.h>
+#include <limits.h>
 #include <stdio.h>
 
 #ifdef __cplusplus
@@ -308,6 +309,49 @@ struct spa_fraction {
 	(uint32_t)(((_val) * (num) + (_denom)-1) / (_denom));	\
 })
 
+/* Macros for getting the next highest power of two, for 32 and 64 bit
+ * unsigned integers. If the integers are already a power of two, the
+ * result is unchanged. Source:
+ * https://graphics.stanford.edu/%7Eseander/bithacks.html#RoundUpPowerOf2 */
+
+#define SPA_ROUND_UP_POW2_32(num)				\
+({								\
+	uint32_t _n = (uint32_t)(num) - 1;			\
+	_n |= _n >> 1;						\
+	_n |= _n >> 2;						\
+	_n |= _n >> 4;						\
+	_n |= _n >> 8;						\
+	_n |= _n >> 16;						\
+	_n + 1;							\
+})
+
+#define SPA_ROUND_UP_POW2_64(num)				\
+({								\
+	uint64_t _n = (uint64_t)(num) - 1;			\
+	_n |= _n >> 1;						\
+	_n |= _n >> 2;						\
+	_n |= _n >> 4;						\
+	_n |= _n >> 8;						\
+	_n |= _n >> 16;						\
+	_n |= _n >> 32;						\
+	_n + 1;							\
+})
+
+/* The vast majority of real world machines use a two's complement method.
+ * However, it is still prudent to check for that instead of just assuming.
+ * Fortunately, it is simple to check for this by negating INT_MAX and
+ * subtracting 1 from that. In two's complement, there is one more negative
+ * integer than there are positive integers (due to two's complement having
+ * only one zero representation), and this check exploits that particular
+ * asymmetry.
+ * It is very important to make sure limits.h is included for this to work,
+ * since otherwise, INT_MIN and INT_MAX will be missing, and this will _not_
+ * cause a preprocessor error - instead, the #if check here silently fails,
+ * as if the machine used something other than a two's complement method. */
+#if INT_MIN == (-(INT_MAX) - 1)
+#define SPA_MACHINE_USES_TWOS_COMPLEMENT
+#endif
+
 
 #define SPA_PTR_ALIGNMENT(p,align)	((uintptr_t)(p) & ((align)-1))
 #define SPA_IS_ALIGNED(p,align)		(SPA_PTR_ALIGNMENT(p,align) == 0)
@@ -385,6 +429,16 @@ struct spa_error_location {
 			return (val);					\
 		}							\
 	} while(false)
+
+#define spa_goto_if_fail(expr, label)					\
+	do {								\
+		if (SPA_UNLIKELY(!(expr))) {				\
+			fprintf(stderr, "'%s' failed at %s:%u %s()\n",	\
+				#expr , __FILE__, __LINE__, __func__);	\
+			goto label;					\
+		}							\
+	} while(false)
+
 
 /* spa_assert_se() is an assert which guarantees side effects of x,
  * i.e. is never optimized away, regardless of NDEBUG or FASTPATH. */
@@ -466,6 +520,14 @@ struct spa_error_location {
 		_res = alloca((size_t)n * (size_t)size);	\
 	_res;							\
 })
+
+SPA_API_UTILS_DEFS int spa_fraction_cmp(const struct spa_fraction *a, const struct spa_fraction *b)
+{
+	uint64_t x = (uint64_t) a->num * b->denom;
+	uint64_t y = (uint64_t) b->num * a->denom;
+
+	return SPA_CMP(x, y);
+}
 
 /**
  * \}

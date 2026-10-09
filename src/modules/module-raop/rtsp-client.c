@@ -10,6 +10,7 @@
 
 #include <spa/utils/result.h>
 
+#include "network-utils.h"
 #include "rtsp-client.h"
 
 #define pw_rtsp_client_emit(o,m,v,...) spa_hook_list_call(&o->listener_list, struct pw_rtsp_client_events, m, v, ##__VA_ARGS__)
@@ -45,11 +46,7 @@ struct pw_rtsp_client {
 	char *session_id;
 	char *url;
 
-	union {
-		struct sockaddr sa;
-		struct sockaddr_in in;
-		struct sockaddr_in6 in6;
-	} local_addr;
+	struct sockaddr_storage local_addr;
 
 	struct spa_source *source;
 	unsigned int connecting:1;
@@ -90,6 +87,10 @@ struct pw_rtsp_client *pw_rtsp_client_new(struct pw_loop *main_loop,
 	spa_list_init(&client->pending);
 	spa_hook_list_init(&client->listener_list);
 	client->headers = pw_properties_new(NULL, NULL);
+	if (client->headers == NULL) {
+		free(client);
+		return NULL;
+	}
 	pw_array_init(&client->content, 4096);
 	client->recv_state = CLIENT_RECV_NONE;
 
@@ -136,19 +137,11 @@ const struct pw_properties *pw_rtsp_client_get_properties(struct pw_rtsp_client 
 int pw_rtsp_client_get_local_ip(struct pw_rtsp_client *client,
 		int *version, char *ip, size_t len)
 {
-	if (client->local_addr.sa.sa_family == AF_INET) {
-		*version = 4;
-		if (ip)
-			inet_ntop(client->local_addr.sa.sa_family,
-				&client->local_addr.in.sin_addr, ip, len);
-	} else if (client->local_addr.sa.sa_family == AF_INET6) {
-		*version = 6;
-		if (ip)
-			inet_ntop(client->local_addr.sa.sa_family,
-				&client->local_addr.in6.sin6_addr,
-				ip, len);
-	} else
-		return -EIO;
+	bool is_ipv4;
+	int res;
+	if ((res = pw_net_get_ip(&client->local_addr, ip, len, &is_ipv4, NULL)) < 0)
+		return res;
+	*version = is_ipv4 ? 4 : 6;
 	return 0;
 }
 
@@ -166,8 +159,8 @@ static int handle_connect(struct pw_rtsp_client *client, int fd)
 	if (res != 0)
 		return -res;
 
-	len = sizeof(client->local_addr.sa);
-	if (getsockname(fd, &client->local_addr.sa, &len) < 0)
+	len = sizeof(client->local_addr);
+	if (getsockname(fd, (struct sockaddr*)&client->local_addr, &len) < 0)
 		return -errno;
 
 	if ((res = pw_rtsp_client_get_local_ip(client, &ip_version,
@@ -175,9 +168,13 @@ static int handle_connect(struct pw_rtsp_client *client, int fd)
 		return res;
 
 	if (ip_version == 4)
-		asprintf(&client->url, "rtsp://%s/%s", local_ip, client->session_id);
+		res = asprintf(&client->url, "rtsp://%s/%s", local_ip, client->session_id);
 	else
-		asprintf(&client->url, "rtsp://[%s]/%s", local_ip, client->session_id);
+		res = asprintf(&client->url, "rtsp://[%s]/%s", local_ip, client->session_id);
+	if (res < 0) {
+		client->url = NULL;
+		return -ENOMEM;
+	}
 
 	pw_log_info("connected local ip %s", local_ip);
 
@@ -280,8 +277,8 @@ static void dispatch_handler(struct pw_rtsp_client *client)
 
 	msg = find_pending(client, cseq);
 	if (msg) {
-		res = msg->reply(msg->user_data, client->status, &client->headers->dict, &client->content);
 		spa_list_remove(&msg->link);
+		res = msg->reply(msg->user_data, client->status, &client->headers->dict, &client->content);
 		free(msg);
 
 		if (res < 0)
@@ -531,22 +528,30 @@ int pw_rtsp_client_connect(struct pw_rtsp_client *client,
 		return -EINVAL;
 	}
 
-	client->source = pw_loop_add_io(client->loop, fd,
+	client->source = pw_loop_add_io(client->loop, spa_steal_fd(fd),
 			SPA_IO_IN | SPA_IO_OUT | SPA_IO_HUP | SPA_IO_ERR,
 			true, on_source_io, client);
 
 	if (client->source == NULL) {
 		res = -errno;
 		pw_log_error("%p: source create failed: %m", client);
-		close(fd);
-		return res;
+		goto error;
 	}
 	client->connecting = true;
 	free(client->session_id);
 	client->session_id = strdup(session_id);
+	if (client->session_id == NULL) {
+		res = -errno;
+		goto error;
+	}
 	pw_log_info("%p: connecting", client);
 
 	return 0;
+error:
+	if (client->source)
+		pw_loop_destroy_source(client->loop, client->source);
+	client->source = NULL;
+	return res;
 }
 
 int pw_rtsp_client_disconnect(struct pw_rtsp_client *client)
@@ -564,6 +569,10 @@ int pw_rtsp_client_disconnect(struct pw_rtsp_client *client)
 	client->session_id = NULL;
 
 	spa_list_consume(msg, &client->messages, link) {
+		spa_list_remove(&msg->link);
+		free(msg);
+	}
+	spa_list_consume(msg, &client->pending, link) {
 		spa_list_remove(&msg->link);
 		free(msg);
 	}

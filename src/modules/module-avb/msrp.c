@@ -7,6 +7,7 @@
 #include <unistd.h>
 
 #include <spa/debug/mem.h>
+#include <spa/utils/cleanup.h>
 
 #include <pipewire/pipewire.h>
 
@@ -39,24 +40,34 @@ struct msrp {
 static void debug_msrp_talker_common(const struct avb_packet_msrp_talker *t)
 {
 	char buf[128];
-	pw_log_info(" stream-id: %s", avb_utils_format_id(buf, sizeof(buf), be64toh(t->stream_id)));
-	pw_log_info(" dest-addr: %s", avb_utils_format_addr(buf, sizeof(buf), t->dest_addr));
-	pw_log_info(" vlan-id:   %d", ntohs(t->vlan_id));
-	pw_log_info(" tspec-max-frame-size: %d", ntohs(t->tspec_max_frame_size));
-	pw_log_info(" tspec-max-interval-frames: %d", ntohs(t->tspec_max_interval_frames));
-	pw_log_info(" priority: %d", t->priority);
-	pw_log_info(" rank: %d", t->rank);
-	pw_log_info(" accumulated-latency: %d", ntohl(t->accumulated_latency));
+	pw_log_debug(" stream-id: %s", avb_utils_format_id(buf, sizeof(buf), be64toh(t->stream_id)));
+	pw_log_debug(" dest-addr: %s", avb_utils_format_addr(buf, sizeof(buf), t->dest_addr));
+	pw_log_debug(" vlan-id:   %d", ntohs(t->vlan_id));
+	pw_log_debug(" tspec-max-frame-size: %d", ntohs(t->tspec_max_frame_size));
+	pw_log_debug(" tspec-max-interval-frames: %d", ntohs(t->tspec_max_interval_frames));
+	pw_log_debug(" priority: %d", t->priority);
+	pw_log_debug(" rank: %d", t->rank);
+	pw_log_debug(" accumulated-latency: %d", ntohl(t->accumulated_latency));
 }
 
 static void debug_msrp_talker(const struct avb_packet_msrp_talker *t)
 {
-	pw_log_info("talker");
+	pw_log_debug("talker");
 	debug_msrp_talker_common(t);
 }
 
 /* IEEE 802.1Q Section 35.2.2.4.4: Listener may declare Ready only once the matching
  * Talker Advertise is registered; otherwise it stays in AskingFailed. */
+/* Milan v1.2 Section 4.3.3.1: Listener_Ready iff Talker Advertise registrar IN, else AskingFailed */
+static void refresh_listener_param(struct stream_common *sc)
+{
+	bool ta_in = sc->tastream_attr.mrp != NULL &&
+		avb_mrp_attribute_get_registrar_state(sc->tastream_attr.mrp) == AVB_MRP_IN;
+	sc->lstream_attr.param = ta_in
+		? AVB_MSRP_LISTENER_PARAM_READY
+		: AVB_MSRP_LISTENER_PARAM_ASKING_FAILED;
+}
+
 static void notify_talker(struct msrp *msrp, uint64_t now, struct attr *attr, uint8_t notify)
 {
 	struct stream_common *sc;
@@ -75,12 +86,8 @@ static void notify_talker(struct msrp *msrp, uint64_t now, struct attr *attr, ui
 
 	sc = SPA_CONTAINER_OF(attr->attr, struct stream_common, tastream_attr);
 	if (sc->stream.direction == SPA_DIRECTION_INPUT) {
-		if (notify == AVB_MRP_NOTIFY_NEW || notify == AVB_MRP_NOTIFY_JOIN)
-			sc->lstream_attr.param = AVB_MSRP_LISTENER_PARAM_READY;
-		else if (notify == AVB_MRP_NOTIFY_LEAVE)
-			sc->lstream_attr.param = AVB_MSRP_LISTENER_PARAM_ASKING_FAILED;
-		/* Milan Table 5.10: TA registrar state flips flags_ex.REGISTERING
-		 * in the listener-side GET_STREAM_INFO answer — emit an unsol. */
+		refresh_listener_param(sc);
+		/* Milan Table 5.10: TA registrar state flips flags_ex.REGISTERING */
 		avb_aecp_aem_mark_stream_info_dirty(msrp->server,
 				AVB_AEM_DESC_STREAM_INPUT, sc->stream.index);
 	}
@@ -100,12 +107,12 @@ static void notify_talker_failed(struct msrp *msrp, uint64_t now, struct attr *a
 			handle_evt_tk_registration_failed(msrp->server->acmp, attr->attr, now);
 	}
 
-	/* Milan Table 5.10: TF registrar state also flips flags_ex.REGISTERING
-	 * on the listener side; emit an unsol when it changes. */
 	sc = SPA_CONTAINER_OF(attr->attr, struct stream_common, tfstream_attr);
-	if (sc->stream.direction == SPA_DIRECTION_INPUT)
+	if (sc->stream.direction == SPA_DIRECTION_INPUT) {
+		refresh_listener_param(sc);
 		avb_aecp_aem_mark_stream_info_dirty(msrp->server,
 				AVB_AEM_DESC_STREAM_INPUT, sc->stream.index);
+	}
 }
 
 static int process_talker(struct msrp *msrp, uint64_t now, uint8_t attr_type,
@@ -126,7 +133,7 @@ static int process_talker(struct msrp *msrp, uint64_t now, uint8_t attr_type,
 
 	return 0;
 }
-static int encode_talker(struct msrp *msrp, struct attr *a, void *m)
+static int encode_talker(struct msrp *msrp, struct attr *a, void *m, size_t maxsize)
 {
 	struct avb_packet_msrp_msg *msg = m;
 	struct avb_packet_mrp_vector *v;
@@ -134,6 +141,9 @@ static int encode_talker(struct msrp *msrp, struct attr *a, void *m)
 	struct avb_packet_mrp_footer *f;
 	uint8_t *ev;
 	size_t attr_list_length = sizeof(*v) + sizeof(*t) + sizeof(*f) + 1;
+
+	if (attr_list_length + sizeof(*msg) > maxsize)
+		return -ENOSPC;
 
 	msg->attribute_type = AVB_MSRP_ATTRIBUTE_TYPE_TALKER_ADVERTISE;
 	msg->attribute_length = sizeof(*t);
@@ -159,10 +169,10 @@ static int encode_talker(struct msrp *msrp, struct attr *a, void *m)
 static void debug_msrp_talker_fail(const struct avb_packet_msrp_talker_fail *t)
 {
 	char buf[128];
-	pw_log_info("talker fail");
+	pw_log_debug("talker fail");
 	debug_msrp_talker_common(&t->talker);
-	pw_log_info(" bridge-id: %s", avb_utils_format_id(buf, sizeof(buf), be64toh(t->bridge_id)));
-	pw_log_info(" failure-code: %d", t->failure_code);
+	pw_log_debug(" bridge-id: %s", avb_utils_format_id(buf, sizeof(buf), be64toh(t->bridge_id)));
+	pw_log_debug(" failure-code: %d", t->failure_code);
 }
 
 static int process_talker_fail(struct msrp *msrp, uint64_t now, uint8_t attr_type,
@@ -183,9 +193,9 @@ static int process_talker_fail(struct msrp *msrp, uint64_t now, uint8_t attr_typ
 static void debug_msrp_listener(const struct avb_packet_msrp_listener *l, uint8_t param)
 {
 	char buf[128];
-	pw_log_info("listener");
-	pw_log_info(" %s", avb_utils_format_id(buf, sizeof(buf), be64toh(l->stream_id)));
-	pw_log_info(" %d", param);
+	pw_log_debug("listener");
+	pw_log_debug(" %s", avb_utils_format_id(buf, sizeof(buf), be64toh(l->stream_id)));
+	pw_log_debug(" %d", param);
 }
 
 static void notify_listener(struct msrp *msrp, uint64_t now, struct attr *attr, uint8_t notify)
@@ -261,7 +271,7 @@ static int process_listener(struct msrp *msrp, uint64_t now, uint8_t attr_type,
 		}
 	return 0;
 }
-static int encode_listener(struct msrp *msrp, struct attr *a, void *m)
+static int encode_listener(struct msrp *msrp, struct attr *a, void *m, size_t maxsize)
 {
 	struct avb_packet_msrp_msg *msg = m;
 	struct avb_packet_mrp_vector *v;
@@ -269,6 +279,9 @@ static int encode_listener(struct msrp *msrp, struct attr *a, void *m)
 	struct avb_packet_mrp_footer *f;
 	uint8_t *ev;
 	size_t attr_list_length = sizeof(*v) + sizeof(*l) + sizeof(*f) + 1 + 1;
+
+	if (attr_list_length + sizeof(*msg) > maxsize)
+		return -ENOSPC;
 
 	msg->attribute_type = AVB_MSRP_ATTRIBUTE_TYPE_LISTENER;
 	msg->attribute_length = sizeof(*l);
@@ -295,10 +308,10 @@ static int encode_listener(struct msrp *msrp, struct attr *a, void *m)
 
 static void debug_msrp_domain(const struct avb_packet_msrp_domain *d)
 {
-	pw_log_info("domain");
-	pw_log_info(" id: %d", d->sr_class_id);
-	pw_log_info(" prio: %d", d->sr_class_priority);
-	pw_log_info(" vid: %d", ntohs(d->sr_class_vid));
+	pw_log_debug("domain");
+	pw_log_debug(" id: %d", d->sr_class_id);
+	pw_log_debug(" prio: %d", d->sr_class_priority);
+	pw_log_debug(" vid: %d", ntohs(d->sr_class_vid));
 }
 
 static void notify_domain(struct msrp *msrp, uint64_t now, struct attr *attr, uint8_t notify)
@@ -318,18 +331,22 @@ static int process_domain(struct msrp *msrp, uint64_t now, uint8_t attr_type,
 			continue;
 		}
 
-		if (msrp->server->avb_mode == AVB_MODE_MILAN_V12)
-		{
-			/** Milan V1.2 Section 4.2.7.2.1:
-			    The endstation shall re-adjust the domain according
-			    to the from the MSRPDU received on its interface */
-			bool mismatch = (a->attr->attr.domain.sr_class_id != d->sr_class_id
-				|| a->attr->attr.domain.sr_class_priority != d->sr_class_priority
+		if (msrp->server->avb_mode == AVB_MODE_MILAN_V12) {
+			/* Milan v1.2 Section 4.2.7.2.1: re-adjust scoped to matching sr_class_id only */
+			bool mismatch;
+			if (a->attr->attr.domain.sr_class_id != d->sr_class_id)
+				continue;
+
+			mismatch = (a->attr->attr.domain.sr_class_priority != d->sr_class_priority
 				|| a->attr->attr.domain.sr_class_vid  != d->sr_class_vid);
 
 			if (mismatch) {
-				pw_log_info("Domain mismatch re-adjusting");
-				a->attr->attr.domain = *d;
+				pw_log_info("Domain re-adjust sr_class_id=%u prio %u->%u vid %u->%u",
+					d->sr_class_id, a->attr->attr.domain.sr_class_priority,
+					d->sr_class_priority, ntohs(a->attr->attr.domain.sr_class_vid),
+					ntohs(d->sr_class_vid));
+				a->attr->attr.domain.sr_class_priority = d->sr_class_priority;
+				a->attr->attr.domain.sr_class_vid = d->sr_class_vid;
 				avb_mrp_attribute_leave(a->attr->mrp, now);
 				avb_mrp_attribute_begin(a->attr->mrp, now);
 				avb_mrp_attribute_join(a->attr->mrp, now, true);
@@ -342,7 +359,7 @@ static int process_domain(struct msrp *msrp, uint64_t now, uint8_t attr_type,
 	return 0;
 }
 
-static int encode_domain(struct msrp *msrp, struct attr *a, void *m)
+static int encode_domain(struct msrp *msrp, struct attr *a, void *m, size_t maxsize)
 {
 	struct avb_packet_msrp_msg *msg = m;
 	struct avb_packet_mrp_vector *v;
@@ -350,6 +367,9 @@ static int encode_domain(struct msrp *msrp, struct attr *a, void *m)
 	struct avb_packet_mrp_footer *f;
 	uint8_t *ev;
 	size_t attr_list_length = sizeof(*v) + sizeof(*d) + sizeof(*f) + 1;
+
+	if (attr_list_length + sizeof(*msg) > maxsize)
+		return -ENOSPC;
 
 	msg->attribute_type = AVB_MSRP_ATTRIBUTE_TYPE_DOMAIN;
 	msg->attribute_length = sizeof(*d);
@@ -375,7 +395,7 @@ static const struct {
 	const char *name;
 	int (*process) (struct msrp *msrp, uint64_t now, uint8_t attr_type,
 			const void *m, uint8_t event, uint8_t param, int num);
-	int (*encode) (struct msrp *msrp, struct attr *attr, void *m);
+	int (*encode) (struct msrp *msrp, struct attr *attr, void *m, size_t maxsize);
 	void (*notify) (struct msrp *msrp, uint64_t now, struct attr *attr, uint8_t notify);
 } dispatch[] = {
 	[AVB_MSRP_ATTRIBUTE_TYPE_TALKER_ADVERTISE] = { "talker", process_talker, encode_talker, notify_talker, },
@@ -514,7 +534,7 @@ static void msrp_event(void *data, uint64_t now, uint8_t event)
 	void *msg = SPA_PTROFF(buffer, sizeof(*p), void);
 	struct attr *a;
 	int len, count = 0;
-	size_t total = sizeof(*p) + 2;
+	size_t total = sizeof(*p) + sizeof(*f);
 
 	p->version = AVB_MRP_PROTOCOL_VERSION;
 
@@ -524,11 +544,12 @@ static void msrp_event(void *data, uint64_t now, uint8_t event)
 		if (dispatch[a->attr->type].encode == NULL)
 			continue;
 
-		pw_log_info("MSRP encode %s %s",
+		pw_log_debug("MSRP encode %s %s",
 				dispatch[a->attr->type].name,
 				avb_mrp_send_name(a->attr->mrp->pending_send));
 
-		len = dispatch[a->attr->type].encode(msrp, a, msg);
+		len = dispatch[a->attr->type].encode(msrp, a, msg,
+				sizeof(buffer) - total);
 		if (len < 0)
 			break;
 
@@ -542,7 +563,7 @@ static void msrp_event(void *data, uint64_t now, uint8_t event)
 	f->end_mark = 0;
 
 	if (count > 0) {
-		pw_log_info("MSRP send: %d attribute(s), %zu bytes", count, total);
+		pw_log_debug("MSRP send: %d attribute(s), %zu bytes", count, total);
 		avb_server_send_packet(msrp->server, msrp_mac, AVB_MSRP_ETH,
 				buffer, total);
 	}
@@ -622,9 +643,9 @@ void avb_msrp_log_state(struct server *server, const char *label)
 struct avb_msrp *avb_msrp_register(struct server *server)
 {
 	struct msrp *msrp;
-	int fd, res;
+	int res;
 
-	fd = avb_server_make_socket(server, AVB_MSRP_ETH, msrp_mac);
+	spa_autoclose int fd = avb_server_make_socket(server, AVB_MSRP_ETH, msrp_mac);
 	if (fd < 0) {
 		errno = -fd;
 		return NULL;
@@ -632,27 +653,26 @@ struct avb_msrp *avb_msrp_register(struct server *server)
 	msrp = calloc(1, sizeof(*msrp));
 	if (msrp == NULL) {
 		res = -errno;
-		goto error_close;
+		goto error;
 	}
 
 	msrp->server = server;
 	spa_list_init(&msrp->attributes);
 
-	msrp->source = pw_loop_add_io(server->impl->loop, fd, SPA_IO_IN, true, on_socket_data, msrp);
+	msrp->source = pw_loop_add_io(server->impl->loop, spa_steal_fd(fd), SPA_IO_IN, true, on_socket_data, msrp);
 	if (msrp->source == NULL) {
 		res = -errno;
 		pw_log_error("msrp %p: can't create msrp source: %m", msrp);
-		goto error_no_source;
+		goto error_free;
 	}
 	avdecc_server_add_listener(server, &msrp->server_listener, &server_events, msrp);
 	avb_mrp_add_listener(server->mrp, &msrp->mrp_listener, &mrp_events, msrp);
 
 	return (struct avb_msrp*)msrp;
 
-error_no_source:
+error_free:
 	free(msrp);
-error_close:
-	close(fd);
+error:
 	errno = -res;
 	return NULL;
 }

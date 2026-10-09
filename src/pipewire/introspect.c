@@ -90,16 +90,23 @@ static struct spa_dict *pw_spa_dict_copy(struct spa_dict *dict)
 	if (copy->items == NULL)
 		goto no_items;
 	copy->n_items = dict->n_items;
+	copy->flags = dict->flags & SPA_DICT_FLAG_SORTED;
 
 	for (i = 0; i < dict->n_items; i++) {
 		items[i].key = strdup(dict->items[i].key);
 		items[i].value = dict->items[i].value ? strdup(dict->items[i].value) : NULL;
+		if (items[i].key == NULL ||
+		    (dict->items[i].value != NULL && items[i].value == NULL))
+			goto no_key;
 	}
 	return copy;
 
-      no_items:
+no_key:
+	pw_spa_dict_destroy(copy);
+	return NULL;
+no_items:
 	free(copy);
-      no_mem:
+no_mem:
 	return NULL;
 }
 

@@ -121,6 +121,8 @@ void module_args_add_props(struct pw_properties *props, const char *str)
 {
 	spa_autofree char *s = strdup(str);
 	char *p = s, *e, f;
+	if (s == NULL)
+		return;
 	const char *k, *v;
 	const struct str_map *map;
 
@@ -147,8 +149,11 @@ void module_args_add_props(struct pw_properties *props, const char *str)
 		for (e = p; *p ;) {
 			if (*p == f)
 				break;
-			if (*p == '\\')
+			if (*p == '\\') {
 				p++;
+				if (*p == '\0')
+					break;
+			}
 			*e++ = *p++;
 		}
 		if (*p != '\0')
@@ -165,24 +170,30 @@ void module_args_add_props(struct pw_properties *props, const char *str)
 	}
 }
 
-static bool find_key(const char * const keys[], const char *key)
+static bool find_key(const struct module_args args[], const char *key)
 {
-	for (int i = 0; keys[i] != NULL; i++)
-		if (spa_streq(keys[i], key))
+	for (int i = 0; args[i].key != NULL; i++)
+		if (spa_streq(args[i].key, key))
 			return true;
 	return false;
 }
 
-static int module_args_check(struct pw_properties *props, const char * const valid_args[])
+static int module_args_check(struct pw_properties *props, const struct module_args valid_args[])
 {
+	const struct spa_dict_item *it;
+	spa_dict_for_each(it, &props->dict) {
+		if (valid_args == NULL || !find_key(valid_args, it->key)) {
+			pw_log_warn("'%s' is not a valid module argument key", it->key);
+			return -EINVAL;
+		}
+	}
 	if (valid_args != NULL) {
-		const struct spa_dict_item *it;
-		spa_dict_for_each(it, &props->dict) {
-			if (!find_key(valid_args, it->key)) {
-				pw_log_warn("'%s' is not a valid module argument key", it->key);
+		for (int i = 0; valid_args[i].key != NULL; i++)
+	                if (SPA_FLAG_IS_SET(valid_args[i].flags, MODULE_ARG_MANDATORY) &&
+			    pw_properties_get(props, valid_args[i].key) == NULL) {
+				pw_log_warn("missing mandatory module argument '%s'", valid_args[i].key);
 				return -EINVAL;
 			}
-		}
 	}
 	return 0;
 }
@@ -283,13 +294,15 @@ void audioinfo_to_properties(struct spa_audio_info_raw *info, struct pw_properti
 	if (info->rate)
 		pw_properties_setf(props, SPA_KEY_AUDIO_RATE, "%u", info->rate);
 	if (info->channels) {
-		char *s, *p, pos[8];
+		char *s, pos[8];
+		struct spa_strbuf b;
 
 		pw_properties_setf(props, SPA_KEY_AUDIO_CHANNELS, "%u", info->channels);
 
-		p = s = alloca(info->channels * 8);
+		s = alloca(info->channels * 8);
+		spa_strbuf_init(&b, s, info->channels * 8);
 		for (i = 0; i < info->channels; i++)
-			p += spa_scnprintf(p, 8, "%s%s", i == 0 ? "" : ", ",
+			spa_strbuf_append(&b, "%s%s", i == 0 ? "" : ", ",
 				channel_id2name(info->position[i], pos, sizeof(pos)));
 		pw_properties_setf(props, SPA_KEY_AUDIO_POSITION, "[ %s ]", s);
 	}
@@ -363,6 +376,8 @@ struct module *module_create(struct impl *impl, const char *name, const char *ar
 		errno = -res;
 		goto error_free;
 	}
+	if (info->properties)
+		pw_properties_update(module->props, info->properties);
 
 	if ((res = module->info->prepare(module)) < 0) {
 		errno = -res;
@@ -400,4 +415,38 @@ struct module *module_lookup(struct impl *impl, uint32_t index, const char *name
 			return m;
 	}
 	return NULL;
+}
+
+char *module_info_usage(const struct module_info *i)
+{
+	const struct module_args *a;
+	FILE *f;
+	size_t size;
+	char *res;
+
+	f = open_memstream(&res, &size);
+	if (f == NULL)
+		return NULL;
+
+	for (a = i->valid_args; a->key; a++) {
+		fprintf(f, "%s=<%s", a->key, a->type);
+		if (a->def)
+			fprintf(f, ", default %s", a->def);
+		fprintf(f, ", %s", a->description);
+		if (a->vals) {
+			const char **v;
+			fprintf(f, " [");
+			for (v = a->vals; *v; v++)
+				fprintf(f, "%s%s", v == a->vals ? "" : "|", *v);
+			fprintf(f, "]");
+		}
+		if (a->flags & MODULE_ARG_MANDATORY)
+			fprintf(f, " (mandatory)");
+		if (a->flags & MODULE_ARG_ENOTIMPL)
+			fprintf(f, " (not implemented)");
+		fprintf(f, ">");
+	}
+	fclose(f);
+
+	return res;
 }

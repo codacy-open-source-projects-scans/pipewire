@@ -83,10 +83,9 @@ static inline void conv_sse(float *d, const float **s, float *c, uint32_t n_c, u
 	}
 }
 
-static inline void avg_sse(float *d, const float *s0, const float *s1, uint32_t n_samples)
+static inline void add_sse(float *d, const float *s0, const float *s1, uint32_t n_samples)
 {
 	uint32_t n, unrolled;
-	__m128 half = _mm_set1_ps(0.5f);
 
 	if (SPA_IS_ALIGNED(d, 16) &&
 	    SPA_IS_ALIGNED(s0, 16) &&
@@ -97,26 +96,20 @@ static inline void avg_sse(float *d, const float *s0, const float *s1, uint32_t 
 
 	for (n = 0; n < unrolled; n += 8) {
 		_mm_store_ps(&d[n + 0],
-				_mm_mul_ps(
-					_mm_add_ps(
-						_mm_load_ps(&s0[n + 0]),
-						_mm_load_ps(&s1[n + 0])),
-					half));
+				_mm_add_ps(
+					_mm_load_ps(&s0[n + 0]),
+					_mm_load_ps(&s1[n + 0])));
 		_mm_store_ps(&d[n + 4],
-				_mm_mul_ps(
-					_mm_add_ps(
-						_mm_load_ps(&s0[n + 4]),
-						_mm_load_ps(&s1[n + 4])),
-					half));
+				_mm_add_ps(
+					_mm_load_ps(&s0[n + 4]),
+					_mm_load_ps(&s1[n + 4])));
 	}
 
 	for (; n < n_samples; n++)
 		_mm_store_ss(&d[n],
-				_mm_mul_ss(
-					_mm_add_ss(
-						_mm_load_ss(&s0[n]),
-						_mm_load_ss(&s1[n])),
-					half));
+				_mm_add_ss(
+					_mm_load_ss(&s0[n]),
+					_mm_load_ss(&s1[n])));
 }
 
 static inline void sub_sse(float *d, const float *s0, const float *s1, uint32_t n_samples)
@@ -144,11 +137,12 @@ static inline void sub_sse(float *d, const float *s0, const float *s1, uint32_t 
 void channelmix_copy_sse(struct channelmix *mix, void * SPA_RESTRICT dst[],
 		const void * SPA_RESTRICT src[], uint32_t n_samples)
 {
+	CHANNELMIX_DEF_MATRIX(matrix, mix, matrix);
 	uint32_t i, n_dst = mix->dst_chan;
 	float **d = (float **)dst;
 	const float **s = (const float **)src;
 	for (i = 0; i < n_dst; i++)
-		vol_sse(d[i], s[i], mix->matrix[i][i], n_samples);
+		vol_sse(d[i], s[i], matrix[i][i], n_samples);
 }
 
 static void lr4_process_sse(struct lr4 *lr4, float *dst, const float *src, const float vol, int samples)
@@ -284,11 +278,12 @@ static inline void delay_convolve_run_sse(float *buffer, uint32_t *pos,
 	const __m128 v = _mm_set1_ps(vol);
 	uint32_t i;
 	uint32_t w = *pos;
-	uint32_t o = n_buffer - delay - n_taps-1;
+	uint32_t o = n_buffer - delay - (n_taps-1);
 	uint32_t n, unrolled;
 
 	if (SPA_IS_ALIGNED(src, 16) &&
-	    SPA_IS_ALIGNED(dst, 16))
+	    SPA_IS_ALIGNED(dst, 16) &&
+	    delay >= 4)
 		unrolled = n_samples & ~3;
 	else
 		unrolled = 0;
@@ -346,6 +341,7 @@ void
 channelmix_f32_n_m_sse(struct channelmix *mix, void * SPA_RESTRICT dst[],
 		   const void * SPA_RESTRICT src[], uint32_t n_samples)
 {
+	CHANNELMIX_DEF_MATRIX(matrix, mix, matrix);
 	float **d = (float **) dst;
 	const float **s = (const float **) src;
 	uint32_t i, j, n_dst = mix->dst_chan, n_src = mix->src_chan;
@@ -357,9 +353,9 @@ channelmix_f32_n_m_sse(struct channelmix *mix, void * SPA_RESTRICT dst[],
 		uint32_t n_j = 0;
 
 		for (j = 0; j < n_src; j++) {
-			if (mix->matrix[i][j] == 0.0f)
+			if (matrix[i][j] == 0.0f)
 				continue;
-			mj[n_j] = mix->matrix[i][j];
+			mj[n_j] = matrix[i][j];
 			sj[n_j++] = s[j];
 		}
 		if (n_j == 0) {
@@ -377,13 +373,14 @@ void
 channelmix_f32_2_3p1_sse(struct channelmix *mix, void * SPA_RESTRICT dst[],
 		   const void * SPA_RESTRICT src[], uint32_t n_samples)
 {
+	CHANNELMIX_DEF_MATRIX(matrix, mix, matrix);
 	uint32_t i, n, unrolled, n_dst = mix->dst_chan;
 	float **d = (float **)dst;
 	const float **s = (const float **)src;
-	const float v0 = mix->matrix[0][0];
-	const float v1 = mix->matrix[1][1];
-	const float v2 = (mix->matrix[2][0] + mix->matrix[2][1]) * 0.5f;
-	const float v3 = (mix->matrix[3][0] + mix->matrix[3][1]) * 0.5f;
+	const float v0 = matrix[0][0];
+	const float v1 = matrix[1][1];
+	const float v2 = (matrix[2][0] + matrix[2][1]) * 0.5f;
+	const float v3 = (matrix[3][0] + matrix[3][1]) * 0.5f;
 
 	if (SPA_FLAG_IS_SET(mix->flags, CHANNELMIX_FLAG_ZERO)) {
 		for (i = 0; i < n_dst; i++)
@@ -393,10 +390,10 @@ channelmix_f32_2_3p1_sse(struct channelmix *mix, void * SPA_RESTRICT dst[],
 		if (mix->widen == 0.0f) {
 			vol_sse(d[0], s[0], v0, n_samples);
 			vol_sse(d[1], s[1], v1, n_samples);
-			avg_sse(d[2], s[0], s[1], n_samples);
+			add_sse(d[2], s[0], s[1], n_samples);
 		} else {
-			const __m128 mv0 = _mm_set1_ps(mix->matrix[0][0]);
-			const __m128 mv1 = _mm_set1_ps(mix->matrix[1][1]);
+			const __m128 mv0 = _mm_set1_ps(matrix[0][0]);
+			const __m128 mv1 = _mm_set1_ps(matrix[1][1]);
 			const __m128 mw = _mm_set1_ps(mix->widen);
 			const __m128 mh = _mm_set1_ps(0.5f);
 			__m128 t0[1], t1[1], w[1], c[1];
@@ -437,11 +434,12 @@ void
 channelmix_f32_2_5p1_sse(struct channelmix *mix, void * SPA_RESTRICT dst[],
 		   const void * SPA_RESTRICT src[], uint32_t n_samples)
 {
+	CHANNELMIX_DEF_MATRIX(matrix, mix, matrix);
 	uint32_t i, n_dst = mix->dst_chan;
 	float **d = (float **)dst;
 	const float **s = (const float **)src;
-	const float v4 = mix->matrix[4][0];
-	const float v5 = mix->matrix[5][1];
+	const float v4 = matrix[4][0];
+	const float v5 = matrix[5][1];
 
 	if (SPA_FLAG_IS_SET(mix->flags, CHANNELMIX_FLAG_ZERO)) {
 		for (i = 0; i < n_dst; i++)
@@ -456,9 +454,9 @@ channelmix_f32_2_5p1_sse(struct channelmix *mix, void * SPA_RESTRICT dst[],
 		} else {
 			sub_sse(d[4], s[0], s[1], n_samples);
 
-			delay_convolve_run_sse(mix->buffer[1], &mix->pos[1], BUFFER_SIZE, mix->delay,
+			delay_convolve_run_sse(mix->buffer[1], &mix->pos[1], mix->buffer_size, mix->delay,
 					mix->taps, mix->n_taps, d[5], d[4], -v5, n_samples);
-			delay_convolve_run_sse(mix->buffer[0], &mix->pos[0], BUFFER_SIZE, mix->delay,
+			delay_convolve_run_sse(mix->buffer[0], &mix->pos[0], mix->buffer_size, mix->delay,
 					mix->taps, mix->n_taps, d[4], d[4], v4, n_samples);
 		}
 	}
@@ -468,13 +466,14 @@ void
 channelmix_f32_2_7p1_sse(struct channelmix *mix, void * SPA_RESTRICT dst[],
 		   const void * SPA_RESTRICT src[], uint32_t n_samples)
 {
+	CHANNELMIX_DEF_MATRIX(matrix, mix, matrix);
 	uint32_t i, n_dst = mix->dst_chan;
 	float **d = (float **)dst;
 	const float **s = (const float **)src;
-	const float v4 = mix->matrix[4][0];
-	const float v5 = mix->matrix[5][1];
-	const float v6 = mix->matrix[6][0];
-	const float v7 = mix->matrix[7][1];
+	const float v4 = matrix[4][0];
+	const float v5 = matrix[5][1];
+	const float v6 = matrix[6][0];
+	const float v7 = matrix[7][1];
 
 	if (SPA_FLAG_IS_SET(mix->flags, CHANNELMIX_FLAG_ZERO)) {
 		for (i = 0; i < n_dst; i++)
@@ -492,9 +491,9 @@ channelmix_f32_2_7p1_sse(struct channelmix *mix, void * SPA_RESTRICT dst[],
 		} else {
 			sub_sse(d[6], s[0], s[1], n_samples);
 
-			delay_convolve_run_sse(mix->buffer[1], &mix->pos[1], BUFFER_SIZE, mix->delay,
+			delay_convolve_run_sse(mix->buffer[1], &mix->pos[1], mix->buffer_size, mix->delay,
 					mix->taps, mix->n_taps, d[7], d[6], -v7, n_samples);
-			delay_convolve_run_sse(mix->buffer[0], &mix->pos[0], BUFFER_SIZE, mix->delay,
+			delay_convolve_run_sse(mix->buffer[0], &mix->pos[0], mix->buffer_size, mix->delay,
 					mix->taps, mix->n_taps, d[6], d[6], v6, n_samples);
 		}
 	}
@@ -504,12 +503,13 @@ void
 channelmix_f32_3p1_2_sse(struct channelmix *mix, void * SPA_RESTRICT dst[],
 		   const void * SPA_RESTRICT src[], uint32_t n_samples)
 {
+	CHANNELMIX_DEF_MATRIX(matrix, mix, matrix);
 	float **d = (float **) dst;
 	const float **s = (const float **) src;
-	const float m0 = mix->matrix[0][0];
-	const float m1 = mix->matrix[1][1];
-	const float m2 = (mix->matrix[0][2] + mix->matrix[1][2]) * 0.5f;
-	const float m3 = (mix->matrix[0][3] + mix->matrix[1][3]) * 0.5f;
+	const float m0 = matrix[0][0];
+	const float m1 = matrix[1][1];
+	const float m2 = (matrix[0][2] + matrix[1][2]) * 0.5f;
+	const float m3 = (matrix[0][3] + matrix[1][3]) * 0.5f;
 
 	if (m0 == 0.0f && m1 == 0.0f && m2 == 0.0f && m3 == 0.0f) {
 		clear_sse(d[0], n_samples);
@@ -554,15 +554,16 @@ void
 channelmix_f32_5p1_2_sse(struct channelmix *mix, void * SPA_RESTRICT dst[],
 		const void * SPA_RESTRICT src[], uint32_t n_samples)
 {
+	CHANNELMIX_DEF_MATRIX(matrix, mix, matrix);
 	uint32_t n, unrolled;
 	float **d = (float **) dst;
 	const float **s = (const float **) src;
-	const float m00 = mix->matrix[0][0];
-	const float m11 = mix->matrix[1][1];
-	const __m128 clev = _mm_set1_ps((mix->matrix[0][2] + mix->matrix[1][2]) * 0.5f);
-	const __m128 llev = _mm_set1_ps((mix->matrix[0][3] + mix->matrix[1][3]) * 0.5f);
-	const __m128 slev0 = _mm_set1_ps(mix->matrix[0][4]);
-	const __m128 slev1 = _mm_set1_ps(mix->matrix[1][5]);
+	const float m00 = matrix[0][0];
+	const float m11 = matrix[1][1];
+	const __m128 clev = _mm_set1_ps((matrix[0][2] + matrix[1][2]) * 0.5f);
+	const __m128 llev = _mm_set1_ps((matrix[0][3] + matrix[1][3]) * 0.5f);
+	const __m128 slev0 = _mm_set1_ps(matrix[0][4]);
+	const __m128 slev1 = _mm_set1_ps(matrix[1][5]);
 	__m128 in, ctr;
 
 	if (SPA_IS_ALIGNED(s[0], 16) &&
@@ -616,6 +617,7 @@ void
 channelmix_f32_5p1_3p1_sse(struct channelmix *mix, void * SPA_RESTRICT dst[],
 		const void * SPA_RESTRICT src[], uint32_t n_samples)
 {
+	CHANNELMIX_DEF_MATRIX(matrix, mix, matrix);
 	uint32_t i, n, unrolled, n_dst = mix->dst_chan;
 	float **d = (float **) dst;
 	const float **s = (const float **) src;
@@ -639,10 +641,10 @@ channelmix_f32_5p1_3p1_sse(struct channelmix *mix, void * SPA_RESTRICT dst[],
 			clear_sse(d[i], n_samples);
 	}
 	else {
-		const __m128 v0 = _mm_set1_ps(mix->matrix[0][0]);
-		const __m128 v1 = _mm_set1_ps(mix->matrix[1][1]);
-		const __m128 slev0 = _mm_set1_ps(mix->matrix[0][4]);
-		const __m128 slev1 = _mm_set1_ps(mix->matrix[1][5]);
+		const __m128 v0 = _mm_set1_ps(matrix[0][0]);
+		const __m128 v1 = _mm_set1_ps(matrix[1][1]);
+		const __m128 slev0 = _mm_set1_ps(matrix[0][4]);
+		const __m128 slev1 = _mm_set1_ps(matrix[1][5]);
 
 		for(n = 0; n < unrolled; n += 4) {
 			_mm_store_ps(&d[0][n], _mm_add_ps(
@@ -662,8 +664,8 @@ channelmix_f32_5p1_3p1_sse(struct channelmix *mix, void * SPA_RESTRICT dst[],
 					_mm_mul_ss(_mm_load_ss(&s[1][n]), v1),
 					_mm_mul_ss(_mm_load_ss(&s[5][n]), slev1)));
 		}
-		vol_sse(d[2], s[2], mix->matrix[2][2], n_samples);
-		vol_sse(d[3], s[3], mix->matrix[3][3], n_samples);
+		vol_sse(d[2], s[2], matrix[2][2], n_samples);
+		vol_sse(d[3], s[3], matrix[3][3], n_samples);
 	}
 }
 
@@ -672,11 +674,12 @@ void
 channelmix_f32_5p1_4_sse(struct channelmix *mix, void * SPA_RESTRICT dst[],
 		const void * SPA_RESTRICT src[], uint32_t n_samples)
 {
+	CHANNELMIX_DEF_MATRIX(matrix, mix, matrix);
 	uint32_t i, n_dst = mix->dst_chan;
 	float **d = (float **) dst;
 	const float **s = (const float **) src;
-	const float v4 = mix->matrix[2][4];
-	const float v5 = mix->matrix[3][5];
+	const float v4 = matrix[2][4];
+	const float v5 = matrix[3][5];
 
 	if (SPA_FLAG_IS_SET(mix->flags, CHANNELMIX_FLAG_ZERO)) {
 		for (i = 0; i < n_dst; i++)
@@ -695,17 +698,18 @@ void
 channelmix_f32_7p1_2_sse(struct channelmix *mix, void * SPA_RESTRICT dst[],
 		const void * SPA_RESTRICT src[], uint32_t n_samples)
 {
+	CHANNELMIX_DEF_MATRIX(matrix, mix, matrix);
 	uint32_t n, unrolled;
 	float **d = (float **) dst;
 	const float **s = (const float **) src;
-	const __m128 v0 = _mm_set1_ps(mix->matrix[0][0]);
-	const __m128 v1 = _mm_set1_ps(mix->matrix[1][1]);
-	const __m128 clev = _mm_set1_ps((mix->matrix[0][2] + mix->matrix[1][2]) * 0.5f);
-	const __m128 llev = _mm_set1_ps((mix->matrix[0][3] + mix->matrix[1][3]) * 0.5f);
-	const __m128 slev0 = _mm_set1_ps(mix->matrix[0][4]);
-	const __m128 slev1 = _mm_set1_ps(mix->matrix[1][5]);
-	const __m128 rlev0 = _mm_set1_ps(mix->matrix[0][6]);
-	const __m128 rlev1 = _mm_set1_ps(mix->matrix[1][7]);
+	const __m128 v0 = _mm_set1_ps(matrix[0][0]);
+	const __m128 v1 = _mm_set1_ps(matrix[1][1]);
+	const __m128 clev = _mm_set1_ps((matrix[0][2] + matrix[1][2]) * 0.5f);
+	const __m128 llev = _mm_set1_ps((matrix[0][3] + matrix[1][3]) * 0.5f);
+	const __m128 slev0 = _mm_set1_ps(matrix[0][4]);
+	const __m128 slev1 = _mm_set1_ps(matrix[1][5]);
+	const __m128 rlev0 = _mm_set1_ps(matrix[0][6]);
+	const __m128 rlev1 = _mm_set1_ps(matrix[1][7]);
 	__m128 in, ctr;
 
 	if (SPA_IS_ALIGNED(s[0], 16) &&

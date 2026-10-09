@@ -19,15 +19,17 @@
 
 #include "config.h"
 
+#include <spa/utils/cleanup.h>
 #include <spa/utils/result.h>
 #include <spa/utils/string.h>
-#include <spa/utils/json.h>
+#include <spa/utils/json-builder.h>
 #include <spa/pod/pod.h>
 #include <spa/pod/builder.h>
 #include <spa/debug/types.h>
 #include <spa/param/audio/type-info.h>
 #include <spa/param/audio/format-utils.h>
 #include <spa/param/audio/raw-json.h>
+#include <spa/param/latency-utils.h>
 
 #include <pipewire/impl.h>
 
@@ -57,10 +59,12 @@
  *               sink for each connected client.
  *  - `playback`: boolean if playback is enabled. This will create a playback or
  *               source stream for each connected client.
+ *  - `capture.latency.ms`: Latency to report for the capture stream.
+ *  - `playback.latency.ms`: Latency to report for the playback stream.
  *  - `local.ifname = <str>`: interface name to use
  *  - `local.ifaddress = <str>`: interface address to use
  *  - `server.address = []`: an array of server addresses to listen on as
- *                            tcp:(<ip>:)<port>.
+ *                            tcp:(\<ip\>:)\<port\>.
  *  - `capture.props`: optional properties for the capture stream
  *  - `playback.props`: optional properties for the playback stream
  *
@@ -78,6 +82,8 @@
  * - \ref PW_KEY_NODE_RATE
  * - \ref PW_KEY_STREAM_CAPTURE_SINK
  * - \ref PW_KEY_NODE_NAME
+ * - \ref PW_KEY_NODE_VIRTUAL
+ * - \ref PW_KEY_NODE_NETWORK
  * - \ref PW_KEY_TARGET_OBJECT
  *
  * By default the server will work with stereo 16 bits samples at 44.1KHz.
@@ -223,6 +229,8 @@ struct impl {
 	struct spa_audio_info_raw playback_info;
 	uint32_t capture_frame_size;
 	uint32_t playback_frame_size;
+	struct spa_process_latency_info capture_latency;
+	struct spa_process_latency_info playback_latency;
 };
 
 struct client {
@@ -485,7 +493,7 @@ static const struct pw_stream_events playback_stream_events = {
 static int create_streams(struct impl *impl, struct client *client)
 {
 	uint32_t n_params;
-	const struct spa_pod *params[1];
+	const struct spa_pod *params[3];
 	uint8_t buffer[1024];
 	struct spa_pod_builder b;
 	struct pw_properties *props;
@@ -524,12 +532,17 @@ static int create_streams(struct impl *impl, struct client *client)
 				&playback_stream_events, client);
 	}
 
-
 	if (impl->capture) {
+		struct spa_latency_info info = SPA_LATENCY_INFO(SPA_DIRECTION_INPUT);
+
 		n_params = 0;
 		spa_pod_builder_init(&b, buffer, sizeof(buffer));
 		params[n_params++] = spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat,
 				&impl->capture_info);
+		params[n_params++] = spa_process_latency_build(&b, SPA_PARAM_ProcessLatency,
+				&impl->capture_latency);
+		spa_process_latency_info_add(&impl->capture_latency, &info);
+		params[n_params++] = spa_latency_build(&b, SPA_PARAM_Latency, &info);
 
 		if ((res = pw_stream_connect(client->capture,
 				PW_DIRECTION_INPUT,
@@ -541,10 +554,16 @@ static int create_streams(struct impl *impl, struct client *client)
 			return res;
 	}
 	if (impl->playback) {
+		struct spa_latency_info info = SPA_LATENCY_INFO(SPA_DIRECTION_OUTPUT);
+
 		n_params = 0;
 		spa_pod_builder_init(&b, buffer, sizeof(buffer));
 		params[n_params++] = spa_format_audio_raw_build(&b, SPA_PARAM_EnumFormat,
 				&impl->playback_info);
+		params[n_params++] = spa_process_latency_build(&b, SPA_PARAM_ProcessLatency,
+				&impl->playback_latency);
+		spa_process_latency_info_add(&impl->playback_latency, &info);
+		params[n_params++] = spa_latency_build(&b, SPA_PARAM_Latency, &info);
 
 		if ((res = pw_stream_connect(client->playback,
 				PW_DIRECTION_OUTPUT,
@@ -576,7 +595,7 @@ on_connect(void *data, int fd, uint32_t mask)
 {
 	struct server *server = data;
 	struct impl *impl = server->impl;
-	struct sockaddr_in addr;
+	struct sockaddr_storage addr;
 	socklen_t addrlen;
 	int client_fd, val;
 	struct client *client = NULL;
@@ -588,21 +607,20 @@ on_connect(void *data, int fd, uint32_t mask)
 		goto error;
 
 	if (server->n_clients >= MAX_CLIENTS) {
-		close(client_fd);
 		errno = ECONNREFUSED;
-		goto error;
+		goto error_close;
 	}
 
 	client = calloc(1, sizeof(struct client));
 	if (client == NULL)
-		goto error;
+		goto error_close;
 
 	client->impl = impl;
 	client->server = server;
 	spa_list_append(&server->client_list, &client->link);
 	server->n_clients++;
 
-	if (inet_ntop(addr.sin_family, &addr.sin_addr.s_addr, client->name, sizeof(client->name)) == NULL)
+	if (pw_net_get_ip(&addr, client->name, sizeof(client->name), NULL, NULL) < 0)
 		snprintf(client->name, sizeof(client->name), "client %d", client_fd);
 
 	client->source = pw_loop_add_io(impl->loop,
@@ -654,6 +672,9 @@ on_connect(void *data, int fd, uint32_t mask)
 	create_streams(impl, client);
 
 	return;
+
+error_close:
+	close(client_fd);
 error:
 	pw_log_error("%p: failed to create client: %m", impl);
 	pw_properties_free(props);
@@ -759,12 +780,10 @@ static struct server *create_server(struct impl *impl, const char *address)
 	if (server->source == NULL) {
 		res = -errno;
 		pw_log_error("%p: can't create server source: %m", impl);
-		goto error_close;
+		goto error;
 	}
 	return server;
 
-error_close:
-	close(fd);
 error:
 	server_free(server);
 	errno = -res;
@@ -856,6 +875,7 @@ static int parse_params(struct impl *impl)
 	struct spa_json it[1];
 	char value[512];
 	int res;
+	int64_t val;
 
 	pw_properties_fetch_bool(impl->props, "capture", &impl->capture);
 	pw_properties_fetch_bool(impl->props, "playback", &impl->playback);
@@ -881,6 +901,12 @@ static int parse_params(struct impl *impl)
 		pw_log_error("can't create props: %m");
 		return -errno;
 	}
+	if ((str = pw_properties_get(impl->props, "capture.latency.ms")) != NULL)
+		if (spa_atoi64(str, &val, 0))
+			impl->capture_latency.ns = val * 1000;
+	if ((str = pw_properties_get(impl->props, "playback.latency.ms")) != NULL)
+		if (spa_atoi64(str, &val, 0))
+			impl->playback_latency.ns = val * 1000;
 
 	if ((str = pw_properties_get(impl->props, "capture.props")) != NULL)
 		pw_properties_update_string(impl->capture_props, str, strlen(str));
@@ -961,8 +987,8 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	struct pw_properties *props;
 	struct impl *impl;
 	struct server *s;
-	FILE *f;
-	char *str;
+	struct spa_json_builder b;
+	spa_autofree char *str = NULL;
 	size_t size;
 	int res;
 	struct spa_dict_item it[1];
@@ -975,14 +1001,8 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 
 	pw_log_debug("module %p: new %s", impl, args);
 
-	if (args)
-		props = pw_properties_new_string(args);
-	else
-		props = pw_properties_new(NULL, NULL);
-
 	impl->context = context;
 	impl->loop = pw_context_get_main_loop(context);
-	impl->props = props;
 	spa_list_init(&impl->server_list);
 
 	pw_impl_module_add_listener(module, &impl->module_listener, &module_events, impl);
@@ -991,16 +1011,25 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 
 	impl->work_queue = pw_context_get_work_queue(context);
 
+	if (args)
+		props = pw_properties_new_string(args);
+	else
+		props = pw_properties_new(NULL, NULL);
+	if (props == NULL) {
+		res = -errno;
+		goto error_free;
+	}
+	impl->props = props;
+
 	if ((res = parse_params(impl)) < 0)
 		goto error_free;
 
-	if ((f = open_memstream(&str, &size)) == NULL) {
-		res = -errno;
+	if ((res = spa_json_builder_memstream(&b, &str, &size, 0)) < 0) {
 		pw_log_error("Can't open memstream: %m");
 		goto error_free;
 	}
 
-	fprintf(f, "[");
+	spa_json_builder_array_push(&b, "[");
 
 	spa_list_for_each(s, &impl->server_list, link) {
 		char ip[128];
@@ -1010,16 +1039,16 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 		if (pw_net_get_ip(&s->addr, ip, sizeof(ip), &ipv4, &port) < 0)
 			continue;
 
-		fprintf(f, " \"%s%s%s:%d\"", ipv4 ? "" : "[", ip, ipv4 ? "" : "]", port);
+		spa_json_builder_array_stringf(&b, "%s%s%s:%d",
+				ipv4 ? "" : "[", ip, ipv4 ? "" : "]", port);
 	}
-	fprintf(f, " ]");
-	fclose(f);
+	spa_json_builder_pop(&b, "]");
+	if ((res = spa_json_builder_close(&b)) < 0)
+		goto error_free;
 
 	pw_log_info("listening on %s", str);
 	it[0] = SPA_DICT_ITEM_INIT("server.address", str);
 	pw_impl_module_update_properties(module, &SPA_DICT_INIT_ARRAY(it));
-
-	free(str);
 
 	return 0;
 

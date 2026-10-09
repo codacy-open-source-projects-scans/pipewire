@@ -34,6 +34,7 @@ static struct descriptor *es_buidler_desc_stream_general_prepare(struct server *
 	if (type == AVB_AEM_DESC_STREAM_INPUT) {
 		struct aecp_aem_stream_input_state_milan_v12 *w;
 		const struct avb_aem_desc_stream *body = ptr;
+		struct avb_aem_stream_format_info fi;
 
 		desc = server_add_descriptor(server, type, index,
 				sizeof(*w), size, ptr);
@@ -46,13 +47,13 @@ static struct descriptor *es_buidler_desc_stream_general_prepare(struct server *
 		/* Milan v1.2 Section 5.3.8.7: started/stopped state defaults to started. */
 		w->stream_in_sta.started = true;
 
-		struct avb_aem_stream_format_info fi;
 		avb_aem_stream_format_decode(body->current_format, &fi);
-		if (fi.kind == AVB_AEM_STREAM_FORMAT_KIND_CRF)
-			return desc;
 
 		stream = &w->stream_in_sta.common.stream;
 		direction = SPA_DIRECTION_INPUT;
+		stream->is_crf = (fi.kind == AVB_AEM_STREAM_FORMAT_KIND_CRF);
+		if (stream->is_crf)
+			pw_log_info("stream %u: CRF clock-reference, no audio data plane", index);
 	} else if (type == AVB_AEM_DESC_STREAM_OUTPUT) {
 		struct aecp_aem_stream_output_state_milan_v12 *w;
 
@@ -120,6 +121,15 @@ static struct descriptor *es_buidler_desc_avb_interface(struct server *server,
 
 	avb_mrp_attribute_begin(if_ptr->domain_attr.mrp, 0);
 	avb_mrp_attribute_join(if_ptr->domain_attr.mrp, 0, true);
+
+	/* milan-avb: declare VID membership (MVRP) once per interface, held for the
+	 * life of the interface like the SR Domain above — NOT per stream, so that
+	 * destroying one stream cannot withdraw the VLAN other streams still need. */
+	avb_mvrp_attribute_new(server->mvrp, &if_ptr->vlan_attr,
+			AVB_MVRP_ATTRIBUTE_TYPE_VID);
+	if_ptr->vlan_attr.attr.vid.vlan = htons(AVB_DEFAULT_VLAN);
+	avb_mrp_attribute_begin(if_ptr->vlan_attr.mrp, 0);
+	avb_mrp_attribute_join(if_ptr->vlan_attr.mrp, 0, true);
 
 	return desc;
 }

@@ -4,7 +4,8 @@
 
 #include <unistd.h>
 
-#include <spa/utils/json.h>
+#include <spa/utils/cleanup.h>
+#include <spa/utils/json-builder.h>
 
 #include <pipewire/pipewire.h>
 
@@ -163,7 +164,7 @@ static int send_packet(struct maap *maap, uint64_t now,
 		maap_message_debug(maap, p);
 	}
 
-	if (send(maap->source->fd, p, sizeof(*h) + sizeof(*p), 0) < 0) {
+	if (send(maap->source->fd, h, sizeof(*h) + sizeof(*p), 0) < 0) {
 		res = -errno;
 		pw_log_warn("got send error: %m");
 	}
@@ -298,26 +299,29 @@ static int load_state(struct maap *maap)
 
 static int save_state(struct maap *maap)
 {
-	char *ptr;
+	struct spa_json_builder b;
+	spa_autofree char *ptr = NULL;
 	size_t size;
-	FILE *f;
 	char key[512];
 	uint32_t count;
+	int res;
 
-	if ((f = open_memstream(&ptr, &size)) == NULL)
-		return -errno;
+	if ((res = spa_json_builder_memstream(&b, &ptr, &size, 0)) < 0)
+		return res;
 
-	fprintf(f, "[ ");
-	fprintf(f, "{ \"start\": \"%02x:%02x:%02x:%02x:%02x:%02x\", ",
+	spa_json_builder_array_push(&b, "[");
+	spa_json_builder_array_push(&b,   "{");
+	spa_json_builder_object_stringf(&b, "start", "%02x:%02x:%02x:%02x:%02x:%02x",
 			maap_base[0], maap_base[1], maap_base[2],
 			maap_base[3], (maap->offset >> 8) & 0xff,
 			maap->offset & 0xff);
-	fprintf(f, " \"count\": %u } ", maap->count);
-	fprintf(f, "]");
-	fclose(f);
+	spa_json_builder_object_uint(&b,    "count", maap->count);
+	spa_json_builder_pop(&b,          "}");
+	spa_json_builder_pop(&b,        "]");
+	if ((res = spa_json_builder_close(&b)) < 0)
+		return res;
 
 	count = pw_properties_set(maap->props, "maap.addresses", ptr);
-	free(ptr);
 
 	if (count > 0) {
 		snprintf(key, sizeof(key), "maap.%s", maap->server->ifname);
@@ -375,9 +379,9 @@ struct avb_maap *avb_maap_register(struct server *server)
 {
 	struct maap *maap;
 	uint8_t bmac[6] = AVB_MAAP_MAC;
-	int fd, res;
+	int res;
 
-	fd = avb_server_make_socket(server, AVB_TSN_ETH, bmac);
+	spa_autoclose int fd = avb_server_make_socket(server, AVB_TSN_ETH, bmac);
 	if (fd < 0) {
 		res = fd;
 		goto error;
@@ -386,7 +390,7 @@ struct avb_maap *avb_maap_register(struct server *server)
 	maap = calloc(1, sizeof(*maap));
 	if (maap == NULL) {
 		res = -errno;
-		goto error_close;
+		goto error;
 	}
 	maap->props = pw_properties_new(NULL, NULL);
 	if (maap->props == NULL) {
@@ -401,7 +405,7 @@ struct avb_maap *avb_maap_register(struct server *server)
 
 	load_state(maap);
 
-	maap->source = pw_loop_add_io(server->impl->loop, fd, SPA_IO_IN, true, on_socket_data, maap);
+	maap->source = pw_loop_add_io(server->impl->loop, spa_steal_fd(fd), SPA_IO_IN, true, on_socket_data, maap);
 	if (maap->source == NULL) {
 		res = -errno;
 		pw_log_error("maap %p: can't create maap source: %m", maap);
@@ -413,8 +417,6 @@ struct avb_maap *avb_maap_register(struct server *server)
 
 error_free:
 	free(maap);
-error_close:
-	close(fd);
 error:
 	errno = -res;
 	return NULL;

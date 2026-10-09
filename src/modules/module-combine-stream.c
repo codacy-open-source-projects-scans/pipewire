@@ -777,6 +777,7 @@ static void stream_state_changed(void *d, enum pw_stream_state old,
 		break;
 	case PW_STREAM_STATE_STREAMING:
 		update_latency(s->impl);
+		update_delay(s->impl);
 		break;
 	default:
 		break;
@@ -931,6 +932,8 @@ static int create_stream(struct stream_info *info)
 
 	if (info->on_demand_id) {
 		s->on_demand_id = strdup(info->on_demand_id);
+		if (s->on_demand_id == NULL)
+			goto error_errno;
 		pw_properties_set(info->stream_props, "combine.on-demand-id", s->on_demand_id);
 	} else {
 		if (pw_properties_get(info->stream_props, PW_KEY_TARGET_OBJECT) == NULL)
@@ -979,6 +982,8 @@ static int rule_matched(void *data, const char *location, const char *action,
 
 	if (spa_streq(action, "create-stream")) {
 		i->stream_props = pw_properties_copy(impl->stream_props);
+		if (i->stream_props == NULL)
+			return -errno;
 
 		pw_properties_update_string(i->stream_props, str, len);
 
@@ -1024,6 +1029,8 @@ static int metadata_property(void *data, uint32_t id,
 		info.id = SPA_ID_INVALID;
 		info.on_demand_id = on_demand_id;
 		info.stream_props = pw_properties_copy(impl->stream_props);
+		if (info.stream_props == NULL)
+			return -errno;
 
 		pw_properties_update_string(info.stream_props, value, strlen(value));
 
@@ -1220,6 +1227,7 @@ static void combine_input_process(void *d)
 
 				offs = SPA_MIN(ds->chunk->offset, ds->maxsize);
 				size = SPA_MIN(ds->chunk->size, ds->maxsize - offs);
+				size = SPA_MIN(size, dd->maxsize);
 
 				ringbuffer_memcpy(&s->delay[j],
 					dd->data, SPA_PTROFF(ds->data, offs, void), size);
@@ -1287,35 +1295,31 @@ static void combine_output_process(void *d)
 
 		for (j = 0; j < in->buffer->n_datas; j++) {
 			struct spa_data *ds, *dd;
-			uint32_t outsize = 0, remap;
-			int32_t stride = 0;
+			uint32_t remap, offs, ssize, stride;
+			void *sdata;
 
 			ds = &in->buffer->datas[j];
+			offs = SPA_MIN(ds->chunk->offset, ds->maxsize);
+			ssize = SPA_MIN(ds->chunk->size, ds->maxsize - offs);
+			stride = ds->chunk->stride;
+			sdata = SPA_PTROFF(ds->data, offs, void);
 
 			remap = s->remap[j];
 			if (remap < out->buffer->n_datas) {
-				uint32_t offs, size;
+				uint32_t size;
 
 				dd = &out->buffer->datas[remap];
 
-				offs = SPA_MIN(ds->chunk->offset, ds->maxsize);
-				size = SPA_MIN(ds->chunk->size, ds->maxsize - offs);
-				size = SPA_MIN(size, dd->maxsize);
+				size = SPA_MIN(ssize, dd->maxsize);
 
 				if (mix[remap]) {
-					ringbuffer_mix(&s->delay[j],
-						dd->data, SPA_PTROFF(ds->data, offs, void), size);
+					ringbuffer_mix(&s->delay[j], dd->data, sdata, size);
 				} else {
-					ringbuffer_memcpy(&s->delay[j],
-						dd->data, SPA_PTROFF(ds->data, offs, void), size);
+					ringbuffer_memcpy(&s->delay[j], dd->data, sdata, size);
 					mix[remap] = true;
 				}
-
-				outsize = SPA_MAX(outsize, size);
-				stride = SPA_MAX(stride, ds->chunk->stride);
-
 				dd->chunk->offset = 0;
-				dd->chunk->size = outsize;
+				dd->chunk->size = size;
 				dd->chunk->stride = stride;
 			}
 		}
@@ -1717,6 +1721,10 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 		goto error;
 
 	impl->registry = pw_core_get_registry(impl->core, PW_VERSION_REGISTRY, 0);
+	if (impl->registry == NULL) {
+		res = -errno;
+		goto error;
+	}
 	pw_registry_add_listener(impl->registry, &impl->registry_listener,
 			&registry_events, impl);
 

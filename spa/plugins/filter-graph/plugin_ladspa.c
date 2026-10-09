@@ -21,6 +21,7 @@
 struct plugin {
 	struct spa_handle handle;
 	struct spa_fga_plugin plugin;
+	bool filter_path;
 
 	struct spa_log *log;
 
@@ -33,11 +34,15 @@ struct descriptor {
 	const LADSPA_Descriptor *d;
 };
 
-static void *ladspa_instantiate(const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor *desc,
-                        unsigned long SampleRate, int index, const char *config)
+static int ladspa_instantiate(const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor *desc,
+                        uint32_t rate, const char *config, uint32_t n_hndl, void **hndl)
 {
 	struct descriptor *d = (struct descriptor *)desc;
-	return d->d->instantiate(d->d, SampleRate);
+	for (uint32_t i = 0; i < n_hndl; i++) {
+		if ((hndl[i] = d->d->instantiate(d->d, rate)) == NULL)
+			return -ENOMEM;
+	}
+	return 0;
 }
 
 static const LADSPA_Descriptor *find_desc(LADSPA_Descriptor_Function desc_func, const char *name)
@@ -156,6 +161,8 @@ static const struct spa_fga_descriptor *ladspa_plugin_make_desc(void *plugin, co
 		return NULL;
 
 	desc = calloc(1, sizeof(*desc));
+	if (desc == NULL)
+		return NULL;
 	desc->d = d;
 
 	desc->desc.instantiate = ladspa_instantiate;
@@ -172,6 +179,10 @@ static const struct spa_fga_descriptor *ladspa_plugin_make_desc(void *plugin, co
 
 	desc->desc.n_ports = d->PortCount;
 	desc->desc.ports = calloc(desc->desc.n_ports, sizeof(struct spa_fga_port));
+	if (desc->desc.ports == NULL) {
+		free(desc);
+		return NULL;
+	}
 
 	for (i = 0; i < desc->desc.n_ports; i++) {
 		desc->desc.ports[i].index = i;
@@ -233,13 +244,13 @@ static inline const char *split_walk(const char *str, const char *delimiter, siz
 	return s;
 }
 
-static void make_search_paths(const char **path, const char **search_dirs)
+static void make_search_paths(const char **path, const char **search_dirs, bool filter)
 {
-	const char *p;
-
-	while ((p = strstr(*path, "../")) != NULL)
-		*path = p + 3;
-
+	if (filter) {
+		const char *p;
+		while ((p = strstr(*path, "../")) != NULL)
+			*path = p + 3;
+	}
 	*search_dirs = getenv("LADSPA_PATH");
 	if (!*search_dirs)
 		*search_dirs = "/usr/lib64/ladspa:/usr/lib/ladspa:" LIBDIR;
@@ -252,6 +263,8 @@ static int load_ladspa_plugin(struct plugin *impl, const char *path, const char 
 	char filename[PATH_MAX];
 	size_t len;
 
+	if (!impl->filter_path && path[0] == '/')
+		return ladspa_handle_load_by_path(impl, path);
 	/*
 	 * set the errno for the case when `ladspa_handle_load_by_path()`
 	 * is never called, which can only happen if the supplied
@@ -337,11 +350,13 @@ impl_init(const struct spa_handle_factory *factory,
 		const char *s = info->items[i].value;
 		if (spa_streq(k, "filter.graph.path"))
 			path = s;
+		else if (spa_streq(k, "library.filter-path"))
+			impl->filter_path = spa_atob(s);
 	}
 	if (path == NULL)
 		return -EINVAL;
 
-	make_search_paths(&path, &search_dirs);
+	make_search_paths(&path, &search_dirs, impl->filter_path);
 
 	if ((res = load_ladspa_plugin(impl, path, search_dirs)) < 0) {
 		spa_log_error(impl->log, "failed to load plugin '%s' in '%s': %s",

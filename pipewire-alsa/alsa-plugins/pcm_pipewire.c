@@ -87,7 +87,7 @@ typedef struct {
 
 static int snd_pcm_pipewire_stop(snd_pcm_ioplug_t *io);
 
-static int update_active(snd_pcm_ioplug_t *io)
+static int update_active(snd_pcm_ioplug_t *io, bool force_wakeup)
 {
 	snd_pcm_pipewire_t *pw = io->private_data;
 	snd_pcm_sframes_t avail;
@@ -96,7 +96,9 @@ static int update_active(snd_pcm_ioplug_t *io)
 
 	avail = snd_pcm_ioplug_avail(io, pw->hw_ptr, io->appl_ptr);
 
-	if (pw->error > 0) {
+	if (pw->error > 0 || force_wakeup ||
+	    io->state == SND_PCM_STATE_SETUP ||
+	    pw->xrun_detected) {
 		active = true;
 	}
 	else if (io->state == SND_PCM_STATE_DRAINING) {
@@ -167,8 +169,10 @@ static int snd_pcm_pipewire_poll_revents(snd_pcm_ioplug_t *io,
 		return pw->error;
 
 	*revents = pfds[0].revents & ~(POLLIN | POLLOUT);
-	if (pfds[0].revents & POLLIN && update_active(io))
+	if (pfds[0].revents & POLLIN && update_active(io, false))
 		*revents |= (io->stream == SND_PCM_STREAM_PLAYBACK) ? POLLOUT : POLLIN;
+	if (io->state == SND_PCM_STATE_SETUP || pw->xrun_detected)
+		*revents |= POLLERR;
 
 	pw_log_trace_fp("poll %d", *revents);
 
@@ -392,7 +396,7 @@ static void on_stream_state_changed(void *data, enum pw_stream_state old, enum p
 	if (state == PW_STREAM_STATE_ERROR) {
 		pw_log_warn("%s", error);
 		pw->error = -errno;
-		update_active(&pw->io);
+		update_active(&pw->io, false);
 	}
 }
 
@@ -466,7 +470,7 @@ static void on_stream_process(void *data)
 		}
 	}
 done:
-	update_active(io);
+	update_active(io, false);
 }
 
 static const struct pw_stream_events stream_events = {
@@ -611,7 +615,7 @@ static int snd_pcm_pipewire_stop(snd_pcm_ioplug_t *io)
 	snd_pcm_pipewire_t *pw = io->private_data;
 
 	pw_log_debug("%p: stop", pw);
-	update_active(io);
+	update_active(io, true);
 
 	pw_thread_loop_lock(pw->main_loop);
 	if (pw->activated && pw->stream != NULL) {
@@ -951,6 +955,8 @@ static snd_pcm_chmap_t * snd_pcm_pipewire_get_chmap(snd_pcm_ioplug_t * io)
 
 	map = calloc(1, sizeof(snd_pcm_chmap_t) +
 				 channels * sizeof(unsigned int));
+	if (map == NULL)
+		return NULL;
 	map->channels = channels;
 	for (i = 0; i < channels; i++)
 		map->pos[i] = channel_to_chmap(position[i]);
@@ -958,33 +964,39 @@ static snd_pcm_chmap_t * snd_pcm_pipewire_get_chmap(snd_pcm_ioplug_t * io)
 	return map;
 }
 
-static void make_map(snd_pcm_chmap_query_t **maps, int index, int channels, ...)
+static void make_map(snd_pcm_chmap_query_t **maps, int *index, int channels, ...)
 {
 	va_list args;
-	int i;
+	int i, idx = *index;
 
-	maps[index] = malloc(sizeof(snd_pcm_chmap_query_t) + (channels * sizeof(unsigned int)));
-	maps[index]->type = SND_CHMAP_TYPE_FIXED;
-	maps[index]->map.channels = channels;
+	maps[idx] = malloc(sizeof(snd_pcm_chmap_query_t) + (channels * sizeof(unsigned int)));
+	if (maps[idx] == NULL)
+		return;
+	maps[idx]->type = SND_CHMAP_TYPE_FIXED;
+	maps[idx]->map.channels = channels;
 	va_start(args, channels);
 	for (i = 0; i < channels; i++)
-		maps[index]->map.pos[i] = va_arg(args, int);
+		maps[idx]->map.pos[i] = va_arg(args, int);
 	va_end(args);
+	(*index)++;
 }
 
 static snd_pcm_chmap_query_t **snd_pcm_pipewire_query_chmaps(snd_pcm_ioplug_t *io)
 {
 	snd_pcm_chmap_query_t **maps;
+	int idx = 0;
 
 	maps = calloc(7, sizeof(*maps));
-	make_map(maps,  0, 1, SND_CHMAP_MONO);
-	make_map(maps,  1, 2, SND_CHMAP_FL, SND_CHMAP_FR);
-	make_map(maps,  2, 4, SND_CHMAP_FL, SND_CHMAP_FR, SND_CHMAP_RL, SND_CHMAP_RR);
-	make_map(maps,  3, 5, SND_CHMAP_FL, SND_CHMAP_FR, SND_CHMAP_RL, SND_CHMAP_RR,
+	if (maps == NULL)
+		return NULL;
+	make_map(maps,  &idx, 1, SND_CHMAP_MONO);
+	make_map(maps,  &idx, 2, SND_CHMAP_FL, SND_CHMAP_FR);
+	make_map(maps,  &idx, 4, SND_CHMAP_FL, SND_CHMAP_FR, SND_CHMAP_RL, SND_CHMAP_RR);
+	make_map(maps,  &idx, 5, SND_CHMAP_FL, SND_CHMAP_FR, SND_CHMAP_RL, SND_CHMAP_RR,
 			SND_CHMAP_FC);
-	make_map(maps,  4, 6, SND_CHMAP_FL, SND_CHMAP_FR, SND_CHMAP_RL, SND_CHMAP_RR,
+	make_map(maps,  &idx, 6, SND_CHMAP_FL, SND_CHMAP_FR, SND_CHMAP_RL, SND_CHMAP_RR,
 			SND_CHMAP_FC, SND_CHMAP_LFE);
-	make_map(maps,  5, 8, SND_CHMAP_FL, SND_CHMAP_FR, SND_CHMAP_RL, SND_CHMAP_RR,
+	make_map(maps,  &idx, 8, SND_CHMAP_FL, SND_CHMAP_FR, SND_CHMAP_RL, SND_CHMAP_RR,
 			SND_CHMAP_FC, SND_CHMAP_LFE, SND_CHMAP_SL, SND_CHMAP_SR);
 
 	return maps;
@@ -1219,7 +1231,7 @@ static void on_core_error(void *data, uint32_t id, int seq, int res, const char 
 	if (id == PW_ID_CORE) {
 		pw->error = res;
 		if (pw->fd != -1)
-			update_active(&pw->io);
+			update_active(&pw->io, false);
 	}
 	pw_thread_loop_signal(pw->main_loop, false);
 }
@@ -1244,7 +1256,7 @@ static ssize_t log_write(void *cookie, const char *buf, size_t size)
 	return size;
 }
 
-static cookie_io_functions_t io_funcs = {
+static const cookie_io_functions_t io_funcs = {
 	.write = log_write,
 };
 
@@ -1261,6 +1273,7 @@ static int snd_pcm_pipewire_open(snd_pcm_t **pcmp,
 		struct pw_properties *props, snd_pcm_stream_t stream, int mode)
 {
 	snd_pcm_pipewire_t *pw;
+	struct pw_properties *props2;
 	int err;
 	const char *str, *node_name = NULL;
 	struct pw_loop *loop;
@@ -1276,8 +1289,7 @@ static int snd_pcm_pipewire_open(snd_pcm_t **pcmp,
 	pw->log_file = fopencookie(pw, "w", io_funcs);
 	if (pw->log_file == NULL) {
 		pw_log_error("can't create log file: %m");
-		err = -errno;
-		goto error;
+		goto error_errno;
 	}
 	if ((err = snd_output_stdio_attach(&pw->output, pw->log_file, 0)) < 0) {
 		pw_log_error("can't attach log file: %s", snd_strerror(err));
@@ -1285,20 +1297,17 @@ static int snd_pcm_pipewire_open(snd_pcm_t **pcmp,
 	}
 
 	pw->main_loop = pw_thread_loop_new("alsa-pipewire", NULL);
-	if (pw->main_loop == NULL) {
-		err = -errno;
-		goto error;
-	}
+	if (pw->main_loop == NULL)
+		goto error_errno;
+
 	loop = pw_thread_loop_get_loop(pw->main_loop);
 	pw->system = loop->system;
 	if ((pw->context = pw_context_new(loop,
 					pw_properties_new(
 						PW_KEY_CLIENT_API, "alsa",
 						NULL),
-					0)) == NULL) {
-		err = -errno;
-		goto error;
-	}
+					0)) == NULL)
+		goto error_errno;
 
 	pw_context_conf_update_props(pw->context, "alsa.properties", pw->props);
 
@@ -1348,12 +1357,14 @@ static int snd_pcm_pipewire_open(snd_pcm_t **pcmp,
 		goto error;
 
 	pw_thread_loop_lock(pw->main_loop);
-	pw->core = pw_context_connect(pw->context, pw_properties_copy(pw->props), 0);
-	if (pw->core == NULL) {
-		err = -errno;
-		pw_thread_loop_unlock(pw->main_loop);
-		goto error;
-	}
+	props2 = pw_properties_copy(pw->props);
+	if (props2 == NULL)
+		goto error_unlock_errno;
+
+	pw->core = pw_context_connect(pw->context, props2, 0);
+	if (pw->core == NULL)
+		goto error_unlock_errno;
+
 	pw_core_add_listener(pw->core, &pw->core_listener, &core_events, pw);
 	pw_thread_loop_unlock(pw->main_loop);
 
@@ -1391,6 +1402,12 @@ static int snd_pcm_pipewire_open(snd_pcm_t **pcmp,
 
 	return 0;
 
+error_unlock_errno:
+	err = -errno;
+	pw_thread_loop_unlock(pw->main_loop);
+	goto error;
+error_errno:
+	err = -errno;
 error:
 	pw_log_debug("%p: failed to open %s :%s", pw, node_name, spa_strerror(err));
 	snd_pcm_pipewire_free(pw);

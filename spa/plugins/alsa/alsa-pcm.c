@@ -48,6 +48,8 @@ static struct card *ensure_card(uint32_t index, bool ucm, bool ucm_split)
 		return c;
 
 	c = calloc(1, sizeof(*c));
+	if (c == NULL)
+		return NULL;
 	c->ref = 1;
 	c->index = index;
 
@@ -678,14 +680,20 @@ int spa_alsa_parse_prop_params(struct state *state, struct spa_pod *params)
 		const char *name;
 		struct spa_pod *pod;
 		char value[512];
+		int res;
 
 		if (spa_pod_parser_get_string(&prs, &name) < 0)
 			break;
 
 		if (spa_pod_parser_get_pod(&prs, &pod) < 0)
 			break;
+
 		if (spa_pod_is_string(pod)) {
-			spa_pod_copy_string(pod, sizeof(value), value);
+			if ((res = spa_pod_copy_string(pod, sizeof(value), value)) < 0) {
+				spa_log_error(state->log, "can't copy value for '%s' (max %zu bytes): %s",
+						name, sizeof(value)-1, spa_strerror(res));
+				continue;
+			}
 		} else if (spa_pod_is_int(pod)) {
 			snprintf(value, sizeof(value), "%d",
 					SPA_POD_VALUE(struct spa_pod_int, pod));
@@ -714,19 +722,25 @@ int spa_alsa_parse_prop_params(struct state *state, struct spa_pod *params)
 static ssize_t log_write(void *cookie, const char *buf, size_t size)
 {
 	struct state *state = cookie;
-	int len;
 
-	while (size > 0) {
-		len = strcspn(buf, "\n");
+	if (!spa_log_level_topic_enabled(state->log, SPA_LOG_TOPIC_DEFAULT, SPA_LOG_LEVEL_DEBUG))
+		return size;
+
+	for (size_t left = size; left > 0; ) {
+		const char *end = memchr(buf, '\n', left);
+		size_t len = end ? (size_t)(end - buf) : left;
+
 		if (len > 0)
 			spa_log_debug(state->log, "%.*s", (int)len, buf);
-		buf += len + 1;
-		size -= len + 1;
+
+		buf += len + !!end;
+		left -= len + !!end;
 	}
+
 	return size;
 }
 
-static cookie_io_functions_t io_funcs = {
+static const cookie_io_functions_t io_funcs = {
 	.write = log_write,
 };
 
@@ -1066,7 +1080,7 @@ int spa_alsa_init(struct state *state, const struct spa_dict *info)
 
 int spa_alsa_clear(struct state *state)
 {
-	int err;
+	int err = 0;
 	struct state *follower;
 
 	spa_list_remove(&state->link);
@@ -1092,12 +1106,8 @@ int spa_alsa_clear(struct state *state)
 	state->card = NULL;
 	state->card_index = SPA_ID_INVALID;
 
-	if ((err = snd_output_close(state->output)) < 0)
-		spa_log_warn(state->log, "output close failed: %s", snd_strerror(err));
-	fclose(state->log_file);
-
-	free(state->tag[0]);
-	free(state->tag[1]);
+	spa_clear_ptr(state->tag[0], free);
+	spa_clear_ptr(state->tag[1], free);
 
 	if (state->ctl) {
 		for (int i = 0; i < state->ctl_n_fds; i++) {
@@ -1119,6 +1129,12 @@ int spa_alsa_clear(struct state *state)
 		}
 	}
 
+	if (state->output) {
+		if ((err = snd_output_close(state->output)) < 0)
+			spa_log_warn(state->log, "output close failed: %s", snd_strerror(err));
+	}
+
+	spa_clear_ptr(state->log_file, fclose);
 	spa_clear_ptr(state->alsa_chmap, free);
 
 	return err;
@@ -1156,25 +1172,32 @@ static int probe_pitch_ctl(struct state *state)
 	if (err < 0) {
 		spa_log_debug(state->log, "%s: did not find ctl: %s",
 				 elem_name, snd_strerror(err));
-
-		snd_ctl_elem_value_free(state->pitch_elem);
-		state->pitch_elem = NULL;
-
-		if (opened) {
-			snd_ctl_close(state->ctl);
-			state->ctl = NULL;
-		}
-
 		goto error;
 	}
 
 	snd_ctl_elem_value_set_integer(state->pitch_elem, 0, 1000000);
-	CHECK(snd_ctl_elem_write(state->ctl, state->pitch_elem), "snd_ctl_elem_write");
+	err = snd_ctl_elem_write(state->ctl, state->pitch_elem);
+	if (err < 0) {
+		spa_log_error(state->log, "snd_ctl_elem_write: %s", snd_strerror(err));
+		goto error;
+	}
 	state->last_rate = 1.0;
 
 	spa_log_info(state->log, "found ctl %s", elem_name);
-	err = 0;
+
+	snd_lib_error_set_handler(NULL);
+
+	return 0;
+
 error:
+	if (state->pitch_elem != NULL) {
+		snd_ctl_elem_value_free(state->pitch_elem);
+		state->pitch_elem = NULL;
+	}
+	if (opened) {
+		snd_ctl_close(state->ctl);
+		state->ctl = NULL;
+	}
 	snd_lib_error_set_handler(NULL);
 	return err;
 }
@@ -2424,9 +2447,15 @@ int spa_alsa_set_format(struct state *state, struct spa_audio_info *fmt, uint32_
 	/* no period size specified. If we are batch or forcing our quantum,
 	 * use the graph requested quantum scaled by our rate */
 	if (period_size == 0 && (state->is_batch || state->force_quantum) && state->position) {
-		period_size = SPA_SCALE32_UP(state->position->clock.target_duration,
-				state->rate, state->position->clock.target_rate.denom);
-		period_size = flp2(period_size);
+		period_size = state->position->clock.target_duration;
+		/* only if we are rate adjusting, scale the period size and round down
+		 * to a power of two. */
+		if (state->position->clock.target_rate.denom != 0 &&
+		    state->rate != (int)state->position->clock.target_rate.denom) {
+			period_size = SPA_SCALE32_UP(period_size,
+					state->rate, state->position->clock.target_rate.denom);
+			period_size = flp2(period_size);
+		}
 	}
 	if (period_size == 0)
 		period_size = default_period;
@@ -2670,16 +2699,22 @@ static int spa_alsa_silence(struct state *state, snd_pcm_uframes_t silence)
 			return res;
 		}
 	} else {
-		uint8_t buffer[silence * state->frame_size];
-		memset(buffer, 0, silence * state->frame_size);
+		uint8_t buffer[1024 * 4];
+		void *bufs[state->channels];
+		snd_pcm_uframes_t chunk, remaining = silence;
+		snd_pcm_uframes_t max = sizeof(buffer) / state->frame_size;
 
-		if (state->planar) {
-			void *bufs[state->channels];
-			for (i = 0; i < state->channels; i++)
-				bufs[i] = buffer;
-			snd_pcm_writen(hndl, bufs, silence);
-		} else {
-			snd_pcm_writei(hndl, buffer, silence);
+		memset(buffer, 0, sizeof(buffer));
+		for (i = 0; i < state->channels; i++)
+			bufs[i] = buffer;
+
+		while (remaining > 0) {
+			chunk = SPA_MIN(remaining, max);
+			if (state->planar)
+				snd_pcm_writen(hndl, bufs, chunk);
+			else
+				snd_pcm_writei(hndl, buffer, chunk);
+			remaining -= chunk;
 		}
 	}
 	return 0;
@@ -2761,6 +2796,18 @@ static inline int do_drop(struct state *state)
 	return 0;
 }
 
+static inline int emit_node_error (struct spa_loop *loop,
+	bool async, uint32_t seq, const void *data, size_t size, void *user_data)
+{
+	struct state *state = user_data;
+	struct spa_event event = SPA_EVENT_INIT(SPA_TYPE_EVENT_Node, SPA_NODE_EVENT_Error);
+
+	spa_log_info(state->log, "%s: emit SPA_NODE_EVENT_Error", state->name);
+
+	spa_node_emit_event(&state->hooks, &event);
+	return 0;
+}
+
 static inline int do_start(struct state *state)
 {
 	int res;
@@ -2769,6 +2816,7 @@ static inline int do_start(struct state *state)
 		if (!state->linked && (res = snd_pcm_start(state->hndl)) < 0) {
 			spa_log_error(state->log, "%s: snd_pcm_start: %s",
 					state->name, snd_strerror(res));
+			spa_loop_invoke(state->main_loop, emit_node_error, 0, NULL, 0, false, state);
 			return res;
 		}
 		state->alsa_started = true;
@@ -2847,12 +2895,40 @@ recover:
 			check_position_config(follower, false);
 		}
 	}
-	do_prepare(driver);
+	if (do_prepare(driver) < 0) {
+		/* Driver is the clock source; starting it unprepared
+		 * breaks the entire pipeline. do_drop errors are
+		 * ignored (prepare can reset the hardware). Follower
+		 * errors are non-fatal by design.
+		 *
+		 * The PCM is now dropped and unprepared, so do not
+		 * re-arm the poll sources (that would busy-loop on
+		 * POLLERR), reset the state flags so a later restart
+		 * does not skip do_prepare()/do_start(), and signal
+		 * the graph to suspend and restart the node. */
+		update_sources(state, false);
+		driver->alsa_started = false;
+		driver->prepared = false;
+		spa_loop_invoke(driver->main_loop, emit_node_error, 0, NULL, 0, false, driver);
+		return -EIO;
+	}
 	spa_list_for_each(follower, &driver->rt.followers, rt.driver_link) {
 		if (follower != driver && follower->linked)
 			do_prepare(follower);
 	}
-	do_start(driver);
+	if (do_start(driver) < 0) {
+		/* The driver is the clock source; if it failed to start the
+		 * entire pipeline is not running. do_start() already emitted
+		 * the node error event. The PCM is prepared but not running,
+		 * so do not re-arm the poll sources (a non-running device may
+		 * report POLLERR and busy-loop), reset the state flags so a
+		 * later restart does not skip do_prepare()/do_start(), and
+		 * fail the recovery instead of pretending it succeeded. */
+		update_sources(state, false);
+		driver->alsa_started = false;
+		driver->prepared = false;
+		return -EIO;
+	}
 	spa_list_for_each(follower, &driver->rt.followers, rt.driver_link) {
 		if (follower != driver && follower->linked)
 			do_start(follower);
@@ -3028,7 +3104,13 @@ static int update_time(struct state *state, uint64_t current_time, snd_pcm_sfram
 
 		bw = (fabs(state->err_avg) + sqrt(fabs(state->err_var)))/1000.0;
 
-		spa_log_debug(state->log, "%s: follower:%d match:%d rate:%f "
+		/* Downgrade to TRACE in nominal operation (rate ~= 1.0, err ~= 0)
+		 * to avoid flooding logs every BW_PERIOD; DEBUG only when correction
+		 * is non-trivial. */
+		spa_log_lev(state->log,
+				(fabs(corr - 1.0) > 0.001 || fabs(err) > state->max_resync * 0.5)
+					? SPA_LOG_LEVEL_DEBUG : SPA_LOG_LEVEL_TRACE,
+				"%s: follower:%d match:%d rate:%f "
 				"bw:%f thr:%u del:%ld target:%ld err:%f max_err:%f max_resync: %f var:%f:%f:%f",
 				state->name, follower, state->matching,
 				corr, state->dll.bw, state->threshold, delay, target,
@@ -3881,7 +3963,11 @@ int spa_alsa_start(struct state *state)
 	else if (!state->opened)
 		return -EIO;
 
-	spa_alsa_prepare(state);
+	if ((err = spa_alsa_prepare(state)) < 0) {
+		spa_log_error(state->log, "%s: prepare failed: %s",
+				state->name, spa_strerror(err));
+		return err;
+	}
 
 	if (!state->disable_tsched) {
 		/* Timer-based scheduling */

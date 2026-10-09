@@ -12,9 +12,10 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <spa/utils/cleanup.h>
 #include <spa/utils/result.h>
 #include <spa/utils/string.h>
-#include <spa/utils/json.h>
+#include <spa/utils/json-builder.h>
 #include <spa/param/audio/format-utils.h>
 
 #include <pipewire/impl.h>
@@ -40,6 +41,10 @@
  *    false by default.
  * - `pulse.latency`: the latency to end-to-end latency in milliseconds to
  *                    maintain (Default 200ms).
+ * - `reconnect.interval.ms`: when the remote connection is broken, retry to
+ *                  connect with this interval in milliseconds. A value of 0
+ *                  disables recovery and will result in a module unload.
+ *                  (Default 0)
  *
  * ## Example configuration
  *
@@ -59,7 +64,8 @@
 PW_LOG_TOPIC_STATIC(mod_topic, "mod." NAME);
 #define PW_LOG_TOPIC_DEFAULT mod_topic
 
-#define MODULE_USAGE	"( pulse.latency=<latency in msec, default 200> ) "
+#define MODULE_USAGE	"( pulse.latency=<latency in msec, default 200> ) "	\
+			"( reconnect.interval.ms=<reconnect interval in msec, default 0> ) "
 
 static const struct spa_dict_item module_props[] = {
 	{ PW_KEY_MODULE_AUTHOR, "Wim Taymans <wim.taymans@gmail.com>" },
@@ -100,6 +106,8 @@ struct tunnel {
 	struct spa_hook module_listener;
 };
 
+static void tunnel_free(struct tunnel *t);
+
 static struct tunnel *tunnel_new(struct impl *impl, const struct tunnel_info *info)
 {
 	struct tunnel *t;
@@ -112,6 +120,11 @@ static struct tunnel *tunnel_new(struct impl *impl, const struct tunnel_info *in
 	t->info.mode = strdup(info->mode);
 	spa_list_append(&impl->tunnel_list, &t->link);
 
+	if (t->info.name == NULL || t->info.mode == NULL) {
+		tunnel_free(t);
+		errno = ENOMEM;
+		return NULL;
+	}
 	return t;
 }
 
@@ -177,18 +190,20 @@ static void pw_properties_from_zeroconf(const char *key, const char *value,
 	else if (spa_streq(key, "channel_map")) {
 		struct channel_map channel_map;
 		uint32_t i, pos[CHANNELS_MAX];
-		char *p, *s, buf[8];
+		char *s, buf[8];
 
 		spa_zero(channel_map);
 		channel_map_parse(value, &channel_map);
 		channel_map_to_positions(&channel_map, pos, CHANNELS_MAX);
 
-		p = s = alloca(4 + channel_map.channels * 8);
-		p += spa_scnprintf(p, 2, "[");
+		s = alloca(4 + channel_map.channels * 8);
+		struct spa_strbuf b;
+		spa_strbuf_init(&b, s, 4 + channel_map.channels * 8);
+		spa_strbuf_append(&b, "[");
 		for (i = 0; i < channel_map.channels; i++)
-			p += spa_scnprintf(p, 8, "%s%s", i == 0 ? "" : ",",
+			spa_strbuf_append(&b, "%s%s", i == 0 ? "" : ",",
 				channel_id2name(pos[i], buf, sizeof(buf)));
-		p += spa_scnprintf(p, 2, "]");
+		spa_strbuf_append(&b, "]");
 		pw_properties_set(props, SPA_KEY_AUDIO_POSITION, s);
 	}
 	else if (spa_streq(key, "format")) {
@@ -213,6 +228,21 @@ static void pw_properties_from_zeroconf(const char *key, const char *value,
 	}
 }
 
+static void copy_tunnel_props(const struct pw_properties *src, struct pw_properties *dst)
+{
+	static const char *keys[] = {
+		"pulse.latency",
+		"reconnect.interval.ms",
+	};
+	uint32_t i;
+	const char *str;
+
+	for (i = 0; i < SPA_N_ELEMENTS(keys); i++) {
+		if ((str = pw_properties_get(src, keys[i])) != NULL)
+			pw_properties_set(dst, keys[i], str);
+	}
+}
+
 static void submodule_destroy(void *data)
 {
 	struct tunnel *t = data;
@@ -229,18 +259,20 @@ static const struct pw_impl_module_events submodule_events = {
 static void on_zeroconf_added(void *data, const void *user_data, const struct spa_dict *info)
 {
 	struct impl *impl = data;
-	const char *name, *type, *mode, *device, *host_name, *desc, *fqdn, *user, *str;
+	const char *name, *type, *mode, *device, *host_name, *desc, *fqdn, *user;
 	struct tunnel *t;
 	struct tunnel_info tinfo;
 	const struct spa_dict_item *it;
-	FILE *f;
-	char *args;
+	struct spa_json_builder b;
+	spa_autofree char *args = NULL;
 	size_t size;
 	struct pw_impl_module *mod;
 	struct pw_properties *props = NULL;
 
 	name = spa_dict_lookup(info, PW_KEY_ZEROCONF_NAME);
 	type = spa_dict_lookup(info, PW_KEY_ZEROCONF_TYPE);
+	if (name == NULL || type == NULL)
+		goto done;
 	mode = strstr(type, "sink") ? "sink" : "source";
 
 	tinfo = TUNNEL_INFO(.name = name, .mode = mode);
@@ -267,6 +299,8 @@ static void on_zeroconf_added(void *data, const void *user_data, const struct sp
 		pw_properties_from_zeroconf(it->key, it->value, props);
 
 	host_name = spa_dict_lookup(info, PW_KEY_ZEROCONF_HOSTNAME);
+	if (host_name == NULL)
+		host_name = "unknown";
 
 	if ((device = pw_properties_get(props, PW_KEY_TARGET_OBJECT)) != NULL)
 		pw_properties_setf(props, PW_KEY_NODE_NAME,
@@ -277,9 +311,14 @@ static void on_zeroconf_added(void *data, const void *user_data, const struct sp
 
 	pw_properties_set(props, "tunnel.mode", mode);
 
-	pw_properties_setf(props, "pulse.server.address", " [%s]:%s",
-			spa_dict_lookup(info, PW_KEY_ZEROCONF_ADDRESS),
-			spa_dict_lookup(info, PW_KEY_ZEROCONF_PORT));
+	{
+		const char *address = spa_dict_lookup(info, PW_KEY_ZEROCONF_ADDRESS);
+		const char *port = spa_dict_lookup(info, PW_KEY_ZEROCONF_PORT);
+		if (address == NULL || port == NULL)
+			goto done;
+		pw_properties_setf(props, "pulse.server.address", " [%s]:%s",
+				address, port);
+	}
 
 	desc = pw_properties_get(props, "tunnel.remote.description");
 	if (desc == NULL)
@@ -306,26 +345,25 @@ static void on_zeroconf_added(void *data, const void *user_data, const struct sp
 				_("%s on %s"), desc, fqdn);
 	}
 
-	if ((str = pw_properties_get(impl->properties, "pulse.latency")) != NULL)
-		pw_properties_set(props, "pulse.latency", str);
+	copy_tunnel_props(impl->properties, props);
 
-	if ((f = open_memstream(&args, &size)) == NULL) {
+	if (spa_json_builder_memstream(&b, &args, &size, 0) < 0) {
 		pw_log_error("Can't open memstream: %m");
 		goto done;
 	}
 
-	fprintf(f, "{");
-	pw_properties_serialize_dict(f, &props->dict, 0);
-	fprintf(f, " stream.props = {");
-	fprintf(f, " }");
-	fprintf(f, "}");
-        fclose(f);
+	spa_json_builder_array_push(&b, "{");
+	pw_properties_serialize_dict(b.f, &props->dict, 0);
+	spa_json_builder_object_push(&b,  "stream.props", "{");
+	spa_json_builder_pop(&b,          "}");
+	spa_json_builder_pop(&b,        "}");
+	if (spa_json_builder_close(&b) < 0)
+		goto done;
 
 	pw_log_info("loading module args:'%s'", args);
 	mod = pw_context_load_module(impl->context,
 			"libpipewire-module-pulse-tunnel",
 			args, NULL);
-	free(args);
 
 	if (mod == NULL) {
 		pw_log_error("Can't load module: %m");
@@ -349,6 +387,8 @@ static void on_zeroconf_removed(void *data, const void *user, const struct spa_d
 
 	name = spa_dict_lookup(info, PW_KEY_ZEROCONF_NAME);
 	type = spa_dict_lookup(info, PW_KEY_ZEROCONF_TYPE);
+	if (name == NULL || type == NULL)
+		return;
 	mode = strstr(type, "sink") ? "sink" : "source";
 
 	tinfo = TUNNEL_INFO(.name = name, .mode = mode);

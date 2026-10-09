@@ -233,7 +233,7 @@ static void collect_device_info(struct pw_manager_object *device, struct pw_mana
 			 struct device_info *dev_info, bool monitor, struct defs *defs)
 {
 	struct pw_manager_param *p;
-	dev_info->active_port_name = NULL;
+	uint32_t enum_channels = 0;
 
 	if (card) {
 		spa_list_for_each(p, &card->param_list, link) {
@@ -257,41 +257,31 @@ static void collect_device_info(struct pw_manager_object *device, struct pw_mana
 				dev_info->have_volume = true;
 			}
 		}
-
-		/* Look up the port name for the active port */
-		if (dev_info->active_port != SPA_ID_INVALID) {
-			spa_list_for_each(p, &card->param_list, link) {
-				uint32_t index, direction;
-				const char *name = NULL;
-
-				if (p->id != SPA_PARAM_EnumRoute)
-					continue;
-
-				if (spa_pod_parse_object(p->param,
-						SPA_TYPE_OBJECT_ParamRoute, NULL,
-						SPA_PARAM_ROUTE_index, SPA_POD_Int(&index),
-						SPA_PARAM_ROUTE_direction, SPA_POD_Id(&direction),
-						SPA_PARAM_ROUTE_name, SPA_POD_String(&name)) < 0)
-					continue;
-
-				if (index == dev_info->active_port &&
-				    direction == dev_info->direction) {
-					dev_info->active_port_name = name;
-					break;
-				}
-			}
-		}
 	}
 
 	spa_list_for_each(p, &device->param_list, link) {
 		switch (p->id) {
 		case SPA_PARAM_EnumFormat:
 		{
-			struct spa_pod *copy = spa_pod_copy(p->param);
-			spa_pod_fixate(copy);
-			format_parse_param(copy, true, &dev_info->ss, &dev_info->map,
-					&defs->sample_spec, &defs->channel_map);
-			free(copy);
+			struct spa_pod *to_free = NULL, *c = p->param;
+			struct sample_spec ss = dev_info->ss;
+			struct channel_map map = dev_info->map;
+
+			if (!spa_pod_is_fixated(c)) {
+				to_free = spa_pod_copy(c);
+				if (to_free == NULL)
+					break;
+				spa_pod_fixate(to_free);
+				c = to_free;
+			}
+			if (format_parse_param(c, true, &ss, &map,
+					&defs->sample_spec, &defs->channel_map) >= 0 &&
+			    ss.channels > enum_channels) {
+				dev_info->ss = ss;
+				dev_info->map = map;
+				enum_channels = ss.channels;
+			}
+			free(to_free);
 			break;
 		}
 		case SPA_PARAM_Format:
@@ -384,10 +374,12 @@ static bool array_contains(uint32_t *vals, uint32_t n_vals, uint32_t val)
 }
 
 uint32_t collect_port_info(struct pw_manager_object *card, struct card_info *card_info,
-			   struct device_info *dev_info, struct port_info *port_info)
+			   struct device_info *dev_info, struct port_info *port_info,
+			   const char **active_port_name)
 {
 	struct pw_manager_param *p;
 	uint32_t n;
+	const char *aport_name = NULL;
 
 	if (card == NULL)
 		return 0;
@@ -441,7 +433,7 @@ uint32_t collect_port_info(struct pw_manager_object *card, struct card_info *car
 			if (!array_contains(pi->devices, pi->n_devices, dev_info->device))
 				continue;
 			if (pi->index == dev_info->active_port)
-				dev_info->active_port_name = pi->name;
+				aport_name = pi->name;
 		}
 
 		while (pi->info != NULL) {
@@ -471,8 +463,11 @@ uint32_t collect_port_info(struct pw_manager_object *card, struct card_info *car
 		}
 		n++;
 	}
-	if (dev_info != NULL && dev_info->active_port_name == NULL && n > 0)
-		dev_info->active_port_name = port_info[0].name;
+	if (aport_name == NULL && n > 0)
+		aport_name = port_info[0].name;
+
+	if (active_port_name)
+		*active_port_name = aport_name;
 	return n;
 }
 
@@ -502,7 +497,8 @@ uint32_t find_port_index(struct pw_manager_object *card, uint32_t direction, con
 	return SPA_ID_INVALID;
 }
 
-struct spa_dict *collect_props(struct spa_pod *info, struct spa_dict *dict)
+struct spa_dict *collect_props(struct spa_pod *info, struct spa_dict *dict,
+			       struct spa_dict_item *items, size_t capacity)
 {
 	struct spa_pod_parser prs;
 	struct spa_pod_frame f[1];
@@ -513,15 +509,18 @@ struct spa_dict *collect_props(struct spa_pod *info, struct spa_dict *dict)
 	    spa_pod_parser_get_int(&prs, &n_items) < 0)
 		return NULL;
 
+	if (n_items < 0 || (size_t) n_items > capacity)
+		return NULL;
+
 	for (n = 0; n < n_items; n++) {
 		if (spa_pod_parser_get(&prs,
-				SPA_POD_String(&dict->items[n].key),
-				SPA_POD_String(&dict->items[n].value),
+				SPA_POD_String(&items[n].key),
+				SPA_POD_String(&items[n].value),
 				NULL) < 0)
 			break;
 	}
 	spa_pod_parser_pop(&prs, &f[0]);
-	dict->n_items = n;
+	*dict = SPA_DICT_INIT(items, n);
 	return dict;
 }
 

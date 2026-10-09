@@ -93,7 +93,7 @@ int compress_offload_api_set_params(struct compress_offload_api_context *context
 	);
 	assert(
 		(num_fragments == 0) ||
-		((num_fragments >= context->caps.min_fragments) && (fragment_size <= context->caps.max_fragments))
+		((num_fragments >= context->caps.min_fragments) && (num_fragments <= context->caps.max_fragments))
 	);
 
 	context->fragment_size = (fragment_size != 0) ? fragment_size : context->caps.min_fragment_size;
@@ -254,8 +254,8 @@ int compress_offload_api_write(struct compress_offload_api_context *context, con
 	num_bytes_written = write(context->fd, data, size);
 	if (num_bytes_written < 0) {
 		switch (errno) {
-			case EBADFD:
-				/* EBADFD indicates that the device is paused and thus is not an error. */
+			case EBADF:
+				/* EBADF indicates that the device is paused and thus is not an error. */
 				break;
 			default:
 				spa_log_error(context->log, "could not write %zu byte(s): %s (%d)",

@@ -286,7 +286,7 @@ static int pipewire_elem_count(snd_ctl_ext_t * ext)
 	assert(ctl);
 
 	if (!ctl->mainloop)
-		return -EBADFD;
+		return -EBADF;
 
 	pw_thread_loop_lock(ctl->mainloop);
 
@@ -322,7 +322,7 @@ static int pipewire_elem_list(snd_ctl_ext_t * ext, unsigned int offset,
 	assert(ctl);
 
 	if (!ctl->mainloop)
-		return -EBADFD;
+		return -EBADF;
 
 	snd_ctl_elem_id_set_interface(id, SND_CTL_ELEM_IFACE_MIXER);
 
@@ -393,7 +393,7 @@ static int pipewire_get_attribute(snd_ctl_ext_t * ext, snd_ctl_ext_key_t key,
 	assert(ctl);
 
 	if (!ctl->mainloop)
-		return -EBADFD;
+		return -EBADF;
 
 	pw_thread_loop_lock(ctl->mainloop);
 
@@ -449,7 +449,7 @@ static int pipewire_read_integer(snd_ctl_ext_t * ext, snd_ctl_ext_key_t key,
 	assert(ctl);
 
 	if (!ctl->mainloop)
-		return -EBADFD;
+		return -EBADF;
 
 	pw_thread_loop_lock(ctl->mainloop);
 
@@ -583,7 +583,7 @@ static int pipewire_write_integer(snd_ctl_ext_t * ext, snd_ctl_ext_key_t key,
 	assert(ctl);
 
 	if (!ctl->mainloop)
-		return -EBADFD;
+		return -EBADF;
 
 	pw_thread_loop_lock(ctl->mainloop);
 
@@ -682,7 +682,7 @@ static int pipewire_read_event(snd_ctl_ext_t * ext, snd_ctl_elem_id_t * id,
 	assert(ctl);
 
 	if (!ctl->mainloop)
-		return -EBADFD;
+		return -EBADF;
 
 	pw_thread_loop_lock(ctl->mainloop);
 
@@ -739,7 +739,7 @@ static int pipewire_ctl_poll_revents(snd_ctl_ext_t * ext, struct pollfd *pfd,
 	assert(ctl);
 
 	if (!ctl->mainloop)
-		return -EBADFD;
+		return -EBADF;
 
 	pw_thread_loop_lock(ctl->mainloop);
 
@@ -836,6 +836,9 @@ static void parse_props(struct global *g, const struct spa_pod *param, bool devi
 	struct spa_pod_object *obj = (struct spa_pod_object *) param;
 	snd_ctl_pipewire_t *ctl = g->ctl;
 
+	if (!spa_pod_is_object_type(param, SPA_TYPE_OBJECT_Props))
+		return;
+
 	SPA_POD_OBJECT_FOREACH(obj, prop) {
 		switch (prop->key) {
 		case SPA_PROP_volume:
@@ -907,7 +910,7 @@ static void device_event_param(void *data, int seq,
 				SPA_PARAM_ROUTE_index, SPA_POD_Int(&idx),
 				SPA_PARAM_ROUTE_direction, SPA_POD_Id(&direction),
 				SPA_PARAM_ROUTE_device, SPA_POD_Int(&device),
-				SPA_PARAM_ROUTE_props, SPA_POD_OPT_Pod(&props)) < 0) {
+				SPA_PARAM_ROUTE_props, SPA_POD_OPT_PodObject(&props)) < 0) {
 			pw_log_warn("device %d: can't parse route", g->id);
 			return;
 		}
@@ -1248,6 +1251,7 @@ SND_CTL_PLUGIN_DEFINE_FUNC(pipewire)
 	int err;
 	const char *str;
 	snd_ctl_pipewire_t *ctl;
+	struct pw_properties *props2;
 	struct pw_loop *loop;
 
         pw_init(NULL, NULL);
@@ -1392,20 +1396,20 @@ SND_CTL_PLUGIN_DEFINE_FUNC(pipewire)
 		goto error;
 
 	pw_thread_loop_lock(ctl->mainloop);
-	ctl->core = pw_context_connect(ctl->context, pw_properties_copy(ctl->props), 0);
-	if (ctl->core == NULL) {
-		err = -errno;
-		goto error_unlock;
-	}
+	if ((props2 = pw_properties_copy(ctl->props)) == NULL)
+		goto error_unlock_errno;
+
+	ctl->core = pw_context_connect(ctl->context, props2, 0);
+	if (ctl->core == NULL)
+		goto error_unlock_errno;
+
 	pw_core_add_listener(ctl->core,
 			&ctl->core_listener,
 			&core_events, ctl);
 
 	ctl->registry = pw_core_get_registry(ctl->core, PW_VERSION_REGISTRY, 0);
-	if (ctl->registry == NULL) {
-		err = -errno;
-		goto error_unlock;
-	}
+	if (ctl->registry == NULL)
+		goto error_unlock_errno;
 
 	pw_registry_add_listener(ctl->registry,
 			&ctl->registry_listener,
@@ -1437,6 +1441,8 @@ SND_CTL_PLUGIN_DEFINE_FUNC(pipewire)
 
 	return 0;
 
+error_unlock_errno:
+	err = -errno;
 error_unlock:
 	pw_thread_loop_unlock(ctl->mainloop);
 error:

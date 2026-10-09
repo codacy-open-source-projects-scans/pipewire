@@ -34,6 +34,8 @@ extern "C" {
 #define BLUEZ_MEDIA_TRANSPORT_INTERFACE BLUEZ_SERVICE ".MediaTransport1"
 #define BLUEZ_INTERFACE_BATTERY_PROVIDER BLUEZ_SERVICE ".BatteryProvider1"
 #define BLUEZ_INTERFACE_BATTERY_PROVIDER_MANAGER BLUEZ_SERVICE ".BatteryProviderManager1"
+#define BLUEZ_LE_ADVERTISING_MANAGER_INTERFACE BLUEZ_SERVICE ".LEAdvertisingManager1"
+#define BLUEZ_LE_ADVERTISEMENT_INTERFACE BLUEZ_SERVICE ".LEAdvertisement1"
 
 #define DBUS_INTERFACE_OBJECT_MANAGER "org.freedesktop.DBus.ObjectManager"
 #define DBUS_SIGNAL_INTERFACES_ADDED "InterfacesAdded"
@@ -153,6 +155,8 @@ extern "C" {
 #define BAP_SOURCE_ENDPOINT	BAP_OBJECT_MANAGER_PATH "/BAPSource"
 #define BAP_BROADCAST_SOURCE_ENDPOINT	BAP_OBJECT_MANAGER_PATH "/BAPBroadcastSource"
 #define BAP_BROADCAST_SINK_ENDPOINT		BAP_OBJECT_MANAGER_PATH "/BAPBroadcastSink"
+
+#define BAP_ADVERTISEMENT_PATH	"/MediaLEAdvertisement"
 
 #define SPA_BT_UNKNOWN_DELAY			0
 
@@ -350,6 +354,12 @@ struct spa_bt_monitor;
 struct spa_bt_backend;
 struct spa_bt_player;
 
+enum bluez_app_id {
+	BLUEZ_APP_A2DP,
+	BLUEZ_APP_BAP,
+	BLUEZ_APP_LAST
+};
+
 struct spa_bt_adapter {
 	struct spa_list link;
 	struct spa_bt_monitor *monitor;
@@ -366,11 +376,15 @@ struct spa_bt_adapter {
 	uint32_t bluetooth_class;
 	uint32_t profiles;
 	int powered;
+
+	struct bluez_app {
+		DBusPendingCall *register_call;
+		bool registered;
+		DBusPendingCall *register_adv_call;
+	} apps[BLUEZ_APP_LAST];
+
 	unsigned int has_msbc:1;
 	unsigned int msbc_probed:1;
-	unsigned int legacy_endpoints_registered:1;
-	unsigned int a2dp_application_registered:1;
-	unsigned int bap_application_registered:1;
 	unsigned int player_registered:1;
 	unsigned int has_battery_provider:1;
 	unsigned int battery_provider_unavailable:1;
@@ -635,7 +649,7 @@ enum spa_bt_transport_state {
 };
 
 struct spa_bt_transport_events {
-#define SPA_VERSION_BT_TRANSPORT_EVENTS	0
+#define SPA_VERSION_BT_TRANSPORT_EVENTS	1
 	uint32_t version;
 
 	void (*destroy) (void *data);
@@ -643,6 +657,8 @@ struct spa_bt_transport_events {
 	void (*state_changed) (void *data, enum spa_bt_transport_state old,
 			enum spa_bt_transport_state state);
 	void (*volume_changed) (void *data);
+	/** The node using the transport will be removed */
+	void (*remove_node) (void *data);
 };
 
 struct spa_bt_transport_implementation {
@@ -744,6 +760,7 @@ int spa_bt_transport_ensure_sco_io(struct spa_bt_transport *t, struct spa_loop *
 #define spa_bt_transport_emit_delay_changed(t)		spa_bt_transport_emit(t, delay_changed, 0)
 #define spa_bt_transport_emit_state_changed(t,...)	spa_bt_transport_emit(t, state_changed, 0, __VA_ARGS__)
 #define spa_bt_transport_emit_volume_changed(t)		spa_bt_transport_emit(t, volume_changed, 0)
+#define spa_bt_transport_emit_remove_node(t)		spa_bt_transport_emit(t, remove_node, 1)
 
 #define spa_bt_transport_add_listener(t,listener,events,data) \
         spa_hook_list_append(&(t)->listener_list, listener, events, data)

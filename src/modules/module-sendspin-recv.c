@@ -18,6 +18,7 @@
 #include <spa/utils/hook.h>
 #include <spa/utils/result.h>
 #include <spa/utils/ringbuffer.h>
+#include <spa/utils/cleanup.h>
 #include <spa/utils/defs.h>
 #include <spa/utils/dll.h>
 #include <spa/utils/json.h>
@@ -85,6 +86,7 @@
  * - \ref PW_KEY_NODE_GROUP
  * - \ref PW_KEY_NODE_LATENCY
  * - \ref PW_KEY_NODE_VIRTUAL
+ * - \ref PW_KEY_NODE_NETWORK
  *
  * ## Example configuration
  *\code{.unparsed}
@@ -352,6 +354,8 @@ static int create_stream(struct client *client)
 	struct spa_pod_builder b;
 	const char *server_id, *ip, *port, *server_name;
 	struct pw_properties *props = pw_properties_copy(client->props);
+	if (props == NULL)
+		return -errno;
 
 	ip = pw_properties_get(props, "sendspin.ip");
 	port = pw_properties_get(props, "sendspin.port");
@@ -424,10 +428,11 @@ static int send_client_hello(struct client *client)
 	struct impl *impl = client->impl;
 	struct spa_json_builder b;
 	int res;
-	char *mem;
+	spa_autofree char *mem = NULL;
 	size_t size;
 
-	spa_json_builder_memstream(&b, &mem, &size, 0);
+	if ((res = spa_json_builder_memstream(&b, &mem, &size, 0)) < 0)
+		return res;
 	spa_json_builder_array_push(&b,  "{");
 	spa_json_builder_object_string(&b, "type", "client/hello");
 	spa_json_builder_object_push(&b,   "payload", "{");
@@ -445,22 +450,21 @@ static int send_client_hello(struct client *client)
 	add_playerv1_support(client, &b);
 	spa_json_builder_pop(&b,           "}");
 	spa_json_builder_pop(&b,         "}");
-	spa_json_builder_close(&b);
+	if ((res = spa_json_builder_close(&b)) < 0)
+		return res;
 
-	res = pw_websocket_connection_send_text(client->conn, mem, size);
-	free(mem);
-
-	return res;
+	return pw_websocket_connection_send_text(client->conn, mem, size);
 }
 
 static int send_client_state(struct client *client)
 {
 	struct spa_json_builder b;
 	int res;
-	char *mem;
+	spa_autofree char *mem = NULL;
 	size_t size;
 
-	spa_json_builder_memstream(&b, &mem, &size, 0);
+	if ((res = spa_json_builder_memstream(&b, &mem, &size, 0)) < 0)
+		return res;
 	spa_json_builder_array_push(&b,  "{");
 	spa_json_builder_object_string(&b, "type", "client/state");
 	spa_json_builder_object_push(&b,   "payload", "{");
@@ -471,11 +475,10 @@ static int send_client_state(struct client *client)
 	spa_json_builder_pop(&b,             "}");
 	spa_json_builder_pop(&b,           "}");
 	spa_json_builder_pop(&b,         "}");
-	spa_json_builder_close(&b);
+	if ((res = spa_json_builder_close(&b)) < 0)
+		return res;
 
-	res = pw_websocket_connection_send_text(client->conn, mem, size);
-	free(mem);
-	return res;
+	return pw_websocket_connection_send_text(client->conn, mem, size);
 }
 
 static uint64_t get_time_us(struct client *client)
@@ -491,23 +494,23 @@ static int send_client_time(struct client *client)
 	struct spa_json_builder b;
 	int res;
 	uint64_t now;
-	char *mem;
+	spa_autofree char *mem = NULL;
 	size_t size;
 
 	now = get_time_us(client);
 
-	spa_json_builder_memstream(&b, &mem, &size, 0);
+	if ((res = spa_json_builder_memstream(&b, &mem, &size, 0)) < 0)
+		return res;
 	spa_json_builder_array_push(&b,  "{");
 	spa_json_builder_object_string(&b, "type", "client/time");
 	spa_json_builder_object_push(&b,   "payload", "{");
 	spa_json_builder_object_uint(&b,     "client_transmitted", now);
 	spa_json_builder_pop(&b,           "}");
 	spa_json_builder_pop(&b,         "}");
-	spa_json_builder_close(&b);
+	if ((res = spa_json_builder_close(&b)) < 0)
+		return res;
 
-	res = pw_websocket_connection_send_text(client->conn, mem, size);
-	free(mem);
-	return res;
+	return pw_websocket_connection_send_text(client->conn, mem, size);
 }
 
 static void do_client_timer(void *data)
@@ -526,21 +529,22 @@ static int send_client_goodbye(struct client *client, const char *reason)
 {
 	struct spa_json_builder b;
 	int res;
-	char *mem;
+	spa_autofree char *mem = NULL;
 	size_t size;
 
-	spa_json_builder_memstream(&b, &mem, &size, 0);
+	if ((res = spa_json_builder_memstream(&b, &mem, &size, 0)) < 0)
+		return res;
 	spa_json_builder_array_push(&b,  "{");
 	spa_json_builder_object_string(&b, "type", "client/goodbye");
 	spa_json_builder_object_push(&b,   "payload", "{");
 	spa_json_builder_object_string(&b,   "reason", reason);
 	spa_json_builder_pop(&b,           "}");
 	spa_json_builder_pop(&b,         "}");
-	spa_json_builder_close(&b);
+	if ((res = spa_json_builder_close(&b)) < 0)
+		return res;
 
 	res = pw_websocket_connection_send_text(client->conn, mem, size);
 	pw_websocket_connection_disconnect(client->conn, true);
-	free(mem);
 	return res;
 }
 
@@ -677,7 +681,7 @@ static int handle_server_time(struct client *client, struct spa_json *payload)
 	spa_regress_update(&client->regress_time, (t2+t3)/2, (t1+t4)/2);
 
 	if (client->timeout_count < 4)
-		timeout = 200 * SPA_MSEC_PER_SEC;
+		timeout = 200 * SPA_NSEC_PER_MSEC;
 	else if (client->timeout_count < 10)
 		timeout = SPA_NSEC_PER_SEC;
 	else if (client->timeout_count < 20)
@@ -695,6 +699,29 @@ static int handle_server_time(struct client *client, struct spa_json *payload)
 static int handle_server_command(struct client *client, struct spa_json *payload)
 {
 	return 0;
+}
+
+static const struct spa_audio_layout_info layouts[] = {
+	{ SPA_AUDIO_LAYOUT_Mono },
+	{ SPA_AUDIO_LAYOUT_Stereo },
+	{ SPA_AUDIO_LAYOUT_2_1 },
+	{ SPA_AUDIO_LAYOUT_3_1 },
+	{ SPA_AUDIO_LAYOUT_5_0 },
+	{ SPA_AUDIO_LAYOUT_5_1 },
+	{ SPA_AUDIO_LAYOUT_7_0 },
+	{ SPA_AUDIO_LAYOUT_7_1 },
+};
+static void default_layout(uint32_t channels, uint32_t *position)
+{
+	SPA_FOR_EACH_ELEMENT_VAR(layouts, l) {
+		if (l->n_channels == channels) {
+			for (uint32_t i = 0; i < l->n_channels; i++)
+				position[i] = l->position[i];
+			return;
+		}
+	}
+	for (uint32_t i = 0; i < channels; i++)
+		position[i] = SPA_AUDIO_CHANNEL_AUX0 + i;
 }
 
 /* {"codec":"pcm","sample_rate":44100,"channels":2,"bit_depth":16} */
@@ -726,7 +753,7 @@ static int parse_player(struct client *client, struct spa_json *player)
 		else if (spa_streq(key, "codec_header")) {
 		}
 	}
-	if (sample_rate == 0 || channels == 0)
+	if (sample_rate <= 0 || channels <= 0 || channels > (int)SPA_AUDIO_MAX_CHANNELS)
 		return -EINVAL;
 
 	if (spa_streq(codec, "pcm")) {
@@ -742,19 +769,14 @@ static int parse_player(struct client *client, struct spa_json *player)
 			client->info.info.raw.format = SPA_AUDIO_FORMAT_S24_LE;
 			client->stride = 3 * channels;
 			break;
+		case 32:
+			client->info.info.raw.format = SPA_AUDIO_FORMAT_S32_LE;
+			client->stride = 4 * channels;
+			break;
 		default:
 			return -EINVAL;
 		}
-	}
-	else if (spa_streq(codec, "opus")) {
-		client->info.media_subtype = SPA_MEDIA_SUBTYPE_opus;
-		client->info.info.opus.rate = sample_rate;
-		client->info.info.opus.channels = channels;
-	}
-	else if (spa_streq(codec, "flac")) {
-		client->info.media_subtype = SPA_MEDIA_SUBTYPE_flac;
-		client->info.info.flac.rate = sample_rate;
-		client->info.info.flac.channels = channels;
+		default_layout(channels, client->info.info.raw.position);
 	}
 	else
 		return -EINVAL;
@@ -775,10 +797,12 @@ static int handle_stream_start(struct client *client, struct spa_json *payload)
 
 	while ((l = spa_json_object_next(payload, key, sizeof(key), &v)) > 0) {
 		if (spa_streq(key, "player")) {
+			int res;
 			if (!spa_json_is_object(v, l))
 				return -EPROTO;
 			spa_json_enter(payload, &it[0]);
-			parse_player(client, &it[0]);
+			if ((res = parse_player(client, &it[0])) < 0)
+				return res;
 		}
 	}
 
@@ -872,8 +896,13 @@ static int do_handle_binary(struct client *client, const uint8_t *payload, int s
 {
 	struct impl *impl = client->impl;
 	int32_t filled;
-	uint32_t index, length = size - 9;
+	uint32_t index, length;
 	uint64_t timestamp;
+
+	if (size < 9)
+		return 0;
+
+	length = size - 9;
 
 	if (payload[0] != 4 || client->stream == NULL)
 		return 0;
@@ -1090,6 +1119,8 @@ static void on_websocket_connected(void *data, void *user,
 				(struct sockaddr*)&addr, sizeof(addr));
 
 		props = pw_properties_copy(impl->stream_props);
+		if (props == NULL)
+			return;
 		if (pw_net_get_ip(&addr, ip, sizeof(ip), &ipv4, &port) >= 0) {
 			pw_properties_set(props, "sendspin.ip", ip);
 			pw_properties_setf(props, "sendspin.port", "%u", port);
@@ -1137,6 +1168,8 @@ static void on_zeroconf_added(void *data, const void *user, const struct spa_dic
 		return;
 
 	props = pw_properties_copy(impl->stream_props);
+	if (props == NULL)
+		return;
 	pw_properties_update(props, info);
 
 	addr = spa_dict_lookup(info, PW_KEY_ZEROCONF_ADDRESS);
@@ -1275,6 +1308,11 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 
 	pw_properties_set(props, PW_KEY_NODE_LOOP_NAME, impl->data_loop->name);
 
+	if (pw_properties_get(props, PW_KEY_NODE_VIRTUAL) == NULL)
+		pw_properties_set(props, PW_KEY_NODE_VIRTUAL, "true");
+	if (pw_properties_get(props, PW_KEY_NODE_NETWORK) == NULL)
+		pw_properties_set(props, PW_KEY_NODE_NETWORK, "true");
+
 	if ((str = pw_properties_get(props, "stream.props")) != NULL)
 		pw_properties_update_string(stream_props, str, strlen(str));
 
@@ -1286,6 +1324,7 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	copy_props(impl, props, PW_KEY_NODE_GROUP);
 	copy_props(impl, props, PW_KEY_NODE_LATENCY);
 	copy_props(impl, props, PW_KEY_NODE_VIRTUAL);
+	copy_props(impl, props, PW_KEY_NODE_NETWORK);
 	copy_props(impl, props, PW_KEY_NODE_CHANNELNAMES);
 	copy_props(impl, props, PW_KEY_MEDIA_NAME);
 	copy_props(impl, props, PW_KEY_MEDIA_CLASS);
@@ -1377,6 +1416,10 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 				path = DEFAULT_SENDSPIN_PATH;
 
 			p = pw_properties_copy(impl->stream_props);
+			if (p == NULL) {
+				res = -errno;
+				goto out;
+			}
 			pw_properties_set(p, "sendspin.ip", hostname);
 			pw_properties_set(p, "sendspin.port", port);
 			pw_properties_set(p, "sendspin.path", path);

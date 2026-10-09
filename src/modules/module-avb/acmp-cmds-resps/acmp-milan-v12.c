@@ -53,6 +53,12 @@ static inline uint64_t peer_id_from_entity_id(uint64_t entity_id, uint16_t uniqu
 		return 0;
 	}
 
+	/* Non-EUI-64 entity_id (MAC|entity_index): high 48 bits are the MAC, swap the
+	 * low 16 for unique_id. EUI-64 (FF:FE marker) rebuilds the stream_id below. */
+	if (((entity_id >> 24) & 0xFFFFULL) != 0xFFFEULL) {
+		return (entity_id & 0xFFFFFFFFFFFF0000ULL) | unique_id;
+	}
+
 	return (entity_id & 0xFFFFFF0000000000ULL) |
 	       ((entity_id & 0xFFFFFFULL) << 16) |
 	       unique_id;
@@ -69,11 +75,17 @@ static inline void clear_stream_binding(struct aecp_aem_stream_input_state_milan
 	       sizeof(stream->stream_in_sta.common.stream.addr));
 	stream->stream_in_sta.common.stream.vlan_id = AVB_DEFAULT_VLAN;
 
+	stream->acmp_sta.talker_entity_id = 0;
 	stream->stream_in_sta.stream_info_dirty = true;
 }
 
 static inline uint64_t stream_talker_entity_id(const struct aecp_aem_stream_input_state_milan_v12 *s)
 {
+	/* Prefer the talker entity_id stashed at BIND_RX (round-trip-safe); deriving it
+	 * from the MSRP stream_id is lossy for non-EUI-64 entity_ids. */
+	if (s->acmp_sta.talker_entity_id != 0) {
+		return s->acmp_sta.talker_entity_id;
+	}
 	return entity_id_from_peer_id(be64toh(s->stream_in_sta.common.lstream_attr.attr.listener.stream_id));
 }
 
@@ -154,8 +166,8 @@ static struct acmp_lt_timers *acmp_lt_add_timer_milan_v12(struct acmp_milan_v12 
 	if (tmr == NULL)
 		return NULL;
 	if (m) {
-		memcpy(tmr->saved_packet, m, len);
-		tmr->saved_packet_len = len;
+		tmr->saved_packet_len = SPA_MIN(len, sizeof(tmr->saved_packet));
+		memcpy(tmr->saved_packet, m, tmr->saved_packet_len);
 	}
 
 	tmr->timeout = timeout;
@@ -455,6 +467,7 @@ static void binding_save_parameters(struct acmp *acmp,
 	uint64_t stream_id = htobe64(peer_id_from_entity_id(be64toh(p->talker_guid), ntohs(p->talker_unique_id)));
 
 	stream->acmp_sta.controller_entity_id = be64toh(p->controller_guid);
+	stream->acmp_sta.talker_entity_id = be64toh(p->talker_guid);
 	stream->stream_in_sta.common.lstream_attr.attr.listener.stream_id = stream_id;
 	stream->stream_in_sta.common.tastream_attr.attr.talker.stream_id = stream_id;
 	stream->stream_in_sta.common.tfstream_attr.attr.talker_fail.talker.stream_id = stream_id;
@@ -2443,6 +2456,38 @@ void acmp_periodic_milan_v12(struct acmp *acmp, uint64_t now)
 			stream_deactivate(stream, now);
 			stream_out->last_probe_rx_time = 0;
 		}
+	}
+
+	/* Milan Section 4.3.3.1 / 5.5.3: a settled Listener with no reservation yet
+	 * (SETTLED_NO_RSV) re-evaluates Listener Ready against the Talker Advertise
+	 * registrar each tick. After a bridge convergence delay the TA arrives with no
+	 * fresh ACMP event, so this re-declares Ready and advances to SETTLED_RSV_OK the
+	 * instant the TA is IN — the stall self-heals, no controller re-bind needed. */
+	for (uint16_t desc_index = 0; desc_index < UINT16_MAX; desc_index++) {
+		struct descriptor *desc;
+		struct aecp_aem_stream_input_state_milan_v12 *si_m;
+		struct stream_common *common;
+		bool ta_in;
+
+		desc = server_find_descriptor(acmp->server, AVB_AEM_DESC_STREAM_INPUT,
+				desc_index);
+		if (desc == NULL)
+			break;
+
+		si_m = desc->ptr;
+		if (si_m->acmp_sta.fsm_acmp_state != FSM_ACMP_STATE_MILAN_V12_SETTLED_NO_RSV)
+			continue;
+
+		common = &si_m->stream_in_sta.common;
+		ta_in = common->tastream_attr.mrp != NULL &&
+			avb_mrp_attribute_get_registrar_state(common->tastream_attr.mrp) == AVB_MRP_IN;
+		common->lstream_attr.param = ta_in
+			? AVB_MSRP_LISTENER_PARAM_READY
+			: AVB_MSRP_LISTENER_PARAM_ASKING_FAILED;
+		if (common->lstream_attr.mrp != NULL)
+			avb_mrp_attribute_join(common->lstream_attr.mrp, now, true);
+		if (ta_in)
+			si_m->acmp_sta.fsm_acmp_state = FSM_ACMP_STATE_MILAN_V12_SETTLED_RSV_OK;
 	}
 }
 

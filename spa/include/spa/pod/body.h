@@ -143,8 +143,8 @@ SPA_API_POD_BODY int spa_pod_is_bool(const struct spa_pod *pod)
 	return SPA_POD_CHECK(pod, SPA_TYPE_Bool, sizeof(int32_t));
 }
 
-#define SPA_POD_BODY_LOAD_ONCE(a, b) (*(a) = SPA_LOAD_ONCE((__typeof__(a))(b)))
-#define SPA_POD_BODY_LOAD_FIELD_ONCE(a, b, field) ((a)->field = SPA_LOAD_ONCE(&((__typeof__(a))(b))->field))
+#define SPA_POD_BODY_LOAD_ONCE(a, b) (*(a) = SPA_LOAD_ONCE(*(__typeof__(a))(b)))
+#define SPA_POD_BODY_LOAD_FIELD_ONCE(a, b, field) ((a)->field = SPA_LOAD_ONCE(((__typeof__(a))(b))->field))
 
 SPA_API_POD_BODY int spa_pod_body_get_bool(const struct spa_pod *pod, const void *body, bool *value)
 {
@@ -250,6 +250,12 @@ SPA_API_POD_BODY int spa_pod_body_copy_string(const struct spa_pod *pod, const v
 	const char *s;
 	if (spa_pod_body_get_string(pod, body, &s) < 0 || maxlen < 1)
 		return -EINVAL;
+	/* pod->size includes the null terminator; a string that does not fit
+	 * is reported as -ENOSPC instead of being silently truncated. */
+	if (pod->size > maxlen) {
+		dest[0] = '\0';
+		return -ENOSPC;
+	}
 	SPA_BARRIER;
 	strncpy(dest, s, maxlen-1);
 	SPA_BARRIER;
@@ -382,6 +388,18 @@ SPA_API_POD_BODY const void *spa_pod_body_get_array_values(const struct spa_pod 
 	if (spa_pod_body_get_array(pod, body, &arr, &body) < 0)
 		return NULL;
 	return spa_pod_array_body_get_values(&arr, body, n_values, val_size, val_type);
+}
+
+SPA_API_POD_BODY uint32_t spa_pod_body_copy_array(const struct spa_pod *pod,
+		const void *body, uint32_t type, uint32_t size, void *values, uint32_t max_values)
+{
+	uint32_t n_values, val_size, val_type;
+	const void *v = spa_pod_body_get_array_values(pod, body, &n_values, &val_size, &val_type);
+	if (v == NULL || max_values == 0 || val_type != type || val_size != size)
+		return 0;
+	n_values = SPA_MIN(n_values, max_values);
+	memcpy(values, v, val_size * n_values);
+	return n_values;
 }
 
 SPA_API_POD_BODY int spa_pod_is_choice(const struct spa_pod *pod)

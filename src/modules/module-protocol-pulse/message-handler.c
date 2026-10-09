@@ -12,7 +12,7 @@
 #include <spa/pod/builder.h>
 #include <spa/pod/pod.h>
 #include <spa/utils/defs.h>
-#include <spa/utils/json.h>
+#include <spa/utils/json-builder.h>
 #include <spa/utils/string.h>
 
 #include <pipewire/pipewire.h>
@@ -67,17 +67,18 @@ static int bluez_card_object_message_handler(struct client *client, struct pw_ma
 				SPA_PARAM_Props, 0, param);
 	} else if (spa_streq(message, "list-codecs")) {
 		uint32_t i;
-		bool first = true;
+		struct spa_json_builder b;
 
-		fputc('[', response);
+		spa_json_builder_file(&b, response, 0);
+		spa_json_builder_array_push(&b, "[");
 		for (i = 0; i < n_codecs; ++i) {
 			const char *desc = codecs[i].description;
-			fprintf(response, "%s{\"name\":\"%d\",\"description\":\"%s\"}",
-					first ? "" : ",",
-					(int)codecs[i].id, desc ? desc : "Unknown");
-			first = false;
+			spa_json_builder_array_push(&b, "{");
+			spa_json_builder_object_stringf(&b, "name", "%d", (int)codecs[i].id);
+			spa_json_builder_object_string(&b, "description", desc ? desc : "Unknown");
+			spa_json_builder_pop(&b, "}");
 		}
-		fputc(']', response);
+		spa_json_builder_pop(&b, "]");
 	} else if (spa_streq(message, "get-codec")) {
 		if (active == SPA_ID_INVALID)
 			fputs("null", response);
@@ -175,6 +176,50 @@ static int core_object_bluetooth_headset_autoswitch(struct client *client, const
 	}
 }
 
+static int core_object_bluetooth_profile_preference(struct client *client, const char *params, FILE *response)
+{
+	if (!client->have_bluetooth_profile_preference) {
+		/* Not supported, return a null value to indicate that */
+		fprintf(response, "null");
+		return 0;
+	}
+
+	if (!params || params[0] == '\0') {
+		/* No parameter => query the current value */
+		if (client->bluetooth_profile_preference)
+			fprintf(response, "%s", client->bluetooth_profile_preference);
+		else
+			fprintf(response, "null");
+		return 0;
+	} else {
+		/* The caller is trying to set a value or clear with a null */
+		int ret;
+
+		if (spa_streq(params, "latency") || spa_streq(params, "quality")) {
+			ret = pw_manager_set_metadata(client->manager, client->metadata_sm_settings, PW_ID_CORE,
+					METADATA_BLUETOOTH_PROFILE_PREFERENCE, "Spa:String:JSON", "%s", params);
+			free(client->bluetooth_profile_preference);
+			client->bluetooth_profile_preference = strdup(params);
+		} else if (spa_streq(params, "null")) {
+			ret = pw_manager_set_metadata(client->manager, client->metadata_sm_settings, PW_ID_CORE,
+					METADATA_BLUETOOTH_PROFILE_PREFERENCE, NULL, NULL);
+			free(client->bluetooth_profile_preference);
+			client->bluetooth_profile_preference = client->default_bluetooth_profile_preference ?
+				strdup(client->default_bluetooth_profile_preference) : NULL;
+		} else {
+			fprintf(response, "Value must be latency or quality");
+			return -EINVAL;
+		}
+
+		if (ret < 0)
+			fprintf(response, "Could not set metadata: %s", spa_strerror(ret));
+		else
+			fprintf(response, "%s", params);
+
+		return ret;
+	}
+}
+
 static int core_object_message_handler(struct client *client, struct pw_manager_object *o, const char *message, const char *params, FILE *response)
 {
 	pw_log_debug(": core %p object message:'%s' params:'%s'", o, message, params);
@@ -191,21 +236,23 @@ static int core_object_message_handler(struct client *client, struct pw_manager_
 				"  pipewire-pulse:list-modules    		list all module names\n"
 				"  pipewire-pulse:describe-module 		describe module info for <params>\n"
 				"  pipewire-pulse:force-mono-output		force mono mixdown on all hardware outputs\n"
-				"  pipewire-pulse:bluetooth-headset-autoswitch	use bluetooth headset mic if available"
+				"  pipewire-pulse:bluetooth-headset-autoswitch\tuse bluetooth headset mic if available\n"
+				"  pipewire-pulse:bluetooth-profile-preference\tbluetooth profile preference (latency or quality)"
 				);
 	} else if (spa_streq(message, "list-handlers")) {
-		bool first = true;
+		struct spa_json_builder b;
 
-		fputc('[', response);
+		spa_json_builder_file(&b, response, 0);
+		spa_json_builder_array_push(&b, "[");
 		spa_list_for_each(o, &client->manager->object_list, link) {
 			if (o->message_object_path) {
-				fprintf(response, "%s{\"name\":\"%s\",\"description\":\"%s\"}",
-						first ? "" : ",",
-						o->message_object_path, o->type);
-				first = false;
+				spa_json_builder_array_push(&b, "{");
+				spa_json_builder_object_string(&b, "name", o->message_object_path);
+				spa_json_builder_object_string(&b, "description", o->type);
+				spa_json_builder_pop(&b, "}");
 			}
 		}
-		fputc(']', response);
+		spa_json_builder_pop(&b, "]");
 #ifdef HAVE_MALLOC_INFO
 	} else if (spa_streq(message, "pipewire-pulse:malloc-info")) {
 		malloc_info(0, response);
@@ -219,15 +266,17 @@ static int core_object_message_handler(struct client *client, struct pw_manager_
 		int res = pw_log_set_level_string(params);
 		fprintf(response, "%d", res);
 	} else if (spa_streq(message, "pipewire-pulse:list-modules")) {
-		bool first = true;
 		const struct module_info *i = NULL;
-		fputc('[', response);
+		struct spa_json_builder b;
+
+		spa_json_builder_file(&b, response, 0);
+		spa_json_builder_array_push(&b, "[");
 		while ((i = module_info_next(client->impl, i)) != NULL) {
-			fprintf(response, "%s{\"name\":\"%s\"}",
-						first ? "" : ",\n", i->name);
-				first = false;
+			spa_json_builder_array_push(&b, "{");
+			spa_json_builder_object_string(&b, "name", i->name);
+			spa_json_builder_pop(&b, "}");
 		}
-		fputc(']', response);
+		spa_json_builder_pop(&b, "]");
 	} else if (spa_streq(message, "pipewire-pulse:describe-module")) {
 		const struct module_info *i = module_info_find(client->impl, params);
 
@@ -243,8 +292,11 @@ static int core_object_message_handler(struct client *client, struct pw_manager_
 					fprintf(response, "Description: %s\n", s);
 				if ((s = spa_dict_lookup(i->properties, PW_KEY_MODULE_AUTHOR)))
 					fprintf(response, "Author: %s\n", s);
-				if ((s = spa_dict_lookup(i->properties, PW_KEY_MODULE_USAGE)))
-					fprintf(response, "Usage: %s\n", s);
+				if (i->valid_args) {
+					char *usage = module_info_usage(i);
+					fprintf(response, "Usage: %s\n", usage);
+					free(usage);
+				}
 				fprintf(response, "Load Once: %s\n", i->load_once ? "Yes": "No");
 				if ((s = spa_dict_lookup(i->properties, PW_KEY_MODULE_DEPRECATED)))
 					fprintf(response, "Warning, deprecated: %s\n", s);
@@ -256,6 +308,8 @@ static int core_object_message_handler(struct client *client, struct pw_manager_
 		return core_object_force_mono_output(client, params, response);
 	} else if (spa_streq(message, "pipewire-pulse:bluetooth-headset-autoswitch")) {
 		return core_object_bluetooth_headset_autoswitch(client, params, response);
+	} else if (spa_streq(message, "pipewire-pulse:bluetooth-profile-preference")) {
+		return core_object_bluetooth_profile_preference(client, params, response);
 	} else {
 		return -ENOSYS;
 	}

@@ -354,6 +354,10 @@ static void midi_to_ffado(struct port *p, float *src, uint32_t n_samples)
 		if (index < c.offset)
 			index = SPA_ROUND_UP_N(c.offset, 8);
 
+		if (size > 1 && data[0] == 0xf7) {
+			data++;
+			size--;
+		}
 		for (j = 0; j < size; j++) {
 			if (index >= n_samples) {
 				/* keep events that don't fit for the next cycle */
@@ -846,6 +850,9 @@ static void parse_props(struct stream *s, const struct spa_pod *param)
 	uint8_t buffer[1024];
 	struct spa_pod_builder b;
 	const struct spa_pod *params[1];
+
+	if (!spa_pod_is_object_type(param, SPA_TYPE_OBJECT_Props))
+		return;
 
 	SPA_POD_OBJECT_FOREACH(obj, prop) {
 		switch (prop->key) {
@@ -1410,7 +1417,10 @@ static void parse_devices(struct impl *impl, const char *val, size_t len)
 	impl->n_devices = 0;
 	while (spa_json_get_string(&it[0], v, sizeof(v)) > 0 &&
 	    impl->n_devices < FFADO_MAX_SPECSTRINGS) {
-		impl->devices[impl->n_devices++] = strdup(v);
+		char *s = strdup(v);
+		if (s == NULL)
+			return;
+		impl->devices[impl->n_devices++] = s;
 	}
 }
 

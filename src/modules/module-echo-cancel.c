@@ -704,6 +704,7 @@ static int set_params(struct impl* impl, const struct spa_pod *params)
 		const char *name;
 		struct spa_pod *pod;
 		char value[512];
+		int res;
 
 		if (spa_pod_parser_get_string(&prs, &name) < 0)
 			break;
@@ -712,7 +713,11 @@ static int set_params(struct impl* impl, const struct spa_pod *params)
 			break;
 
 		if (spa_pod_is_string(pod)) {
-			spa_pod_copy_string(pod, sizeof(value), value);
+			if ((res = spa_pod_copy_string(pod, sizeof(value), value)) < 0) {
+				pw_log_error("can't copy value for '%s' (max %zu bytes): %s",
+						name, sizeof(value)-1, spa_strerror(res));
+				continue;
+			}
 		} else if (spa_pod_is_none(pod)) {
 			spa_zero(value);
 		} else
@@ -738,6 +743,9 @@ static void props_changed(struct impl* impl, const struct spa_pod *param)
 	struct spa_pod_object* obj = (struct spa_pod_object*)param;
 
 	if (param == NULL)
+		return;
+
+	if (!spa_pod_is_object_type(param, SPA_TYPE_OBJECT_Props))
 		return;
 
 	SPA_POD_OBJECT_FOREACH(obj, prop) {
@@ -1509,7 +1517,8 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	impl->loader = spa_support_find(support, n_support, SPA_TYPE_INTERFACE_PluginLoader);
 	if (impl->loader == NULL) {
 		pw_log_error("a plugin loader is needed");
-		return -EINVAL;
+		res = -EINVAL;
+		goto error;
 	}
 
 	struct spa_dict_item dict_items[] = {
@@ -1520,15 +1529,16 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	handle = spa_plugin_loader_load(impl->loader, SPA_NAME_AEC, &dict);
 	if (handle == NULL) {
 		pw_log_error("aec plugin %s not available library.name %s", SPA_NAME_AEC, path);
-		return -ENOENT;
+		res = -ENOENT;
+		goto error;
 	}
+	impl->spa_handle = handle;
 
 	if ((res = spa_handle_get_interface(handle, SPA_TYPE_INTERFACE_AUDIO_AEC, &iface)) < 0) {
 		pw_log_error("can't get %s interface %d", SPA_TYPE_INTERFACE_AUDIO_AEC, res);
-		return res;
+		goto error;
 	}
 	impl->aec = iface;
-	impl->spa_handle = handle;
 
 	if (impl->aec->iface.version > SPA_VERSION_AUDIO_AEC) {
 		pw_log_error("codec plugin %s has incompatible ABI version (%d > %d)",
@@ -1544,7 +1554,8 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 		aec_props = pw_properties_new_string(str);
 	else
 		aec_props = pw_properties_new(NULL, NULL);
-
+	if (aec_props == NULL)
+		goto error_errno;
 
 	if (spa_interface_callback_check(&impl->aec->iface, struct spa_audio_aec_methods, init2, 3)) {
 		impl->rec_info = impl->capture_info;
@@ -1587,19 +1598,27 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 		goto error;
 	}
 
+	unsigned int num = 0, denom = 1;
 	if (impl->aec->latency) {
-		unsigned int num, denom, req_num, req_denom;
+
+		if (sscanf(impl->aec->latency, "%u/%u", &num, &denom) != 2) {
+			pw_log_warn("Invalid AEC latency '%s', assuming 0", impl->aec->latency);
+			num = 0;
+			denom = 1;
+		}
+	}
+	if (num != 0 && denom != 0) {
+		unsigned int req_num = 0, req_denom = 1;
 		unsigned int factor = 0;
 		unsigned int new_num = 0;
 
-		spa_assert_se(sscanf(impl->aec->latency, "%u/%u", &num, &denom) == 2);
-
 		if ((str = pw_properties_get(props, PW_KEY_NODE_LATENCY)) != NULL) {
-			sscanf(str, "%u/%u", &req_num, &req_denom);
-			factor = (req_num * denom) / (req_denom * num);
-			new_num = req_num / factor * factor;
+			if (sscanf(str, "%u/%u", &req_num, &req_denom) == 2 &&
+			    req_denom != 0) {
+				factor = (req_num * denom) / (req_denom * num);
+				new_num = req_num / factor * factor;
+			}
 		}
-
 		if (factor == 0 || new_num == 0) {
 			pw_log_info("Setting node latency to %s", impl->aec->latency);
 			pw_properties_set(props, PW_KEY_NODE_LATENCY, impl->aec->latency);
@@ -1633,6 +1652,7 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	}
 
 	pw_properties_free(props);
+	props = NULL;
 
 	pw_proxy_add_listener((struct pw_proxy*)impl->core,
 			&impl->core_proxy_listener,
@@ -1641,7 +1661,8 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 			&impl->core_listener,
 			&core_events, impl);
 
-	setup_streams(impl);
+	if ((res = setup_streams(impl)) < 0)
+		goto error;
 
 	pw_impl_module_add_listener(module, &impl->module_listener, &module_events, impl);
 
@@ -1649,6 +1670,8 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 
 	return 0;
 
+error_errno:
+	res = -errno;
 error:
 	pw_properties_free(props);
 	impl_destroy(impl);

@@ -539,6 +539,24 @@ gst_pipewire_src_init (GstPipeWireSrc * src)
   src->transform_value = UINT32_MAX;
 }
 
+/* Drop a pool buffer whose last reference we hold, once the loop lock is not
+ * held any more. buffer_recycle() takes GST_OBJECT_LOCK (pool) first and the
+ * loop lock second; gst_pipewire_src_create() holds the loop lock across
+ * dequeue_buffer(). Releasing the last reference from in there takes those two
+ * in the opposite order from every other caller, which deadlocks against a
+ * consumer recycling a buffer from another thread. */
+static void
+release_pool_buffer (GstPipeWireSrc *pwsrc)
+{
+  GstBuffer *buf = pwsrc->buf_to_release;
+
+  if (buf == NULL)
+    return;
+
+  pwsrc->buf_to_release = NULL;
+  gst_buffer_unref (buf);
+}
+
 static gboolean
 buffer_recycle (GstMiniObject *obj)
 {
@@ -563,33 +581,28 @@ buffer_recycle (GstMiniObject *obj)
     return TRUE;
   }
 
-  GST_OBJECT_LOCK (data->pool);
-  if (!obj->dispose) {
-    GST_OBJECT_UNLOCK (data->pool);
-    return TRUE;
-  }
-
-  GST_BUFFER_FLAGS (obj) = data->flags;
-
   pw_thread_loop_lock (src->stream->core->loop);
   if (!obj->dispose) {
     pw_thread_loop_unlock (src->stream->core->loop);
-    GST_OBJECT_UNLOCK (data->pool);
     return TRUE;
   }
+
+  GST_OBJECT_LOCK (data->pool);
+  GST_BUFFER_FLAGS (obj) = data->flags;
 
   gst_mini_object_ref (obj);
 
   data->queued = TRUE;
+  if (src->n_outstanding > 0)
+    src->n_outstanding--;
 
   if ((res = pw_stream_queue_buffer (src->stream->pwstream, data->b)) < 0)
     GST_WARNING_OBJECT (src, "can't queue recycled buffer %p, %s", obj, spa_strerror(res));
   else
     GST_LOG_OBJECT (src, "recycle buffer %p", obj);
 
-  pw_thread_loop_unlock (src->stream->core->loop);
-
   GST_OBJECT_UNLOCK (data->pool);
+  pw_thread_loop_unlock (src->stream->core->loop);
 
   return FALSE;
 }
@@ -608,6 +621,10 @@ on_add_buffer (void *_data, struct pw_buffer *b)
   GST_MINI_OBJECT_CAST (data->buf)->dispose = buffer_recycle;
 
   pwsrc->n_buffers++;
+  if (pwsrc->n_buffers == 1) {
+    pwsrc->n_outstanding = 0;
+    pwsrc->warned_starving = FALSE;
+  }
 }
 
 static void
@@ -708,6 +725,23 @@ static const char *spa_transform_value_to_gst_image_orientation(uint32_t transfo
   return transform_map[transform_value];
 }
 
+/* Memory that can be read with a plain mmap can be copied; a DMA-BUF without
+ * SPA_DATA_FLAG_MAPPABLE cannot, and there is nothing better to do for such a
+ * buffer than to keep sharing it. */
+static gboolean
+buffer_is_copyable (struct pw_buffer *b)
+{
+  uint32_t i;
+
+  for (i = 0; i < b->buffer->n_datas; i++) {
+    struct spa_data *d = &b->buffer->datas[i];
+
+    if (d->type == SPA_DATA_DmaBuf && !(d->flags & SPA_DATA_FLAG_MAPPABLE))
+      return FALSE;
+  }
+  return TRUE;
+}
+
 static GstBuffer *dequeue_buffer(GstPipeWireSrc *pwsrc)
 {
   struct pw_buffer *b;
@@ -718,6 +752,7 @@ static GstBuffer *dequeue_buffer(GstPipeWireSrc *pwsrc)
   enum spa_meta_videotransform_value transform_value;
   struct spa_meta_cursor *cursor;
   struct pw_time time;
+  gboolean use_pool;
   guint i;
 
   b = pw_stream_dequeue_buffer (pwsrc->stream->pwstream);
@@ -736,10 +771,42 @@ static GstBuffer *dequeue_buffer(GstPipeWireSrc *pwsrc)
     return NULL;
   }
 
+  use_pool = pwsrc->use_bufferpool != USE_BUFFERPOOL_NO;
+
+  /* Downstream can hold every buffer of the pool, leaving the producer with
+   * nothing to fill; the stream then stops instead of degrading. Handing over
+   * the last free buffer is what decides that, and it is also the last moment a
+   * buffer can still be made to come back, so copy it instead of sharing it and
+   * the pool buffer is returned straight away.
+   *
+   * This is not free while it applies: downstream receives system memory where
+   * it would otherwise get the DMA-BUF. A pool of one is left out, because
+   * there every buffer is the last one -- which is what use-bufferpool=false
+   * already provides explicitly. */
+  if (use_pool && pwsrc->use_bufferpool == USE_BUFFERPOOL_AUTO &&
+      pwsrc->n_buffers > 1 &&
+      pwsrc->n_outstanding + 1 >= pwsrc->n_buffers &&
+      buffer_is_copyable (b)) {
+    use_pool = FALSE;
+    if (!pwsrc->warned_starving) {
+      pwsrc->warned_starving = TRUE;
+      GST_INFO_OBJECT (pwsrc, "downstream holds %d of %d buffers, copying to "
+          "keep the stream going", pwsrc->n_outstanding, pwsrc->n_buffers);
+    }
+  }
+
   pw_stream_get_time_n(pwsrc->stream->pwstream, &time, sizeof(time));
 
+  gint64 delay_ns = 0;
+  if (time.rate.denom != 0) {
+    guint64 abs_delay = time.delay >= 0 ? (guint64) time.delay : -(guint64) time.delay;
+    delay_ns = gst_util_uint64_scale (abs_delay, GST_SECOND * time.rate.num, time.rate.denom);
+    if (time.delay < 0)
+      delay_ns = -delay_ns;
+  }
+
   if (pwsrc->delay != time.delay && time.rate.denom != 0) {
-    pwsrc->min_latency = time.delay * GST_SECOND * time.rate.num / time.rate.denom;
+    pwsrc->min_latency = delay_ns > 0 ? delay_ns : 0;
     GST_LOG_OBJECT (pwsrc, "latency changed %"PRIi64" -> %"PRIi64" %"PRIu64,
 		    pwsrc->delay, time.delay, pwsrc->min_latency);
     pwsrc->delay = time.delay;
@@ -752,6 +819,7 @@ static GstBuffer *dequeue_buffer(GstPipeWireSrc *pwsrc)
   buf = gst_buffer_new ();
 
   data->queued = FALSE;
+  pwsrc->n_outstanding++;
   GST_BUFFER_PTS (buf) = GST_CLOCK_TIME_NONE;
   GST_BUFFER_DTS (buf) = GST_CLOCK_TIME_NONE;
 
@@ -766,8 +834,10 @@ static GstBuffer *dequeue_buffer(GstPipeWireSrc *pwsrc)
     }
     GST_BUFFER_OFFSET (buf) = h->seq;
   } else {
-    GST_BUFFER_PTS (buf) = b->time - pwsrc->delay;
-    GST_BUFFER_DTS (buf) = b->time - pwsrc->delay;
+    /* We cannot reuse pwsrc->min_latency here because time.delay can be negative.
+     * PTS/DTS needs to be shifted forward when delay is negative. */
+    GST_BUFFER_PTS (buf) = b->time - delay_ns;
+    GST_BUFFER_DTS (buf) = b->time - delay_ns;
   }
 
   if (pwsrc->media_type == SPA_MEDIA_TYPE_video) {
@@ -781,7 +851,7 @@ static GstBuffer *dequeue_buffer(GstPipeWireSrc *pwsrc)
   }
 
   crop = data->crop;
-  if (crop) {
+  if (crop && spa_meta_region_is_valid(crop)) {
     GstVideoCropMeta *meta = gst_buffer_add_video_crop_meta(buf);
     if (meta) {
       meta->x = crop->region.position.x;
@@ -868,7 +938,7 @@ static GstBuffer *dequeue_buffer(GstPipeWireSrc *pwsrc)
     GstMemory *pmem = gst_buffer_peek_memory (data->buf, i);
     if (pmem) {
       GstMemory *mem;
-      if (pwsrc->use_bufferpool != USE_BUFFERPOOL_NO)
+      if (use_pool)
         mem = gst_memory_share (pmem, d->chunk->offset, d->chunk->size);
       else
         mem = gst_memory_copy (pmem, d->chunk->offset, d->chunk->size);
@@ -879,9 +949,16 @@ static GstBuffer *dequeue_buffer(GstPipeWireSrc *pwsrc)
       GST_BUFFER_FLAG_SET (buf, GST_BUFFER_FLAG_CORRUPTED);
     }
   }
-  if (pwsrc->use_bufferpool != USE_BUFFERPOOL_NO)
+  if (use_pool) {
+    /* the meta keeps a reference, so this is not the last one and the recycle
+     * happens later, from whichever thread drops it */
     gst_buffer_add_parent_buffer_meta (buf, data->buf);
-  gst_buffer_unref (data->buf);
+    gst_buffer_unref (data->buf);
+  } else {
+    /* without the meta this *is* the last reference: leave it to the caller to
+     * drop once the loop lock is released, see release_pool_buffer() */
+    pwsrc->buf_to_release = data->buf;
+  }
 
   if (gst_buffer_get_size(buf) == 0)
   {
@@ -1240,6 +1317,14 @@ gst_pipewire_src_negotiate (GstBaseSrc * basesrc)
 
   result = gst_pipewire_src_stream_start (pwsrc);
 
+  /* Return true when flushing to avoid caps negotiation failure */
+  pw_thread_loop_lock (pwsrc->stream->core->loop);
+  if (pwsrc->flushing) {
+    GST_DEBUG_OBJECT (pwsrc, "is flushing");
+    result = TRUE;
+  }
+  pw_thread_loop_unlock (pwsrc->stream->core->loop);
+
   return result;
 
 no_nego_needed:
@@ -1566,8 +1651,10 @@ gst_pipewire_src_create (GstPushSrc * psrc, GstBuffer ** buffer)
   pwsrc = GST_PIPEWIRE_SRC (psrc);
 
   pw_thread_loop_lock (pwsrc->stream->core->loop);
-  if (!pwsrc->negotiated)
-    goto not_negotiated;
+  if (!pwsrc->negotiated) {
+    if (wait_negotiated(pwsrc) == PW_STREAM_STATE_ERROR)
+      goto not_negotiated;
+  }
 
   while (TRUE) {
     enum pw_stream_state state;
@@ -1620,7 +1707,8 @@ gst_pipewire_src_create (GstPushSrc * psrc, GstBuffer ** buffer)
 
           old = pwsrc->last_buffer;
           pwsrc->last_buffer = gst_buffer_copy (buf);
-          gst_buffer_unref (old);
+          if (old != NULL)
+            gst_buffer_unref (old);
           gst_buffer_add_parent_buffer_meta (pwsrc->last_buffer, buf);
 
           clock = gst_element_get_clock (GST_ELEMENT_CAST (pwsrc));
@@ -1633,6 +1721,15 @@ gst_pipewire_src_create (GstPushSrc * psrc, GstBuffer ** buffer)
         }
         break;
       }
+    }
+    if (pwsrc->buf_to_release != NULL) {
+      /* dequeue_buffer() took a buffer off the pool and then dropped it. Hand
+       * it back to the producer before waiting for the next one, or the next
+       * dequeue overwrites the pointer and the buffer is never recycled. */
+      pw_thread_loop_unlock (pwsrc->stream->core->loop);
+      release_pool_buffer (pwsrc);
+      pw_thread_loop_lock (pwsrc->stream->core->loop);
+      continue;
     }
     timeout = FALSE;
     if (pwsrc->keepalive_time > 0) {
@@ -1650,6 +1747,7 @@ gst_pipewire_src_create (GstPushSrc * psrc, GstBuffer ** buffer)
     }
   }
   pw_thread_loop_unlock (pwsrc->stream->core->loop);
+  release_pool_buffer (pwsrc);
 
   *buffer = buf;
 
@@ -1689,21 +1787,25 @@ gst_pipewire_src_create (GstPushSrc * psrc, GstBuffer ** buffer)
 not_negotiated:
   {
     pw_thread_loop_unlock (pwsrc->stream->core->loop);
+    release_pool_buffer (pwsrc);
     return GST_FLOW_NOT_NEGOTIATED;
   }
 streaming_eos:
   {
     pw_thread_loop_unlock (pwsrc->stream->core->loop);
+    release_pool_buffer (pwsrc);
     return GST_FLOW_EOS;
   }
 streaming_error:
   {
     pw_thread_loop_unlock (pwsrc->stream->core->loop);
+    release_pool_buffer (pwsrc);
     return GST_FLOW_ERROR;
   }
 streaming_stopped:
   {
     pw_thread_loop_unlock (pwsrc->stream->core->loop);
+    release_pool_buffer (pwsrc);
     return GST_FLOW_FLUSHING;
   }
 }
@@ -1786,14 +1888,24 @@ gst_pipewire_src_change_state (GstElement * element, GstStateChange transition)
        * be moved from idle to suspended, which would mean format cleared via
        * handle_format_change. Wait for new format to avoid basesrc calling
        * create() and get not-negotiated error as response. */
-      if (wait_negotiated(this) == PW_STREAM_STATE_ERROR)
+      if (wait_negotiated(this) == PW_STREAM_STATE_ERROR) {
+        pw_thread_loop_unlock (this->stream->core->loop);
         goto open_failed;
+      }
+
       pw_thread_loop_unlock (this->stream->core->loop);
       break;
     case GST_STATE_CHANGE_PLAYING_TO_PAUSED:
       /* stop recording ASAP by corking */
       GST_DEBUG_OBJECT (this, "in-activating stream");
       pw_thread_loop_lock (this->stream->core->loop);
+      /* Wait if caps negotiation is currently in progress
+       * to prevent caps negotiation failure which can cause
+       * error in basesrc.
+       */
+      if (wait_negotiated(this) == PW_STREAM_STATE_ERROR) {
+        GST_DEBUG_OBJECT (this, "stream state error");
+      }
       pw_stream_set_active (this->stream->pwstream, false);
       pw_thread_loop_unlock (this->stream->core->loop);
       break;

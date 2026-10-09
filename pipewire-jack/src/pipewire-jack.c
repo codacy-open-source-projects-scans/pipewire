@@ -248,6 +248,7 @@ struct mix {
 	struct port *peer_port;
 
 	struct spa_io_buffers *io[2];
+	uint32_t io_busy;
 
 	struct spa_list queue;
 	struct buffer buffers[MAX_BUFFERS];
@@ -652,6 +653,7 @@ static void init_mix(struct mix *mix, uint32_t mix_id, struct port *port, uint32
 	mix->io[0] = mix->io[1] = NULL;
 	mix->n_buffers = 0;
 	spa_list_init(&mix->queue);
+	SPA_ATOMIC_STORE(mix->io_busy, 0);
 	if (mix_id == SPA_ID_INVALID) {
 		port->global_mix = mix;
 		if (port->n_mix > 0)
@@ -708,9 +710,11 @@ static struct mix *create_mix(struct client *c, struct port *port,
 	spa_list_remove(&mix->link);
 	spa_list_append(&c->mix, &mix->link);
 
-	spa_list_append(&port->mix, &mix->port_link);
-
 	init_mix(mix, mix_id, port, peer_id);
+
+	pw_loop_lock(c->loop->loop);
+	spa_list_append(&port->mix, &mix->port_link);
+	pw_loop_unlock(c->loop->loop);
 
 	return mix;
 }
@@ -733,6 +737,7 @@ static int clear_buffers(struct client *c, struct mix *mix)
 	}
 	mix->n_buffers = 0;
 	spa_list_init(&mix->queue);
+	SPA_ATOMIC_STORE(mix->io_busy, 0);
 	return 0;
 }
 
@@ -793,7 +798,9 @@ static struct port * alloc_port(struct client *c, enum spa_direction direction)
 
 	p->direction = direction;
 	p->emptyptr = SPA_PTR_ALIGN(p->empty, c->max_align, float);
+	pw_loop_lock(c->loop->loop);
 	p->port_id = pw_map_insert_new(&c->ports[direction], p);
+	pw_loop_unlock(c->loop->loop);
 	c->n_ports++;
 
 	pthread_mutex_lock(&c->context.lock);
@@ -876,6 +883,8 @@ static struct object *find_port_by_name(struct client *c, const char *name)
 static struct object *find_by_id(struct client *c, uint32_t id)
 {
 	struct object *o;
+	if (id == SPA_ID_INVALID)
+		return NULL;
 	spa_list_for_each(o, &c->context.objects, link) {
 		if (o->id == id)
 			return o;
@@ -890,6 +899,14 @@ static struct object *find_by_serial(struct client *c, uint32_t serial)
 		if (o->serial == serial)
 			return o;
 	}
+	return NULL;
+}
+
+static struct object *find_port_by_serial(struct client *c, uint32_t serial)
+{
+	struct object *o = find_by_serial(c, serial);
+	if (o != NULL && o->type == INTERFACE_Port)
+		return o;
 	return NULL;
 }
 
@@ -914,15 +931,17 @@ static struct object *find_client(struct client *c, uint32_t client_id)
 	return find_type(c, client_id, INTERFACE_Client, false);
 }
 
-static struct object *find_link(struct client *c, uint32_t src, uint32_t dst)
+/* Matches a link by serial instead of object id, since the object id might be
+ * re-used. See #5356. */
+static struct object *find_link(struct client *c, uint32_t src_serial, uint32_t dst_serial)
 {
 	struct object *l;
 
 	spa_list_for_each(l, &c->context.objects, link) {
-		if (l->type != INTERFACE_Link || l->removed)
+		if (l->type != INTERFACE_Link || l->removing || l->removed)
 			continue;
-		if (l->port_link.src == src &&
-		    l->port_link.dst == dst) {
+		if (l->port_link.src_serial == src_serial &&
+		    l->port_link.dst_serial == dst_serial) {
 			return l;
 		}
 	}
@@ -1569,6 +1588,8 @@ static inline int midi_event_append(void *port_buffer, const jack_midi_data_t *d
 	size_t old_size;
 	uint8_t *old, *buf;
 
+	if (mb->event_count == 0)
+		return -ENOBUFS;
 	ev = &events[--mb->event_count];
 	mb->write_pos -= ev->size;
 	old_size = ev->size;
@@ -1645,6 +1666,10 @@ static void convert_to_event(struct mix_info **mix, uint32_t n_mix, void *midi, 
 						break;
 				}
 			} else {
+				if (size > 1 && data[0] == 0xf7) {
+					data++;
+					size--;
+				}
 				res = midi_event_write(midi, control->offset, data, size, fix);
 			}
 			if (res < 0)
@@ -1718,11 +1743,11 @@ static inline void *get_buffer_output(struct port *p, uint32_t frames, uint32_t 
 	if (SPA_UNLIKELY((io = mix->io[cycle]) == NULL || mix->n_buffers == 0))
 		return NULL;
 
-	if (io->status == SPA_STATUS_HAVE_DATA &&
+	if (SPA_ATOMIC_LOAD(io->status) == SPA_STATUS_HAVE_DATA &&
 	    io->buffer_id < mix->n_buffers) {
 		b = &mix->buffers[io->buffer_id];
 		d = &b->datas[0];
-	} else {
+	} else if (SPA_ATOMIC_CAS(mix->io_busy, 0, 1)) {
 		if (mix->n_buffers == 1) {
 			b = &mix->buffers[0];
 		} else {
@@ -1733,6 +1758,7 @@ static inline void *get_buffer_output(struct port *p, uint32_t frames, uint32_t 
 			if (SPA_UNLIKELY(b == NULL)) {
 				pw_log_warn("port %p: out of buffers %d", p, mix->n_buffers);
 				io->buffer_id = SPA_ID_INVALID;
+				SPA_ATOMIC_STORE(mix->io_busy, 0);
 				return NULL;
 			}
 		}
@@ -1742,7 +1768,15 @@ static inline void *get_buffer_output(struct port *p, uint32_t frames, uint32_t 
 		d->chunk->stride = stride;
 
 		io->buffer_id = b->id;
-		io->status = SPA_STATUS_HAVE_DATA;
+		SPA_ATOMIC_STORE(io->status, SPA_STATUS_HAVE_DATA);
+		SPA_ATOMIC_STORE(mix->io_busy, 0);
+	} else {
+		while (SPA_ATOMIC_LOAD(io->status) != SPA_STATUS_HAVE_DATA)
+			;
+		if (SPA_UNLIKELY(io->buffer_id >= mix->n_buffers))
+			return NULL;
+		b = &mix->buffers[io->buffer_id];
+		d = &b->datas[0];
 	}
 	ptr = d->data;
 	if (buf)
@@ -3788,7 +3822,8 @@ static void registry_event_global(void *data, uint32_t id,
 		if ((str = spa_dict_lookup(props, PW_KEY_SEC_PID)) != NULL) {
 			pw_log_debug("%p: pid of \"%s\" is \"%s\"", c, app, str);
 		} else {
-			pw_log_debug("%p: pid of \"%s\" is unknown", c, app);
+			pw_log_warn("%p: pid of \"%s\" is unknown", c, app);
+			str = "0";
 		}
 
 		o = alloc_object(c, INTERFACE_Client);
@@ -4154,6 +4189,13 @@ static void registry_event_global_remove(void *data, uint32_t id)
 	}
 	o->removing = true;
 
+	/* pipewire will reuse the global id for this object from now on, so we
+	 * retire it here instead of when the jack object is freed. Until then the
+	 * object remains reachable by its serial which is what's being used as
+	 * jack_port_id, but unassigning the global id prevents that serial from
+	 * being re-issued to new ports as they appear in the future. See #5356. */
+	o->id = SPA_ID_INVALID;
+
 	switch (o->type) {
 	case INTERFACE_Client:
 		free_object(c, o);
@@ -4166,20 +4208,20 @@ static void registry_event_global_remove(void *data, uint32_t id)
 				c->metadata->default_audio_source[0] = '\0';
 		}
 		if (find_node(c, o->node.name) == NULL) {
-			pw_log_info("%p: client %u removed \"%s\"", c, o->id, o->node.name);
+			pw_log_info("%p: client %u removed \"%s\"", c, id, o->node.name);
 			queue_notify(c, NOTIFY_TYPE_REGISTRATION, o, 0, NULL);
 		} else {
 			free_object(c, o);
 		}
 		break;
 	case INTERFACE_Port:
-		pw_log_info("%p: port %u/%u removed \"%s\"", c, o->id, o->serial, o->port.name);
+		pw_log_info("%p: port %u/%u removed \"%s\"", c, id, o->serial, o->port.name);
 		queue_notify(c, NOTIFY_TYPE_PORTREGISTRATION, o, 0, NULL);
 		break;
 	case INTERFACE_Link:
-		if (find_type(c, o->port_link.src, INTERFACE_Port, true) != NULL &&
-		    find_type(c, o->port_link.dst, INTERFACE_Port, true) != NULL) {
-			pw_log_info("%p: link %u %u/%u -> %u/%u removed", c, o->id,
+		if (find_port_by_serial(c, o->port_link.src_serial) != NULL &&
+		    find_port_by_serial(c, o->port_link.dst_serial) != NULL) {
+			pw_log_info("%p: link %u %u/%u -> %u/%u removed", c, id,
 					o->port_link.src, o->port_link.src_serial,
 					o->port_link.dst, o->port_link.dst_serial);
 			queue_notify(c, NOTIFY_TYPE_CONNECT, o, 0, NULL);
@@ -4377,13 +4419,17 @@ jack_client_t * jack_client_open (const char *client_name,
 	if (client->core == NULL)
 		goto server_failed;
 
-	client->pool = pw_core_get_mempool(client->core);
-
 	pw_core_add_listener(client->core,
 			&client->core_listener,
 			&core_events, client);
+
+	client->pool = pw_core_get_mempool(client->core);
+
 	client->registry = pw_core_get_registry(client->core,
 			PW_VERSION_REGISTRY, 0);
+	if (client->registry == NULL)
+		goto init_failed;
+
 	pw_registry_add_listener(client->registry,
 			&client->registry_listener,
 			&registry_events, client);
@@ -4612,6 +4658,16 @@ int jack_client_close (jack_client_t *client)
 		pw_thread_loop_stop(c->context.notify);
 	}
 
+	pw_array_for_each(item, &c->ports[SPA_DIRECTION_OUTPUT].items) {
+                if (pw_map_item_is_free(item))
+			continue;
+		free_port(c, item->data, false);
+	}
+	pw_array_for_each(item, &c->ports[SPA_DIRECTION_INPUT].items) {
+                if (pw_map_item_is_free(item))
+			continue;
+		free_port(c, item->data, false);
+	}
 	if (c->registry) {
 		spa_hook_remove(&c->registry_listener);
 		pw_proxy_destroy((struct pw_proxy*)c->registry);
@@ -4644,16 +4700,6 @@ int jack_client_close (jack_client_t *client)
 
 	pw_log_debug("%p: free", client);
 
-	pw_array_for_each(item, &c->ports[SPA_DIRECTION_OUTPUT].items) {
-                if (pw_map_item_is_free(item))
-			continue;
-		free_port(c, item->data, false);
-	}
-	pw_array_for_each(item, &c->ports[SPA_DIRECTION_INPUT].items) {
-                if (pw_map_item_is_free(item))
-			continue;
-		free_port(c, item->data, false);
-	}
 	pthread_mutex_lock(&globals.lock);
 	spa_list_consume(o, &c->context.objects, link) {
 		bool to_free = o->to_free;
@@ -4933,7 +4979,7 @@ int jack_deactivate (jack_client_t *client)
 	pw_client_node_set_active(c->node, false);
 
 	spa_list_for_each(o, &c->context.objects, link) {
-		if (o->type != INTERFACE_Link || o->removed)
+		if (o->type != INTERFACE_Link || o->removing || o->removed)
 			continue;
 		if (o->port_link.src_ours || o->port_link.dst_ours)
 			pw_registry_destroy(c->registry, o->id);
@@ -5984,7 +6030,8 @@ const char * jack_port_short_name (const jack_port_t *port)
 	return_val_if_fail(o != NULL, NULL);
 	if (o->type != INTERFACE_Port)
 		return NULL;
-	return strchr(port_name(o), ':') + 1;
+	const char *p = strchr(port_name(o), ':');
+	return p ? p + 1 : port_name(o);
 }
 
 SPA_EXPORT
@@ -6095,7 +6142,7 @@ int jack_port_connected_to (const jack_port_t *port,
 		p = o;
 		o = l;
 	}
-	if ((l = find_link(c, o->id, p->id)) != NULL)
+	if ((l = find_link(c, o->serial, p->serial)) != NULL)
 		res = 1;
 
      exit:
@@ -6139,9 +6186,9 @@ const char ** jack_port_get_all_connections (const jack_client_t *client,
 		if (l->type != INTERFACE_Link || l->removed)
 			continue;
 		if (l->port_link.src_serial == o->serial)
-			p = find_type(c, l->port_link.dst, INTERFACE_Port, true);
+			p = find_port_by_serial(c, l->port_link.dst_serial);
 		else if (l->port_link.dst_serial == o->serial)
-			p = find_type(c, l->port_link.src, INTERFACE_Port, true);
+			p = find_port_by_serial(c, l->port_link.src_serial);
 		else
 			continue;
 
@@ -6580,8 +6627,6 @@ int jack_disconnect (jack_client_t *client,
 	src = find_port_by_name(c, source_port);
 	dst = find_port_by_name(c, destination_port);
 
-	pw_log_debug("%p: %d %d", client, src->id, dst->id);
-
 	if (src == NULL || dst == NULL ||
 	    !(src->port.flags & JackPortIsOutput) ||
 	    !(dst->port.flags & JackPortIsInput)) {
@@ -6592,7 +6637,7 @@ int jack_disconnect (jack_client_t *client,
 	if ((res = check_connect(c, src, dst)) != 1)
 		goto exit;
 
-	if ((l = find_link(c, src->id, dst->id)) == NULL) {
+	if ((l = find_link(c, src->serial, dst->serial)) == NULL) {
 		res = -ENOENT;
 		goto exit;
 	}

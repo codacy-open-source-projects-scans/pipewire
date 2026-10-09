@@ -3374,6 +3374,45 @@ void pa_alsa_path_set_set_callback(pa_alsa_path_set *ps, snd_mixer_t *m, snd_mix
         pa_alsa_path_set_callback(p, m, cb, userdata);
 }
 
+/* Attach the callback to an element that has just been added to the mixer,
+ * if it is one of the path's elements. Returns whether it was. */
+bool pa_alsa_path_attach_callback(pa_alsa_path *p, snd_mixer_elem_t *me, snd_mixer_elem_callback_t cb, void *userdata) {
+    pa_alsa_element *e;
+
+    pa_assert(p);
+    pa_assert(me);
+    pa_assert(cb);
+
+    /* The mixer also holds elements of our own class, for jacks and ELD. */
+    if (snd_mixer_elem_get_type(me) != SND_MIXER_ELEM_SIMPLE)
+        return false;
+
+    PA_LLIST_FOREACH(e, p->elements) {
+        if (pa_streq(snd_mixer_selem_get_name(me), e->alsa_id.name) &&
+            snd_mixer_selem_get_index(me) == (unsigned int) e->alsa_id.index) {
+            snd_mixer_elem_set_callback(me, cb);
+            snd_mixer_elem_set_callback_private(me, userdata);
+            return true;
+        }
+    }
+
+    return false;
+}
+
+bool pa_alsa_path_set_attach_callback(pa_alsa_path_set *ps, snd_mixer_elem_t *me, snd_mixer_elem_callback_t cb, void *userdata) {
+    pa_alsa_path *p;
+    void *state;
+    bool attached = false;
+
+    pa_assert(ps);
+
+    PA_HASHMAP_FOREACH(p, ps->paths, state)
+        if (pa_alsa_path_attach_callback(p, me, cb, userdata))
+            attached = true;
+
+    return attached;
+}
+
 static pa_alsa_path *profile_set_get_path(pa_alsa_profile_set *ps, const char *path_name) {
     pa_alsa_path *path;
 
@@ -4467,7 +4506,7 @@ static void profile_set_set_availability_groups(pa_alsa_profile_set *ps) {
 
 static void mapping_paths_probe(pa_alsa_mapping *m, pa_alsa_profile *profile,
                                 pa_alsa_direction_t direction, pa_hashmap *used_paths,
-                                pa_hashmap *mixers) {
+                                pa_hashmap *mixers, uint32_t card_index) {
 
     pa_alsa_path *p;
     void *state;
@@ -4492,7 +4531,7 @@ static void mapping_paths_probe(pa_alsa_mapping *m, pa_alsa_profile *profile,
 
     pa_assert(pcm_handle);
 
-    mixer_handle = pa_alsa_open_mixer_for_pcm(mixers, pcm_handle, true);
+    mixer_handle = pa_alsa_open_mixer_for_pcm(mixers, pcm_handle, true, card_index);
     if (!mixer_handle) {
         /* Cannot open mixer, remove all entries */
         pa_hashmap_remove_all(ps->paths);
@@ -4500,7 +4539,7 @@ static void mapping_paths_probe(pa_alsa_mapping *m, pa_alsa_profile *profile,
     }
 
     PA_HASHMAP_FOREACH(p, ps->paths, state) {
-        if (p->autodetect_eld_device)
+        if (p->autodetect_eld_device && m->hw_device_index >= 0)
             p->eld_device = m->hw_device_index;
 
         if (pa_alsa_path_probe(p, m, mixer_handle, m->profile_set->ignore_dB) < 0)
@@ -4544,7 +4583,7 @@ static int mapping_verify(pa_alsa_mapping *m, const pa_channel_map *bonus) {
         { "analog-surround-41",     N_("Analog Surround 4.1") },
         { "analog-surround-50",     N_("Analog Surround 5.0") },
         { "analog-surround-51",     N_("Analog Surround 5.1") },
-        { "analog-surround-61",     N_("Analog Surround 6.0") },
+        { "analog-surround-60",     N_("Analog Surround 6.0") },
         { "analog-surround-61",     N_("Analog Surround 6.1") },
         { "analog-surround-70",     N_("Analog Surround 7.0") },
         { "analog-surround-71",     N_("Analog Surround 7.1") },
@@ -5087,6 +5126,7 @@ static int add_profiles_to_probe(
 static void mapping_query_hw_device(pa_alsa_mapping *mapping, snd_pcm_t *pcm) {
     int r;
     snd_pcm_info_t* pcm_info;
+    const char *name;
     snd_pcm_info_alloca(&pcm_info);
 
     r = snd_pcm_info(pcm, pcm_info);
@@ -5098,15 +5138,18 @@ static void mapping_query_hw_device(pa_alsa_mapping *mapping, snd_pcm_t *pcm) {
     /* XXX: It's not clear what snd_pcm_info_get_device() does if the device is
      * not backed by a hw device or if it's backed by multiple hw devices. We
      * only use hw_device_index for HDMI devices, however, and for those the
-     * return value is expected to be always valid, so this shouldn't be a
-     * significant problem. */
-    mapping->hw_device_index = snd_pcm_info_get_device(pcm_info);
+     * return value is expected to be always valid with a couple of known
+     * exceptions, which we try to avoid below */
+    name = snd_pcm_info_get_name(pcm_info);
+
+    if (!spa_strstartswith(name, "a52") && !spa_strstartswith(name, "dcahdmi"))
+        mapping->hw_device_index = snd_pcm_info_get_device(pcm_info);
 }
 
 void pa_alsa_profile_set_probe(
         pa_alsa_profile_set *ps,
         pa_hashmap *mixers,
-        const char *dev_id,
+        uint32_t card_index,
         const pa_sample_spec *ss,
         unsigned default_n_fragments,
         unsigned default_fragment_size_msec) {
@@ -5119,8 +5162,10 @@ void pa_alsa_profile_set_probe(
     pa_hashmap *broken_inputs, *broken_outputs, *used_paths;
     pa_alsa_mapping *selected_fallback_input = NULL, *selected_fallback_output = NULL;
 
+    char dev_id[16];
+    snprintf(dev_id, sizeof(dev_id), "%d", card_index);
+
     pa_assert(ps);
-    pa_assert(dev_id);
     pa_assert(ss);
 
     if (ps->probed)
@@ -5244,7 +5289,7 @@ void pa_alsa_profile_set_probe(
                     if (p->fallback_output && selected_fallback_output == NULL) {
                         selected_fallback_output = m;
                     }
-                    mapping_paths_probe(m, p, PA_ALSA_DIRECTION_OUTPUT, used_paths, mixers);
+                    mapping_paths_probe(m, p, PA_ALSA_DIRECTION_OUTPUT, used_paths, mixers, card_index);
                 }
 
         if (p->input_mappings)
@@ -5254,14 +5299,12 @@ void pa_alsa_profile_set_probe(
                     if (p->fallback_input && selected_fallback_input == NULL) {
                         selected_fallback_input = m;
                     }
-                    mapping_paths_probe(m, p, PA_ALSA_DIRECTION_INPUT, used_paths, mixers);
+                    mapping_paths_probe(m, p, PA_ALSA_DIRECTION_INPUT, used_paths, mixers, card_index);
                 }
     }
 
     /* Clean up */
     profile_finalize_probing(last, NULL);
-
-    pa_alsa_profile_set_drop_unsupported(ps);
 
     paths_drop_unused(ps->input_paths, used_paths);
     paths_drop_unused(ps->output_paths, used_paths);
@@ -5273,6 +5316,57 @@ void pa_alsa_profile_set_probe(
     profile_set_set_availability_groups(ps);
 
     ps->probed = true;
+}
+
+void pa_alsa_profile_set_recheck_hdmi_eld(
+        pa_alsa_profile_set *ps,
+        uint32_t card_index,
+        const struct pa_hdmi_eld *eld) {
+
+    pa_alsa_profile *p;
+    void *state;
+
+    pa_assert(ps);
+
+    pa_log_debug("Refreshing HDMI profile-set support on card %u", card_index);
+
+    /* For each profile containing output HDMI mappings, use the ELD channel
+     * count to determine if the profile is supported by the connected sink.
+     * Other profiles are left untouched. */
+    PA_HASHMAP_FOREACH(p, ps->profiles, state) {
+        uint32_t idx;
+        pa_alsa_mapping *m;
+        bool supports_hdmi_output_mapping = false;
+
+        if (p->profile.flags & (ACP_PROFILE_OFF | ACP_PROFILE_PRO))
+            continue;
+
+	/* Skip profiles with input mappings as HDMI ELD is only for playback */
+	if (p->input_mappings)
+	    continue;
+
+        if (p->output_mappings) {
+            PA_IDXSET_FOREACH(m, p->output_mappings, idx) {
+
+                /* Only handle HDMI mappings */
+                if (strcmp (m->device_strings[0], "hdmi:%f") != 0)
+                    continue;
+
+                if (eld->lpcm_channels < (int)m->channel_map.channels) {
+                    p->supported = false;
+                    pa_log_debug("HDMI profile %s disabled (ELD channels did not match)", p->name);
+                    break;
+                }
+
+                supports_hdmi_output_mapping = true;
+            }
+        }
+
+        if (supports_hdmi_output_mapping) {
+            p->supported = true;
+            pa_log_debug("HDMI profile %s enabled (ELD channels matched)", p->name);
+        }
+    }
 }
 
 void pa_alsa_profile_set_dump(pa_alsa_profile_set *ps) {

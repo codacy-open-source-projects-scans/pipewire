@@ -12,9 +12,10 @@
 #include <fcntl.h>
 #include <unistd.h>
 
+#include <spa/utils/cleanup.h>
 #include <spa/utils/result.h>
 #include <spa/utils/string.h>
-#include <spa/utils/json.h>
+#include <spa/utils/json-builder.h>
 
 #include <pipewire/impl.h>
 #include <pipewire/i18n.h>
@@ -45,7 +46,7 @@
  *    false by default.
  * - `raop.latency.ms` = latency for all streams in microseconds. This
  *    can be overwritten in the stream rules.
- * - `stream.rules` = <rules>: match rules, use create-stream actions. See
+ * - `stream.rules` = \<rules\>: match rules, use create-stream actions. See
  *   \ref page_module_raop_sink for module properties.
  *
  * ## Example configuration
@@ -232,28 +233,27 @@ struct match_info {
 static int create_stream(struct impl *impl, struct pw_properties *props,
 		struct tunnel *t)
 {
-	FILE *f;
-	char *args;
+	struct spa_json_builder b;
+	spa_autofree char *args = NULL;
 	size_t size;
 	int res = 0;
 	struct pw_impl_module *mod;
 
-	if ((f = open_memstream(&args, &size)) == NULL) {
-		res = -errno;
+	if ((res = spa_json_builder_memstream(&b, &args, &size, 0)) < 0) {
 		pw_log_error("Can't open memstream: %m");
 		goto done;
 	}
 
-	fprintf(f, "{");
-	pw_properties_serialize_dict(f, &props->dict, 0);
-	fprintf(f, "}");
-        fclose(f);
+	spa_json_builder_array_push(&b, "{");
+	pw_properties_serialize_dict(b.f, &props->dict, 0);
+	spa_json_builder_pop(&b,        "}");
+	if ((res = spa_json_builder_close(&b)) < 0)
+		goto done;
 
 	pw_log_info("loading module args:'%s'", args);
 	mod = pw_context_load_module(impl->context,
 			"libpipewire-module-raop-sink",
 			args, NULL);
-	free(args);
 
 	if (mod == NULL) {
 		res = -errno;
@@ -471,7 +471,7 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	impl->properties = props;
 
 	if ((local = pw_properties_get(impl->properties, "raop.discover-local")) == NULL)
-		local = "false";
+		local = "true";
 	pw_properties_set(impl->properties, PW_KEY_ZEROCONF_DISCOVER_LOCAL, local);
 
 	pw_impl_module_add_listener(module, &impl->module_listener, &module_events, impl);

@@ -61,7 +61,6 @@ static int emit_info(struct impl *this, bool full)
 	struct spa_dict_item items[13];
 	uint32_t n_items = 0;
 	struct spa_device_info info;
-	struct spa_param_info params[2];
 	char path[128], version[16], capabilities[16], device_caps[16], devices_str[16];
 	struct spa_strbuf buf;
 
@@ -104,12 +103,6 @@ static int emit_info(struct impl *this, bool full)
 	ADD_ITEM(SPA_KEY_API_V4L2_CAP_DEVICE_CAPS, device_caps);
 #undef ADD_ITEM
 	info.props = &SPA_DICT_INIT(items, n_items);
-
-	info.change_mask |= SPA_DEVICE_CHANGE_MASK_PARAMS;
-	params[0] = SPA_PARAM_INFO(SPA_PARAM_EnumProfile, SPA_PARAM_INFO_READ);
-	params[1] = SPA_PARAM_INFO(SPA_PARAM_Profile, SPA_PARAM_INFO_WRITE);
-	info.n_params = 0;
-	info.params = params;
 
 	spa_device_emit_info(&this->hooks, &info);
 
@@ -244,13 +237,13 @@ impl_init(const struct spa_handle_factory *factory,
 	reset_props(&this->props);
 
 	if (info && (str = spa_dict_lookup(info, SPA_KEY_API_V4L2_PATH)))
-		strncpy(this->props.device, str, sizeof(this->props.device)-1);
+		spa_scnprintf(this->props.device, sizeof(this->props.device), "%s", str);
 	if (info && (str = spa_dict_lookup(info, SPA_KEY_DEVICE_DEVIDS)))
-		strncpy(this->props.devnum, str, sizeof(this->props.devnum)-1);
+		spa_scnprintf(this->props.devnum, sizeof(this->props.devnum), "%s", str);
 	if (info && (str = spa_dict_lookup(info, SPA_KEY_DEVICE_PRODUCT_ID)))
-		strncpy(this->props.product_id, str, sizeof(this->props.product_id)-1);
+		spa_scnprintf(this->props.product_id, sizeof(this->props.product_id), "%s", str);
 	if (info && (str = spa_dict_lookup(info, SPA_KEY_DEVICE_VENDOR_ID)))
-		strncpy(this->props.vendor_id, str, sizeof(this->props.vendor_id)-1);
+		spa_scnprintf(this->props.vendor_id, sizeof(this->props.vendor_id), "%s", str);
 
 	return 0;
 }

@@ -7,12 +7,176 @@
 #include <opus/opus.h>
 #include <opus/opus_multistream.h>
 
+static int opus_packet_decode(struct rtp_stream *impl, struct rtp_packet *p)
+{
+	int res;
+	OpusMSDecoder *dec = impl->stream_data;
+
+	//pw_log_info("opus decode %d", p->seq);
+
+	res = opus_multistream_decode_float(dec,
+			SPA_PTROFF(p->data, p->hlen, void), p->size - p->hlen,
+			(float*)p->tmp, p->tmp_size/impl->stride, 0);
+	if (res < 0) {
+		pw_log_warn("opus decode error %d (%s)", res, opus_strerror(res));
+		return res;
+	}
+	p->decoded = p->tmp;
+	p->decoded_len = res * impl->stride;
+	p->duration = res;
+	return 0;
+}
+
+static int opus_packet_repair(struct rtp_stream *impl, struct rtp_packet *last,
+		struct rtp_packet *next, uint32_t num, uint32_t ts_start, uint32_t ts_end)
+{
+	struct rtp_packet *p;
+	uint32_t i, duration, offs, size;
+	int res;
+	OpusMSDecoder *dec = impl->stream_data;
+	uint8_t *data;
+	int32_t span;
+
+	span = rtp_timestamp_delta(ts_end, ts_start);
+	if (span <= 0)
+		return -EINVAL;
+
+	duration = span / num;
+
+	if ((p = rtp_stream_get_free_packet(impl)) == NULL || p == next)
+		return -ENOSPC;
+	if (duration > p->tmp_size / impl->stride)
+		return -EINVAL;
+
+	size = SPA_MIN((uint32_t)span, p->tmp_size/impl->stride);
+	data = p->tmp;
+
+	/* one packet to store all PLC/FEC, this size must match the total amount of
+	 * missing samples. */
+	pw_log_info("opus recover %u %u %u %u", last->seq+1, next->seq, num, duration);
+
+	res = opus_multistream_decode_float(dec, NULL, 0, (float*)data, size, 1);
+	if (res < 0) {
+		pw_log_warn("recover packet failed for %d: %d (%s)", p->seq, res, opus_strerror(res));
+		size = 0;
+	} else {
+		size = res;
+	}
+
+	offs = 0;
+	for (i = 0; i < num; i++) {
+		spa_list_remove(&p->link);
+		spa_list_append(&next->link, &p->link);
+
+		p->seq = last->seq + i + 1;
+		p->timestamp = ts_start + offs;
+
+		p->decoded = p->tmp;
+		p->decoded_len = impl->stride * duration;
+		p->duration = duration;
+
+		if (offs + duration <= size) {
+			//pw_log_info("recover %d %d %d %d with PLC", p->seq, offs, duration, size);
+			if (offs > 0)
+				memcpy(p->decoded, &data[offs * impl->stride], p->decoded_len);
+		} else {
+			//pw_log_info("recover %d %d %d %d with silence", p->seq, offs, duration, size);
+			memset(p->decoded, 0, p->decoded_len);
+		}
+		offs += duration;
+
+		if (i+1<num) {
+			if ((p = rtp_stream_get_free_packet(impl)) == NULL || p == next)
+				return -ENOSPC;
+		}
+	}
+	return 0;
+}
+/* read wanted samples from the packet buffer at timestamp. Fill the gaps with
+ * silence */
+static void opus_packet_buffer_read(struct rtp_stream *impl, uint32_t timestamp, void *dst,
+		uint32_t wanted, uint32_t stride)
+{
+	struct rtp_packet *p, *prev_p = NULL;
+	uint16_t next_seq;
+	uint32_t next_timestamp;
+	int res;
+
+	spa_list_for_each(p, &impl->queued, link) {
+		uint32_t samples, skip, ts, ts_end;
+		int32_t ts_delta;
+		int16_t seq_delta;
+
+		if (wanted == 0)
+			break;
+
+		if (prev_p == NULL) {
+			next_seq = p->seq;
+			next_timestamp = p->timestamp;
+		}
+
+		seq_delta = rtp_seqnum_delta(p->seq, next_seq);
+		if (seq_delta > 0 && prev_p != NULL) {
+			if ((res = opus_packet_repair(impl, prev_p, p, seq_delta,
+							next_timestamp, p->timestamp)) < 0) {
+				pw_log_warn("could not repair packets: %d", res);
+				goto skip;
+			}
+			p = spa_list_next(prev_p, link);
+		} else if (p->decoded == NULL) {
+			if ((res = opus_packet_decode(impl, p)) < 0)
+				goto skip;
+		}
+
+		ts = p->timestamp;
+		samples = p->duration;
+		ts_end = ts + samples;
+		if (rtp_timestamp_delta(ts_end, timestamp) <= 0)
+			goto next;
+
+		ts_delta = rtp_timestamp_delta(timestamp, ts);
+		if (ts_delta < 0) {
+			/* there is no packet that contains the requested
+			 * timestamp, we underrun */
+			skip = -ts_delta;
+			skip = SPA_MIN(skip, wanted);
+			memset(dst, 0, skip * stride);
+			dst = SPA_PTROFF(dst, skip * stride, void);
+			wanted -= skip;
+			timestamp += skip;
+			skip = 0;
+		} else {
+			/* packet contains requested timestamp, skip samples
+			 * before timestamp */
+			skip = ts_delta;
+			samples -= SPA_MIN(skip, samples);
+		}
+		samples = SPA_MIN(samples, wanted);
+		if (samples > 0) {
+			memcpy(dst, SPA_PTROFF(p->decoded, skip*stride, void), samples * stride);
+			dst = SPA_PTROFF(dst, samples * stride, void);
+			wanted -= samples;
+			timestamp += samples;
+		}
+next:
+		next_timestamp = ts_end;
+skip:
+		next_seq = (p->seq + 1) & 0xffff;
+		prev_p = p;
+	}
+	if (wanted > 0) {
+		/* we ran out of packets and we could not fill the complete
+		 * buffer -> underrun */
+		memset(dst, 0, wanted * stride);
+	}
+}
+
 /* TODO: Direct timestamp mode here may require a rework. See audio.c for a reference.
  * Also check out the usage of actual_max_buffer_size in audio.c. */
 
 static void rtp_opus_process_playback(void *data)
 {
-	struct impl *impl = data;
+	struct rtp_stream *impl = data;
 	struct pw_buffer *buf;
 	struct spa_data *d;
 	uint32_t wanted, timestamp, target_buffer, stride, maxsize;
@@ -33,63 +197,45 @@ static void rtp_opus_process_playback(void *data)
 		/* in direct mode, read directly from the timestamp index,
 		 * because sender and receiver are in sync, this would keep
 		 * target_buffer of samples available. */
-		spa_ringbuffer_read_update(&impl->ring,
-				impl->io_position->clock.position);
-	}
-	avail = spa_ringbuffer_get_read_index(&impl->ring, &timestamp);
-
-	target_buffer = impl->target_buffer;
-
-	if (avail < (int32_t)wanted) {
-		enum spa_log_level level;
-		memset(d[0].data, 0, wanted * stride);
-		if (impl->have_sync) {
-			impl->have_sync = false;
-			level = SPA_LOG_LEVEL_WARN;
-		} else {
-			level = SPA_LOG_LEVEL_DEBUG;
-		}
-		pw_log(level, "underrun %d/%u < %u",
-					avail, target_buffer, wanted);
+		timestamp = impl->io_position->clock.position;
 	} else {
+		timestamp = impl->expected_timestamp;
+	}
+
+	if (!impl->direct_timestamp) {
 		double error, corr;
-		if (impl->first) {
-			if ((uint32_t)avail > target_buffer) {
-				uint32_t skip = avail - target_buffer;
-				pw_log_debug("first: avail:%d skip:%u target:%u",
-							avail, skip, target_buffer);
-				timestamp += skip;
-				avail = target_buffer;
-			}
-			impl->first = false;
-		} else if (avail > (int32_t)SPA_MIN(target_buffer * 8, BUFFER_SIZE2 / stride)) {
-			pw_log_warn("overrun %u > %u", avail, target_buffer * 8);
-			timestamp += avail - target_buffer;
-			avail = target_buffer;
-		}
-		if (!impl->direct_timestamp) {
-			/* when not using direct timestamp and clocks are not
-			 * in sync, try to adjust our playback rate to keep the
-			 * requested target_buffer bytes in the ringbuffer */
+
+		target_buffer = impl->target_buffer;
+
+		if (!impl->have_sync) {
+			spa_dll_init(&impl->dll);
+			spa_dll_set_bw(&impl->dll, SPA_DLL_BW_MIN, 128, impl->rate);
+
+			avail = (int32_t)(target_buffer);
+			timestamp = (int32_t)(impl->tail_timestamp - avail);
+			impl->expected_timestamp = timestamp;
+			impl->have_sync = impl->num_queued != 0;
+			error = 0.0;
+
+			pw_log_info("sync:%d %08x %08x target:%u synced:%u", avail,
+				impl->tail_timestamp, timestamp, target_buffer, impl->have_sync);
+		} else {
+			avail = (int32_t)(impl->tail_timestamp - timestamp);
 			error = (double)target_buffer - (double)avail;
 			error = SPA_CLAMPD(error, -impl->max_error, impl->max_error);
-
-			corr = spa_dll_update(&impl->dll, error);
-
-			pw_log_trace("avail:%u target:%u error:%f corr:%f", avail,
-					target_buffer, error, corr);
-
-			pw_stream_set_rate(impl->stream, 1.0 / corr);
 		}
-		spa_ringbuffer_read_data(&impl->ring,
-				impl->buffer,
-				BUFFER_SIZE2,
-				(timestamp * stride) & BUFFER_MASK2,
-				d[0].data, wanted * stride);
+		corr = spa_dll_update(&impl->dll, error);
 
-		timestamp += wanted;
-		spa_ringbuffer_read_update(&impl->ring, timestamp);
+		pw_log_trace_fp("avail:%u target:%u error:%f corr:%f", avail,
+				target_buffer, error, corr);
+
+		pw_stream_set_rate(impl->stream, 1.0 / corr);
 	}
+
+	opus_packet_buffer_read(impl, timestamp, d[0].data, wanted, stride);
+
+	impl->expected_timestamp = timestamp + wanted;
+
 	d[0].chunk->offset = 0;
 	d[0].chunk->size = wanted * stride;
 	d[0].chunk->stride = stride;
@@ -99,180 +245,15 @@ static void rtp_opus_process_playback(void *data)
 	pw_stream_queue_buffer(impl->stream, buf);
 }
 
-static int rtp_opus_receive(struct impl *impl, uint8_t *buffer, ssize_t len,
-			uint64_t current_time)
-{
-	struct rtp_header *hdr;
-	ssize_t hlen, plen;
-	uint16_t seq;
-	uint32_t timestamp, samples, write, expected_write;
-	uint32_t stride = impl->stride;
-	OpusMSDecoder *dec = impl->stream_data;
-	int32_t filled;
-	int res;
-
-	if (len < 12)
-		goto short_packet;
-
-	hdr = (struct rtp_header*)buffer;
-	if (hdr->v != 2)
-		goto invalid_version;
-
-	hlen = 12 + hdr->cc * 4;
-	if (hlen > len)
-		goto invalid_len;
-
-	if (impl->have_ssrc && impl->ssrc != hdr->ssrc)
-		goto unexpected_ssrc;
-	impl->ssrc = hdr->ssrc;
-	impl->have_ssrc = !impl->ignore_ssrc;
-
-	seq = ntohs(hdr->sequence_number);
-	if (impl->have_seq && impl->seq != seq) {
-		pw_log_info("unexpected seq (%d != %d) SSRC:%u",
-				seq, impl->seq, hdr->ssrc);
-		impl->have_sync = false;
-	}
-	impl->seq = seq + 1;
-	impl->have_seq = true;
-
-	timestamp = ntohl(hdr->timestamp) - impl->ts_offset;
-
-	impl->receiving = true;
-
-	plen = len - hlen;
-
-	filled = spa_ringbuffer_get_write_index(&impl->ring, &expected_write);
-
-	/* we always write to timestamp + delay */
-	write = timestamp + impl->target_buffer;
-
-	if (!impl->have_sync) {
-		pw_log_info("sync to timestamp:%u seq:%u ts_offset:%u SSRC:%u target:%u direct:%u",
-				timestamp, seq, impl->ts_offset, impl->ssrc,
-				impl->target_buffer, impl->direct_timestamp);
-
-		/* we read from timestamp, keeping target_buffer of data
-		 * in the ringbuffer. */
-		impl->ring.readindex = timestamp;
-		impl->ring.writeindex = write;
-		filled = impl->target_buffer;
-
-		spa_dll_init(&impl->dll);
-		spa_dll_set_bw(&impl->dll, SPA_DLL_BW_MIN, 128, impl->rate);
-		memset(impl->buffer, 0, BUFFER_SIZE);
-		impl->have_sync = true;
-	} else if (expected_write != write) {
-		pw_log_debug("unexpected write (%u != %u)",
-				write, expected_write);
-	}
-
-	if (filled + plen > BUFFER_SIZE2 / stride) {
-		pw_log_debug("capture overrun %u + %zd > %u", filled, plen,
-				BUFFER_SIZE2 / stride);
-		impl->have_sync = false;
-	} else {
-		uint32_t index = (write * stride) & BUFFER_MASK2, end;
-
-		res = opus_multistream_decode_float(dec,
-				&buffer[hlen], plen,
-				(float*)&impl->buffer[index], 2880,
-				0);
-
-		end = index + (res * stride);
-		/* fold to the lower part of the ringbuffer when overflow */
-		if (end > BUFFER_SIZE2)
-			memmove(impl->buffer, &impl->buffer[BUFFER_SIZE2], end - BUFFER_SIZE2);
-
-		pw_log_info("receiving %zd len:%d timestamp:%d %u", plen, res, timestamp, index);
-		samples = res;
-
-		write += samples;
-		spa_ringbuffer_write_update(&impl->ring, write);
-	}
-	return 0;
-
-short_packet:
-	pw_log_warn("short packet received");
-	return -EINVAL;
-invalid_version:
-	pw_log_warn("invalid RTP version");
-	spa_debug_log_mem(pw_log_get(), SPA_LOG_LEVEL_INFO, 0, buffer, len);
-	return -EPROTO;
-invalid_len:
-	pw_log_warn("invalid RTP length");
-	return -EINVAL;
-unexpected_ssrc:
-	if (!impl->fixed_ssrc) {
-		/* We didn't have a configured SSRC, and there's more than one SSRC on
-		* this address/port pair */
-		pw_log_warn("unexpected SSRC (expected %u != %u)",
-			impl->ssrc, hdr->ssrc);
-	}
-	return -EINVAL;
-}
-
-static void rtp_opus_flush_packets(struct impl *impl)
-{
-	int32_t avail, tosend;
-	uint32_t stride, timestamp, offset;
-	uint8_t out[1280];
-	struct iovec iov[2];
-	struct rtp_header header;
-	OpusMSEncoder *enc = impl->stream_data;
-	int res = 0;
-
-	avail = spa_ringbuffer_get_read_index(&impl->ring, &timestamp);
-	tosend = impl->psamples;
-
-	if (avail < tosend)
-		return;
-
-	stride = impl->stride;
-
-	spa_zero(header);
-	header.v = 2;
-	header.pt = impl->payload;
-	header.ssrc = htonl(impl->ssrc);
-
-	iov[0].iov_base = &header;
-	iov[0].iov_len = sizeof(header);
-	iov[1].iov_base = out;
-	iov[1].iov_len = 0;
-
-	offset = 0;
-	while (avail >= tosend) {
-		header.sequence_number = htons(impl->seq);
-		header.timestamp = htonl(impl->ts_offset + timestamp);
-
-		res = opus_multistream_encode_float(enc,
-				(const float*)&impl->buffer[offset * stride], tosend,
-				out, sizeof(out));
-
-		pw_log_trace("sending %d len:%d timestamp:%d", tosend, res, timestamp);
-		iov[1].iov_len = res;
-
-		rtp_stream_call_send_packet(impl, iov, 2);
-
-		impl->seq++;
-		timestamp += tosend;
-		offset += tosend;
-		avail -= tosend;
-	}
-
-	pw_log_trace("move %d offset:%d", avail, offset);
-	memmove(impl->buffer, &impl->buffer[offset * stride], avail * stride);
-
-	spa_ringbuffer_read_update(&impl->ring, timestamp);
-}
-
 static void rtp_opus_process_capture(void *data)
 {
-	struct impl *impl = data;
+	struct rtp_stream *impl = data;
 	struct pw_buffer *buf;
 	struct spa_data *d;
 	uint32_t offs, size, timestamp, expected_timestamp, stride;
-	int32_t filled, wanted;
+	uint32_t wanted;
+	void *src, *dst;
+	struct rtp_packet *p, *t;
 
 	if ((buf = pw_stream_dequeue_buffer(impl->stream)) == NULL) {
 		pw_log_info("Out of stream buffers: %m");
@@ -285,7 +266,7 @@ static void rtp_opus_process_capture(void *data)
 	stride = impl->stride;
 	wanted = size / stride;
 
-	filled = spa_ringbuffer_get_write_index(&impl->ring, &expected_timestamp);
+	expected_timestamp = impl->expected_timestamp;
 
 	if (SPA_LIKELY(impl->io_position)) {
 		uint32_t rate = impl->io_position->clock.rate.denom;
@@ -296,33 +277,81 @@ static void rtp_opus_process_capture(void *data)
 	if (!impl->have_sync) {
 		pw_log_info("sync to timestamp:%u seq:%u ts_offset:%u SSRC:%u",
 				timestamp, impl->seq, impl->ts_offset, impl->ssrc);
-		impl->ring.readindex = impl->ring.writeindex = expected_timestamp = timestamp;
-		memset(impl->buffer, 0, BUFFER_SIZE);
+		impl->expected_timestamp = expected_timestamp = timestamp;
 		impl->have_sync = true;
 	} else {
 		if (SPA_ABS((int32_t)expected_timestamp - (int32_t)timestamp) > 32) {
 			pw_log_warn("expected %u != timestamp %u", expected_timestamp, timestamp);
 			impl->have_sync = false;
-		} else if (filled + wanted > (int32_t)(BUFFER_SIZE / stride)) {
-			pw_log_warn("overrun %u + %u > %u", filled, wanted, BUFFER_SIZE / stride);
-			impl->have_sync = false;
 		}
 	}
 
-	spa_ringbuffer_write_data(&impl->ring,
-			impl->buffer,
-			BUFFER_SIZE,
-			(filled * stride) & BUFFER_MASK,
-			SPA_PTROFF(d[0].data, offs, void), wanted * stride);
-	expected_timestamp += wanted;
-	spa_ringbuffer_write_update(&impl->ring, expected_timestamp);
+	src = SPA_PTROFF(d[0].data, offs, void);
+	while (wanted > 0) {
+		p = rtp_stream_peek_pending_packet(impl);
+
+		if (p->size < sizeof(struct rtp_header)) {
+			struct rtp_header *header;
+
+			header = p->data;
+			header->v = 2;
+			header->pt = impl->payload;
+			header->ssrc = htonl(impl->ssrc);
+			if (impl->marker_on_first && impl->first)
+				header->m = 1;
+			else
+				header->m = 0;
+			header->sequence_number = htons(impl->seq);
+
+			p->timestamp = impl->ts_offset + impl->ts_align + expected_timestamp;
+			header->timestamp = htonl(p->timestamp);
+
+			p->size = sizeof(struct rtp_header);
+			p->decoded = p->tmp;
+			p->decoded_len = 0;
+		}
+		uint32_t prepared = p->decoded_len / stride;
+		uint32_t to_send = SPA_MIN(impl->psamples - prepared, wanted);
+
+		dst = SPA_PTROFF(p->decoded, p->decoded_len, void);
+
+		spa_memcpy(dst, src, to_send * stride);
+
+		p->decoded_len += to_send * stride;
+		prepared += to_send;
+		wanted -= to_send;
+
+		src = SPA_PTROFF(src, to_send * stride, void);
+
+		if (prepared >= impl->psamples) {
+			OpusMSEncoder *enc = impl->stream_data;
+
+			int res = opus_multistream_encode_float(enc,
+					(const float*)p->decoded, p->decoded_len / stride,
+					SPA_PTROFF(p->data, p->size, uint8_t), p->maxsize - p->size);
+			if (res > 0) {
+				p->size += res;
+
+				rtp_stream_queue_packet(impl, p);
+
+				impl->seq++;
+			} else {
+				pw_log_error("opus encoder error %d", res);
+			}
+			rtp_stream_clear_pending_packet(impl);
+		}
+		impl->first = false;
+		expected_timestamp += to_send;
+	}
+	impl->expected_timestamp = expected_timestamp;
 
 	pw_stream_queue_buffer(impl->stream, buf);
 
-	rtp_opus_flush_packets(impl);
+	spa_list_for_each_safe(p, t, &impl->queued, link)
+		rtp_stream_send_packet(impl, p);
 }
 
-static void rtp_opus_deinit(struct impl *impl, enum spa_direction direction)
+static void rtp_opus_deinit(struct rtp_stream *impl, enum spa_direction direction)
 {
 	if (impl->stream_data) {
 		if (direction == SPA_DIRECTION_INPUT)
@@ -332,7 +361,7 @@ static void rtp_opus_deinit(struct impl *impl, enum spa_direction direction)
 	}
 }
 
-static int rtp_opus_init(struct impl *impl, enum spa_direction direction)
+static int rtp_opus_init(struct rtp_stream *impl, enum spa_direction direction)
 {
 	int err;
 	unsigned char mapping[255];
@@ -358,7 +387,6 @@ static int rtp_opus_init(struct impl *impl, enum spa_direction direction)
 		mapping[i] = i;
 
 	impl->deinit = rtp_opus_deinit;
-	impl->receive_rtp = rtp_opus_receive;
 	if (direction == SPA_DIRECTION_INPUT) {
 		impl->stream_events.process = rtp_opus_process_capture;
 
@@ -379,13 +407,15 @@ static int rtp_opus_init(struct impl *impl, enum spa_direction direction)
 			impl->info.info.opus.channels, 0,
 			mapping,
 			&err);
+
+		opus_multistream_decoder_ctl(impl->stream_data, OPUS_SET_COMPLEXITY(5));
 	}
 	if (!impl->stream_data)
-		pw_log_error("opus error: %d", err);
+		pw_log_error("opus error: %d (%s)", err, opus_strerror(err));
 	return impl->stream_data ? 0 : err;
 }
 #else
-static int rtp_opus_init(struct impl *impl, enum spa_direction direction)
+static int rtp_opus_init(struct rtp_stream *impl, enum spa_direction direction)
 {
 	return -ENOTSUP;
 }

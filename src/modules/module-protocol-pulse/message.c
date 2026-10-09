@@ -215,7 +215,7 @@ static int read_cvolume(struct message *m, struct volume *vol)
 
 	if ((res = read_u8(m, &vol->channels)) < 0)
 		return res;
-	if (vol->channels > CHANNELS_MAX)
+	if (vol->channels == 0 || vol->channels > CHANNELS_MAX)
 		return -EINVAL;
 	for (i = 0; i < vol->channels; i ++) {
 		if ((res = read_volume(m, &vol->values[i])) < 0)
@@ -361,6 +361,8 @@ int message_get(struct message *m, ...)
 			if ((res = read_format_info(m, va_arg(va, struct format_info*))) < 0)
 				goto done;
 			break;
+		default:
+			goto invalid;
 		}
 	}
 	res = 0;
@@ -375,21 +377,16 @@ done:
 	return res;
 }
 
-static int ensure_size(struct message *m, uint32_t size)
+static int message_resize(struct message *m, uint32_t size)
 {
+	uint64_t needed;
 	uint32_t alloc, diff;
 	void *data;
 
-	if (m->length > m->allocated)
+	needed = SPA_ROUND_UP_N(SPA_MAX((uint64_t)m->allocated + size, 4096u), 4096u);
+	if (needed > UINT32_MAX)
 		return -ENOMEM;
-
-	if (size <= m->allocated - m->length)
-		return size;
-
-	if (m->allocated + size < m->allocated)
-		return -ENOMEM;
-
-	alloc = SPA_ROUND_UP_N(SPA_MAX(m->allocated + size, 4096u), 4096u);
+	alloc = (uint32_t)needed;
 	diff = alloc - m->allocated;
 	if ((data = realloc(m->data, alloc)) == NULL) {
 		free(m->data);
@@ -403,6 +400,17 @@ static int ensure_size(struct message *m, uint32_t size)
 	m->data = data;
 	m->allocated = alloc;
 	return size;
+}
+
+static inline int ensure_size(struct message *m, uint32_t size)
+{
+	if (m->length > m->allocated)
+		return -ENOMEM;
+
+	if (size <= m->allocated - m->length)
+		return size;
+
+	return message_resize(m, size);
 }
 
 static void write_8(struct message *m, uint8_t val)
@@ -788,8 +796,10 @@ int message_dump(enum spa_log_level level, const char *prefix, struct message *m
 		}
 		case TAG_PROPLIST:
 		{
-			struct pw_properties *props = pw_properties_new(NULL, NULL);
 			const struct spa_dict_item *it;
+			struct pw_properties *props = pw_properties_new(NULL, NULL);
+			if (props == NULL)
+				return -errno;
 			res = read_props(m, props, false);
 			if (res >= 0) {
 				pw_log(level, "%s %u: props: n_items:%u", prefix, o, props->dict.n_items);

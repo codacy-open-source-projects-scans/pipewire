@@ -73,6 +73,7 @@ extra_docs = [
   'dox/internals/protocol.dox',
   'dox/internals/pulseaudio.dox',
   'dox/internals/dma-buf.dox',
+  'dox/internals/rtp-module-internals.dox',
   'dox/tutorial/index.dox',
   'dox/tutorial/tutorial1.dox',
   'dox/tutorial/tutorial2.dox',
@@ -169,18 +170,14 @@ cssfiles = [
 ]
 
 # Example files (in order from simple to esoteric)
-example_files = [
-  'tutorial1.c',
-  'tutorial2.c',
-  'tutorial3.c',
-  'tutorial4.c',
-  'tutorial5.c',
-  'tutorial6.c',
-  'tutorial7.c',
-]
+example_files = []
 example_dep_files = []
-foreach h : example_files
-  example_dep_files += ['examples/' + h]
+
+subdir('examples')
+
+foreach h : tutorials
+  example_files += [h + '.c']
+  example_dep_files += ['examples/' + h + '.c']
 endforeach
 foreach h : examples
   example_files += [h + '.c']
@@ -223,7 +220,8 @@ doxygen_env.set('LIBPIPEWIRE_MODULES', '<ul><li>' + '</li><li>'.join(module_manp
 pulse_module_manpage_list = []
 foreach m : pipewire_module_protocol_pulse_sources
   name = fs.stem(fs.name(m))
-  if m.contains('/modules/') and name.startswith('module-')
+  if m.contains('/modules/') and (name.startswith('module-') or name.startswith('pulse-module-'))
+    name = name.replace('pulse-module-', 'module-')
     pagepart = name.replace('-', '_')
     pulse_module_manpage_list += f'\\ref page_pulse_@pagepart@ "pipewire-pulse-@name@(7)"'
     manpages += [[f'pipewire-pulse-@name@.7', f'page_pulse_@pagepart@']]

@@ -251,13 +251,20 @@ static int apply_props(struct impl *this, const struct spa_pod *param)
 	struct props *p = &this->props;
 	int changed = 0;
 
+	if (!spa_pod_is_object_type(param, SPA_TYPE_OBJECT_Props))
+		return -EINVAL;
+
 	SPA_POD_OBJECT_FOREACH(obj, prop) {
 		switch (prop->key) {
 		case SPA_PROP_volume:
+			if (!spa_pod_is_float(&prop->value))
+				return -EINVAL;
 			if (spa_pod_get_float(&prop->value, &p->volume) == 0)
 				changed++;
 			break;
 		case SPA_PROP_mute:
+			if (!spa_pod_is_bool(&prop->value))
+				return -EINVAL;
 			if (spa_pod_get_bool(&prop->value, &p->mute) == 0)
 				changed++;
 			break;
@@ -272,6 +279,7 @@ static int impl_node_set_param(void *object, uint32_t id, uint32_t flags,
 			       const struct spa_pod *param)
 {
 	struct impl *this = object;
+	int res;
 
 	spa_return_val_if_fail(this != NULL, -EINVAL);
 
@@ -281,7 +289,9 @@ static int impl_node_set_param(void *object, uint32_t id, uint32_t flags,
 			props_reset(&this->props);
 			return 0;
 		}
-		if (apply_props(this, param) > 0) {
+		if ((res = apply_props(this, param)) < 0)
+			return res;
+		if (res > 0) {
 			this->info.change_mask = SPA_NODE_CHANGE_MASK_PARAMS;
 			this->params[1].flags ^= SPA_PARAM_INFO_SERIAL;
 			emit_info(this, false);
@@ -334,6 +344,9 @@ static int impl_node_send_command(void *object, const struct spa_command *comman
 		break;
 	case SPA_NODE_COMMAND_Pause:
 		this->started = false;
+		break;
+	case SPA_NODE_COMMAND_ParamBegin:
+	case SPA_NODE_COMMAND_ParamEnd:
 		break;
 	default:
 		return -ENOTSUP;

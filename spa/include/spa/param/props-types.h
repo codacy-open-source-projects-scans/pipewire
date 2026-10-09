@@ -25,6 +25,7 @@ extern "C" {
 static const struct spa_type_info spa_type_props[] = {
 	{ SPA_PROP_START, SPA_TYPE_Id, SPA_TYPE_INFO_PROPS_BASE, spa_type_param, },
 	{ SPA_PROP_unknown, SPA_TYPE_None, SPA_TYPE_INFO_PROPS_BASE "unknown", NULL },
+	{ SPA_PROP_group, SPA_TYPE_String, SPA_TYPE_INFO_PROPS_BASE "group", NULL },
 	{ SPA_PROP_device, SPA_TYPE_String, SPA_TYPE_INFO_PROPS_BASE "device", NULL },
 	{ SPA_PROP_deviceName, SPA_TYPE_String, SPA_TYPE_INFO_PROPS_BASE "deviceName", NULL },
 	{ SPA_PROP_deviceFd, SPA_TYPE_Fd, SPA_TYPE_INFO_PROPS_BASE "deviceFd", NULL },
@@ -66,6 +67,8 @@ static const struct spa_type_info spa_type_props[] = {
 	{ SPA_PROP_volumeRampTime, SPA_TYPE_Int, SPA_TYPE_INFO_PROPS_BASE "volumeRampTime", NULL },
 	{ SPA_PROP_volumeRampStepTime, SPA_TYPE_Int, SPA_TYPE_INFO_PROPS_BASE "volumeRampStepTime", NULL },
 	{ SPA_PROP_volumeRampScale, SPA_TYPE_Id, SPA_TYPE_INFO_PROPS_BASE "volumeRampScale", spa_type_audio_volume_ramp_scale },
+	{ SPA_PROP_volumeMin, SPA_TYPE_Float, SPA_TYPE_INFO_PROPS_BASE "volumeMin", NULL },
+	{ SPA_PROP_volumeMax, SPA_TYPE_Float, SPA_TYPE_INFO_PROPS_BASE "volumeMax", NULL },
 
 	{ SPA_PROP_brightness, SPA_TYPE_Float, SPA_TYPE_INFO_PROPS_BASE "brightness", NULL },
 	{ SPA_PROP_contrast, SPA_TYPE_Float, SPA_TYPE_INFO_PROPS_BASE "contrast", NULL },
@@ -93,6 +96,7 @@ static const struct spa_type_info spa_type_prop_info[] = {
 	{ SPA_PROP_INFO_container, SPA_TYPE_Id, SPA_TYPE_INFO_PROP_INFO_BASE "container", NULL },
 	{ SPA_PROP_INFO_params, SPA_TYPE_Bool, SPA_TYPE_INFO_PROP_INFO_BASE "params", NULL },
 	{ SPA_PROP_INFO_description, SPA_TYPE_String, SPA_TYPE_INFO_PROP_INFO_BASE "description", NULL },
+	{ SPA_PROP_INFO_group, SPA_TYPE_String, SPA_TYPE_INFO_PROP_INFO_BASE "group", NULL },
 	{ 0, 0, NULL, NULL },
 };
 

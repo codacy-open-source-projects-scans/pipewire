@@ -63,6 +63,11 @@ struct stream *stream_new(struct client *client, enum stream_type type, uint32_t
 	struct defs *defs = &client->impl->defs;
 	const char *str;
 
+	if (pw_map_get_size(&client->streams) >= defs->max_streams) {
+		errno = ENOSPC;
+		return NULL;
+	}
+
 	struct stream *stream = calloc(1, sizeof(*stream));
 	if (stream == NULL)
 		return NULL;
@@ -158,8 +163,7 @@ void stream_free(struct stream *stream)
 
 	pw_work_queue_cancel(impl->work_queue, stream, SPA_ID_INVALID);
 
-	if (stream->buffer)
-		free(stream->buffer);
+	free(stream->buffer);
 
 	pw_properties_free(stream->props);
 
@@ -210,14 +214,14 @@ uint32_t stream_pop_missing(struct stream *stream)
 	missing -= stream->requested;
 	missing -= avail;
 
-	if (missing <= 0) {
-		pw_log_debug("stream %p: (tlen:%u - req:%"PRIi64" - avail:%"PRIi64") <= 0",
+	if (SPA_UNLIKELY(missing <= 0)) {
+		pw_log_trace_fp("stream %p: (tlen:%u - req:%"PRIi64" - avail:%"PRIi64") <= 0",
 				stream, stream->attr.tlength, stream->requested, avail);
 		return 0;
 	}
 
-	if (missing < stream->attr.minreq && !stream_prebuf_active(stream, avail)) {
-		pw_log_debug("stream %p: (tlen:%u - req:%"PRIi64" - avail:%"PRIi64") <= minreq:%u",
+	if (SPA_LIKELY(missing < stream->attr.minreq && !stream_prebuf_active(stream, avail))) {
+		pw_log_trace_fp("stream %p: (tlen:%u - req:%"PRIi64" - avail:%"PRIi64") <= minreq:%u",
 				stream, stream->attr.tlength, stream->requested, avail,
 				stream->attr.minreq);
 		return 0;
@@ -245,11 +249,11 @@ void stream_set_paused(struct stream *stream, bool paused, const char *reason)
 void stream_set_corked(struct stream *stream, bool cork)
 {
 	stream->corked = cork;
-	pw_log_info("cork %d", cork);
+	pw_log_debug("cork %d", cork);
 	pw_stream_update_properties(stream->stream,
 			&SPA_DICT_ITEMS(
 				SPA_DICT_ITEM("pulse.corked", cork ? "true" : "false")));
-	stream_set_paused(stream, cork, "cork request");
+	stream_set_paused(stream, cork, cork ? "cork request" : "uncork request");
 }
 
 int stream_send_underflow(struct stream *stream, int64_t offset)
@@ -285,9 +289,12 @@ int stream_send_overflow(struct stream *stream)
 	struct client *client = stream->client;
 	struct impl *impl = client->impl;
 	struct message *reply;
+	int suppressed;
 
-	pw_log_warn("client %p [%s]: stream %p OVERFLOW channel:%u",
-		    client, client->name, stream, stream->channel);
+	if ((suppressed = spa_ratelimit_test(&impl->rate_limit, stream->timestamp)) >= 0) {
+		pw_log_warn("[%s]: OVERFLOW channel:%u (%d suppressed)",
+			    client->name, stream->channel, suppressed);
+	}
 
 	reply = message_alloc(impl, -1, 0);
 	message_put(reply,
@@ -382,7 +389,7 @@ int stream_send_request(struct stream *stream)
 	if (size == 0)
 		return 0;
 
-	pw_log_debug("stream %p: REQUEST channel:%d %u", stream, stream->channel, size);
+	pw_log_trace("stream %p: REQUEST channel:%d %u", stream, stream->channel, size);
 
 	msg = message_alloc(impl, -1, 0);
 	message_put(msg,

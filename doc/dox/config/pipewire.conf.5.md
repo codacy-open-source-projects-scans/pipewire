@@ -4,7 +4,7 @@ The PipeWire server configuration file
 
 \tableofcontents
 
-# SYNOPSIS
+# SYNOPSIS {#synopsis}
 
 *$PIPEWIRE_CONFIG_DIR/pipewire/pipewire.conf*
 
@@ -288,6 +288,12 @@ Default video rate denominator
 @PAR@ pipewire.conf  library.name.system = support/libspa-support
 The name of the shared library to use for the system functions for the main thread.
 
+@PAR@ pipewire.conf  library.use-fallback = true
+When a plugin feature is not listed in context.spa-libs, a predefined fallback
+plugin location is used by default. If this option is set to false, only plugin
+features explicitly listed in context.spa-libs will be loadable. This can be used
+to lock down what plugins that can be loaded.
+
 @PAR@ pipewire.conf  link.max-buffers = 64
 The maximum number of buffers to negotiate between nodes. Note that version < 3 clients
 can only support 16 buffers. More buffers is almost always worse than less, latency
@@ -358,6 +364,8 @@ factory-name and the plugin where the factory can be found.
 Factory names can contain a wildcard to group several related factories into one
 plugin. The plugin is loaded from the first matching factory-name.
 
+A special `blocked` value for the plugin disables the factory-name.
+
 ## Example
 
 ```
@@ -374,6 +382,7 @@ context.spa-libs = {
     api.jack.*      = jack/libspa-jack
     support.*       = support/libspa-support
     video.convert.* = videoconvert/libspa-videoconvert
+    #filter.graph   = blocked
 }
 ```
 
@@ -518,6 +527,7 @@ The general rules object follows the following pattern:
             {
                 # <key> = <value>
                 # all keys must match the value. ! negates. ~ starts regex.
+                # if <value> is an array, matching is done on its elements.
                 #application.process.binary = "teams"
                 #application.name = "~speech-dispatcher.*"
 
@@ -634,6 +644,19 @@ matches = [
   }
 ]
 ```
+
+When the value is an array, the match is performed on the array elements until
+one succeeds. For example:
+
+```css
+matches = [
+  {
+    pipewire.sec.gids = 42
+  }
+]
+```
+
+Matches `pipewire.sec.gids = [ 10, 20, 42, 1000 ]`.
 
 
 # CONTEXT PROPERTIES RULES  @IDX@ pipewire.conf context.properties.rules

@@ -39,7 +39,7 @@ struct props {
 	bool disable_longname;
 };
 
-#define MAX_EVENT_SIZE 256
+#define MAX_EVENT_SIZE 64
 #define MAX_PORTS 256
 #define MAX_BUFFERS 32
 
@@ -81,6 +81,7 @@ struct seq_port {
 	struct buffer *buffer;
 	struct spa_pod_builder builder;
 	struct spa_pod_frame frame;
+	uint32_t dropped;
 
 	uint32_t control_types;
 

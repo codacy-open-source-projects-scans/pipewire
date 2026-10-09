@@ -86,6 +86,8 @@ ATTRS{subsystem_vendor}=="0x1179", ATTRS{subsystem_device}=="0xff00", ENV{ACP_PR
 ATTRS{subsystem_vendor}=="0x1462", ATTRS{subsystem_device}=="0x1053", ENV{ACP_PROFILE_SET}="force-speaker-and-int-mic.conf"
 # Lenovo 3000 Y410
 ATTRS{subsystem_vendor}=="0x17aa", ATTRS{subsystem_device}=="0x384e", ENV{ACP_PROFILE_SET}="force-speaker.conf"
+# Panasonic Let's Note CF-SX4 (CF-SX4EDHCS)
+ATTRS{subsystem_vendor}=="0x10f7", ATTRS{subsystem_device}=="0x8338", ENV{ACP_PROFILE_SET}="force-speaker.conf"
 
 GOTO="pipewire_end"
 
@@ -127,13 +129,15 @@ ATTRS{idVendor}=="1038", ATTRS{idProduct}=="12ad", ENV{ACP_PROFILE_SET}="usb-gam
 ATTRS{idVendor}=="1038", ATTRS{idProduct}=="1294", ENV{ACP_PROFILE_SET}="usb-gaming-headset.conf"
 ATTRS{idVendor}=="1038", ATTRS{idProduct}=="1730", ENV{ACP_PROFILE_SET}="usb-gaming-headset.conf"
 # ID 1038:1282 is for SteelSeries GameDAC
-ATTRS{idVendor}=="1038", ATTRS{idProduct}=="1282", ENV{ACP_PROFILE_SET}="usb-gaming-headset.conf"
+ATTRS{idVendor}=="1038", ATTRS{idProduct}=="1282", ENV{ACP_PROFILE_SET}="steelseries-gamedac-usb-audio.conf"
 # ID 1038:12c4 is for Arctis 9
 ATTRS{idVendor}=="1038", ATTRS{idProduct}=="12c4", ENV{ACP_PROFILE_SET}="usb-gaming-headset.conf"
 # Lucidsound LS31
 ATTRS{idVendor}=="2f12", ATTRS{idProduct}=="0109", ENV{ACP_PROFILE_SET}="usb-gaming-headset.conf"
 # ID 9886:002c is for the Astro A50 Gen4
 ATTRS{idVendor}=="9886", ATTRS{idProduct}=="002c", ENV{ACP_PROFILE_SET}="usb-gaming-headset.conf"
+# ID 9886:002c is for the Logitech Astro A50 Gen5
+ATTRS{idVendor}=="046d", ATTRS{idProduct}=="0b1c", ENV{ACP_PROFILE_SET}="usb-gaming-headset.conf"
 # ID 9886:0038 is for the Astro Mixamp Pro TR
 ATTRS{idVendor}=="9886", ATTRS{idProduct}=="0038", ENV{ACP_PROFILE_SET}="usb-gaming-headset.conf"
 # ID 9886:0045 is for the Astro A20 Gen2
@@ -186,6 +190,15 @@ ATTRS{idVendor}=="1395", ATTRS{idProduct}=="0089", ENV{ACP_PROFILE_SET}="usb-gam
 ATTRS{idVendor}=="1395", ATTRS{idProduct}=="0300", ENV{ACP_PROFILE_SET}="usb-gaming-headset.conf"
 # Sennheiser GSP 670 USB headset
 ATTRS{idVendor}=="1395", ATTRS{idProduct}=="008a", ENV{ACP_PROFILE_SET}="usb-gaming-headset.conf"
+
+# Audeze Maxwell Dongle
+ATTRS{idVendor}=="3329", ATTRS{idProduct}=="4b19", ENV{ACP_PROFILE_SET}="audeze-maxwell.conf"
+# Audeze Maxwell XBOX Dongle
+ATTRS{idVendor}=="3329", ATTRS{idProduct}=="4b18", ENV{ACP_PROFILE_SET}="audeze-maxwell.conf"
+# Audeze Maxwell PLAYSTATION Headset, connected over USB rather than through the dongle
+ATTRS{idVendor}=="3329", ATTRS{idProduct}=="4b1a", ENV{ACP_PROFILE_SET}="audeze-maxwell.conf"
+# Audeze Maxwell XBOX Headset, connected over USB rather than through the dongle
+ATTRS{idVendor}=="3329", ATTRS{idProduct}=="4b1e", ENV{ACP_PROFILE_SET}="audeze-maxwell.conf"
 
 # JBL Quantum One
 ATTRS{idVendor}=="0ecb", ATTRS{idProduct}=="203a", ENV{ACP_PROFILE_SET}="usb-gaming-headset-gamefirst.conf"

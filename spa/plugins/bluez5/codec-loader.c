@@ -32,6 +32,7 @@ static int codec_order(const struct media_codec *c)
 {
 	static const enum spa_bluetooth_audio_codec order[] = {
 		SPA_BLUETOOTH_AUDIO_CODEC_LC3,
+		SPA_BLUETOOTH_AUDIO_CODEC_LHDC_V5,
 		SPA_BLUETOOTH_AUDIO_CODEC_LDAC,
 		SPA_BLUETOOTH_AUDIO_CODEC_APTX_HD,
 		SPA_BLUETOOTH_AUDIO_CODEC_APTX,
@@ -136,11 +137,13 @@ static int load_media_codecs_from(struct impl *impl, const char *factory_name, c
 			continue;
 		}
 
-		/* Don't load duplicate endpoints */
+		/* Don't load duplicate endpoints. Two owners on the same
+		 * endpoint is a conflict; companions sharing an owner are not.
+		 */
 		for (j = 0; j < impl->n_codecs; ++j) {
 			const struct media_codec *c2 = impl->codecs[j];
 			const char *ep2 = c2->endpoint_name ? c2->endpoint_name : c2->name;
-			if (spa_streq(ep, ep2) && c->fill_caps && c2->fill_caps) {
+			if (spa_streq(ep, ep2) && !c->endpoint_companion && !c2->endpoint_companion) {
 				spa_log_debug(impl->log, "media codec %s from %s duplicate endpoint %s",
 						c->name, factory_name, ep);
 				goto next_codec;
@@ -183,6 +186,7 @@ const struct media_codec * const *load_media_codecs(struct spa_plugin_loader *lo
 		MEDIA_CODEC_FACTORY_LIB("aac"),
 		MEDIA_CODEC_FACTORY_LIB("aptx"),
 		MEDIA_CODEC_FACTORY_LIB("faststream"),
+		MEDIA_CODEC_FACTORY_LIB("lhdc"),
 		MEDIA_CODEC_FACTORY_LIB("ldac"),
 		MEDIA_CODEC_FACTORY_LIB("sbc"),
 		MEDIA_CODEC_FACTORY_LIB("lc3plus"),

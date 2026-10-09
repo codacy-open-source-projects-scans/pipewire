@@ -39,6 +39,7 @@
 
 #include "volume-ops.h"
 #include "fmt-ops.h"
+#include "gaps-ops.h"
 #include "channelmix-ops.h"
 #include "resample.h"
 #include "wavfile.h"
@@ -108,6 +109,7 @@ struct props {
 	char wav_path[512];
 	unsigned int lock_volumes:1;
 	unsigned int filter_graph_disabled:1;
+	float fade_duration;
 };
 
 static void props_reset(struct props *props)
@@ -131,6 +133,7 @@ static void props_reset(struct props *props)
 	spa_zero(props->wav_path);
 	props->lock_volumes = false;
 	props->filter_graph_disabled = false;
+	props->fade_duration = 0.020f;
 }
 
 struct buffer {
@@ -140,7 +143,7 @@ struct buffer {
 	uint32_t flags;
 	struct spa_list link;
 	struct spa_buffer *buf;
-	void *datas[MAX_DATAS];
+	void **datas;
 };
 
 struct port {
@@ -162,8 +165,9 @@ struct port {
 	struct spa_param_info params[N_PORT_PARAMS];
 	char position[16];
 
-	struct buffer buffers[MAX_BUFFERS];
+	struct buffer *buffers;
 	uint32_t n_buffers;
+	uint32_t last_buffer;
 
 	struct spa_latency_info latency[2];
 	unsigned int have_latency:1;
@@ -179,8 +183,10 @@ struct port {
 	uint32_t stride;
 	uint32_t maxsize;
 
-	const struct spa_pod_sequence *ctrl;
+	struct spa_pod seq;
+	const void *seq_body;
 	uint32_t ctrl_offset;
+	bool ramp_start;
 
 	struct spa_list queue;
 };
@@ -212,7 +218,8 @@ struct stage_context {
 #define CTX_DATA_REMAP_SRC	3
 #define CTX_DATA_TMP_0		4
 #define CTX_DATA_TMP_1		5
-#define CTX_DATA_MAX		6
+#define CTX_DATA_GAP		6
+#define CTX_DATA_MAX		7
 	void **datas[CTX_DATA_MAX];
 	uint32_t in_samples;
 	uint32_t n_samples;
@@ -291,6 +298,7 @@ struct impl {
 	struct spa_io_clock *io_clock;
 	struct spa_io_position *io_position;
 	struct spa_io_rate_match *io_rate_match;
+	struct spa_io_latency io_latency;
 
 	uint64_t info_all;
 	struct spa_node_info info;
@@ -309,9 +317,11 @@ struct impl {
 	struct dir dir[2];
 	struct channelmix mix;
 	struct resample resample;
+	struct gaps gaps;
 	struct volume volume;
 	double rate_scale;
-	struct spa_pod_sequence *vol_ramp_sequence;
+	struct spa_pod vol_ramp_seq;
+	const void *vol_ramp_seq_body;
 	void *vol_ramp_sequence_data;
 	uint32_t vol_ramp_offset;
 
@@ -481,6 +491,7 @@ static int init_port(struct impl *this, enum spa_direction direction, uint32_t p
 		port->blocks = 1;
 		port->stride = 1;
 	}
+	port->last_buffer = SPA_ID_INVALID;
 	port->valid = true;
 	spa_list_init(&port->queue);
 
@@ -508,8 +519,10 @@ static int node_param_enum_port_config(struct impl *this, uint32_t id, uint32_t 
 	case 0 ... 1:
 	{
 		struct dir *dir = &this->dir[index];
-		*param = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_ParamPortConfig, id,
+		struct spa_pod_frame f[1];
+
+		spa_pod_builder_push_object(b, &f[0], SPA_TYPE_OBJECT_ParamPortConfig, id);
+		spa_pod_builder_add(b,
 			SPA_PARAM_PORT_CONFIG_direction, SPA_POD_Id(dir->direction),
 			SPA_PARAM_PORT_CONFIG_mode,      SPA_POD_CHOICE_ENUM_Id(4,
 				SPA_PARAM_PORT_CONFIG_MODE_none,
@@ -517,7 +530,14 @@ static int node_param_enum_port_config(struct impl *this, uint32_t id, uint32_t 
 				SPA_PARAM_PORT_CONFIG_MODE_dsp,
 				SPA_PARAM_PORT_CONFIG_MODE_convert),
 			SPA_PARAM_PORT_CONFIG_monitor,   SPA_POD_CHOICE_Bool(false),
-			SPA_PARAM_PORT_CONFIG_control,   SPA_POD_CHOICE_Bool(false));
+			SPA_PARAM_PORT_CONFIG_control,   SPA_POD_CHOICE_Bool(false),
+			0);
+		if (this->group_name[0]) {
+			spa_pod_builder_add(b,
+				SPA_PARAM_PORT_CONFIG_group, SPA_POD_String(this->group_name),
+				0);
+		}
+		*param = spa_pod_builder_pop(b, &f[0]);
 		break;
 	}
 	default:
@@ -542,10 +562,14 @@ static int node_param_port_config(struct impl *this, uint32_t id, uint32_t index
 			SPA_PARAM_PORT_CONFIG_monitor,   SPA_POD_Bool(this->monitor),
 			SPA_PARAM_PORT_CONFIG_control,   SPA_POD_Bool(dir->control),
 			0);
-
+		if (this->group_name[0]) {
+			spa_pod_builder_add(b,
+				SPA_PARAM_PORT_CONFIG_group, SPA_POD_String(this->group_name),
+				0);
+		}
 		if (dir->have_format) {
 			spa_pod_builder_prop(b, SPA_PARAM_PORT_CONFIG_format, 0);
-			spa_format_audio_raw_build(b, id, &dir->format.info.raw);
+			spa_format_audio_build(b, id, &dir->format);
 		}
 		*param = spa_pod_builder_pop(b, &f[0]);
 		break;
@@ -562,208 +586,220 @@ static int node_param_prop_info(struct impl *this, uint32_t id, uint32_t index,
 	struct props *p = &this->props;
 	struct spa_pod_frame f[2];
 
+	if (index >= 33) {
+		if (this->filter_graph[0] && this->filter_graph[0]->graph) {
+			return spa_filter_graph_enum_prop_info(this->filter_graph[0]->graph,
+					index - 33, b, param);
+		}
+		return 0;
+	}
+	spa_pod_builder_push_object(b, &f[0], SPA_TYPE_OBJECT_PropInfo, id);
+	if (this->group_name[0]) {
+		spa_pod_builder_add(b,
+			SPA_PROP_INFO_group, SPA_POD_String(this->group_name),
+			0);
+	}
 	switch (index) {
 	case 0:
-		*param = spa_pod_builder_add_object(b,
-				SPA_TYPE_OBJECT_PropInfo, id,
-				SPA_PROP_INFO_id,   SPA_POD_Id(SPA_PROP_volume),
-				SPA_PROP_INFO_description, SPA_POD_String("Volume"),
-				SPA_PROP_INFO_type, SPA_POD_CHOICE_RANGE_Float(p->volume,
-					DEFAULT_MIN_VOLUME, DEFAULT_MAX_VOLUME));
+		spa_pod_builder_add(b,
+			SPA_PROP_INFO_id,   SPA_POD_Id(SPA_PROP_volume),
+			SPA_PROP_INFO_description, SPA_POD_String("Volume"),
+			SPA_PROP_INFO_type, SPA_POD_CHOICE_RANGE_Float(p->volume,
+				DEFAULT_MIN_VOLUME, DEFAULT_MAX_VOLUME),
+			0);
 		break;
 	case 1:
-		*param = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, id,
+		spa_pod_builder_add(b,
 			SPA_PROP_INFO_id,   SPA_POD_Id(SPA_PROP_mute),
 			SPA_PROP_INFO_description, SPA_POD_String("Mute"),
-			SPA_PROP_INFO_type, SPA_POD_CHOICE_Bool(p->channel.mute));
+			SPA_PROP_INFO_type, SPA_POD_CHOICE_Bool(p->channel.mute),
+			0);
 		break;
 	case 2:
-		*param = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, id,
+		spa_pod_builder_add(b,
 			SPA_PROP_INFO_id,   SPA_POD_Id(SPA_PROP_channelVolumes),
 			SPA_PROP_INFO_description, SPA_POD_String("Channel Volumes"),
 			SPA_PROP_INFO_type, SPA_POD_CHOICE_RANGE_Float(p->volume,
 				DEFAULT_MIN_VOLUME, DEFAULT_MAX_VOLUME),
-			SPA_PROP_INFO_container, SPA_POD_Id(SPA_TYPE_Array));
+			SPA_PROP_INFO_container, SPA_POD_Id(SPA_TYPE_Array),
+			0);
 		break;
 	case 3:
-		*param = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, id,
+		spa_pod_builder_add(b,
 			SPA_PROP_INFO_id,   SPA_POD_Id(SPA_PROP_channelMap),
 			SPA_PROP_INFO_description, SPA_POD_String("Channel Map"),
 			SPA_PROP_INFO_type, SPA_POD_Id(SPA_AUDIO_CHANNEL_UNKNOWN),
-			SPA_PROP_INFO_container, SPA_POD_Id(SPA_TYPE_Array));
+			SPA_PROP_INFO_container, SPA_POD_Id(SPA_TYPE_Array),
+			0);
 		break;
 	case 4:
-		*param = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, id,
+		spa_pod_builder_add(b,
 			SPA_PROP_INFO_id,   SPA_POD_Id(SPA_PROP_monitorMute),
 			SPA_PROP_INFO_description, SPA_POD_String("Monitor Mute"),
-			SPA_PROP_INFO_type, SPA_POD_CHOICE_Bool(p->monitor.mute));
+			SPA_PROP_INFO_type, SPA_POD_CHOICE_Bool(p->monitor.mute),
+			0);
 		break;
 	case 5:
-		*param = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, id,
+		spa_pod_builder_add(b,
 			SPA_PROP_INFO_id,   SPA_POD_Id(SPA_PROP_monitorVolumes),
 			SPA_PROP_INFO_description, SPA_POD_String("Monitor Volumes"),
 			SPA_PROP_INFO_type, SPA_POD_CHOICE_RANGE_Float(p->volume,
 				DEFAULT_MIN_VOLUME, DEFAULT_MAX_VOLUME),
-			SPA_PROP_INFO_container, SPA_POD_Id(SPA_TYPE_Array));
+			SPA_PROP_INFO_container, SPA_POD_Id(SPA_TYPE_Array),
+			0);
 		break;
 	case 6:
-		*param = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, id,
+		spa_pod_builder_add(b,
 			SPA_PROP_INFO_id,   SPA_POD_Id(SPA_PROP_softMute),
 			SPA_PROP_INFO_description, SPA_POD_String("Soft Mute"),
-			SPA_PROP_INFO_type, SPA_POD_CHOICE_Bool(p->soft.mute));
+			SPA_PROP_INFO_type, SPA_POD_CHOICE_Bool(p->soft.mute),
+			0);
 		break;
 	case 7:
-		*param = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, id,
+		spa_pod_builder_add(b,
 			SPA_PROP_INFO_id,   SPA_POD_Id(SPA_PROP_softVolumes),
 			SPA_PROP_INFO_description, SPA_POD_String("Soft Volumes"),
 			SPA_PROP_INFO_type, SPA_POD_CHOICE_RANGE_Float(p->volume,
 				DEFAULT_MIN_VOLUME, DEFAULT_MAX_VOLUME),
-			SPA_PROP_INFO_container, SPA_POD_Id(SPA_TYPE_Array));
+			SPA_PROP_INFO_container, SPA_POD_Id(SPA_TYPE_Array),
+			0);
 		break;
 	case 8:
-		*param = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, id,
+		spa_pod_builder_add(b,
 			SPA_PROP_INFO_name, SPA_POD_String("monitor.channel-volumes"),
 			SPA_PROP_INFO_description, SPA_POD_String("Monitor channel volume"),
 			SPA_PROP_INFO_type, SPA_POD_CHOICE_Bool(
 				this->monitor_channel_volumes),
-			SPA_PROP_INFO_params, SPA_POD_Bool(true));
+			SPA_PROP_INFO_params, SPA_POD_Bool(true),
+			0);
 		break;
 	case 9:
-		*param = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, id,
+		spa_pod_builder_add(b,
 			SPA_PROP_INFO_name, SPA_POD_String("channelmix.disable"),
 			SPA_PROP_INFO_description, SPA_POD_String("Disable Channel mixing"),
 			SPA_PROP_INFO_type, SPA_POD_CHOICE_Bool(p->mix_disabled),
-			SPA_PROP_INFO_params, SPA_POD_Bool(true));
+			SPA_PROP_INFO_params, SPA_POD_Bool(true),
+			0);
 		break;
 	case 10:
-		*param = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, id,
+		spa_pod_builder_add(b,
 			SPA_PROP_INFO_name, SPA_POD_String("channelmix.min-volume"),
 			SPA_PROP_INFO_description, SPA_POD_String("Minimum volume level"),
 			SPA_PROP_INFO_type, SPA_POD_CHOICE_RANGE_Float(p->min_volume,
 				DEFAULT_MIN_VOLUME, DEFAULT_MAX_VOLUME),
-			SPA_PROP_INFO_params, SPA_POD_Bool(true));
+			SPA_PROP_INFO_params, SPA_POD_Bool(true),
+			0);
 		break;
 	case 11:
-		*param = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, id,
+		spa_pod_builder_add(b,
 			SPA_PROP_INFO_name, SPA_POD_String("channelmix.max-volume"),
 			SPA_PROP_INFO_description, SPA_POD_String("Maximum volume level"),
 			SPA_PROP_INFO_type, SPA_POD_CHOICE_RANGE_Float(p->max_volume,
 				DEFAULT_MIN_VOLUME, DEFAULT_MAX_VOLUME),
-			SPA_PROP_INFO_params, SPA_POD_Bool(true));
+			SPA_PROP_INFO_params, SPA_POD_Bool(true),
+			0);
 		break;
 	case 12:
-		*param = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, id,
+		spa_pod_builder_add(b,
 			SPA_PROP_INFO_name, SPA_POD_String("channelmix.normalize"),
 			SPA_PROP_INFO_description, SPA_POD_String("Normalize Volumes"),
 			SPA_PROP_INFO_type, SPA_POD_CHOICE_Bool(
 				SPA_FLAG_IS_SET(this->mix.options, CHANNELMIX_OPTION_NORMALIZE)),
-			SPA_PROP_INFO_params, SPA_POD_Bool(true));
+			SPA_PROP_INFO_params, SPA_POD_Bool(true),
+			0);
 		break;
 	case 13:
-		*param = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, id,
+		spa_pod_builder_add(b,
 			SPA_PROP_INFO_name, SPA_POD_String("channelmix.mix-lfe"),
 			SPA_PROP_INFO_description, SPA_POD_String("Mix LFE into channels"),
 			SPA_PROP_INFO_type, SPA_POD_CHOICE_Bool(
 				SPA_FLAG_IS_SET(this->mix.options, CHANNELMIX_OPTION_MIX_LFE)),
-			SPA_PROP_INFO_params, SPA_POD_Bool(true));
+			SPA_PROP_INFO_params, SPA_POD_Bool(true),
+			0);
 		break;
 	case 14:
-		*param = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, id,
+		spa_pod_builder_add(b,
 			SPA_PROP_INFO_name, SPA_POD_String("channelmix.upmix"),
 			SPA_PROP_INFO_description, SPA_POD_String("Enable upmixing"),
 			SPA_PROP_INFO_type, SPA_POD_CHOICE_Bool(
 				SPA_FLAG_IS_SET(this->mix.options, CHANNELMIX_OPTION_UPMIX)),
-			SPA_PROP_INFO_params, SPA_POD_Bool(true));
+			SPA_PROP_INFO_params, SPA_POD_Bool(true),
+			0);
 		break;
 	case 15:
-		*param = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, id,
+		spa_pod_builder_add(b,
 			SPA_PROP_INFO_name, SPA_POD_String("channelmix.lfe-cutoff"),
 			SPA_PROP_INFO_description, SPA_POD_String("LFE cutoff frequency"),
 			SPA_PROP_INFO_type, SPA_POD_CHOICE_RANGE_Float(
 				this->mix.lfe_cutoff, 0.0, 1000.0),
-			SPA_PROP_INFO_params, SPA_POD_Bool(true));
+			SPA_PROP_INFO_params, SPA_POD_Bool(true),
+			0);
 		break;
 	case 16:
-		*param = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, id,
+		spa_pod_builder_add(b,
 			SPA_PROP_INFO_name, SPA_POD_String("channelmix.fc-cutoff"),
 			SPA_PROP_INFO_description, SPA_POD_String("FC cutoff frequency (Hz)"),
 			SPA_PROP_INFO_type, SPA_POD_CHOICE_RANGE_Float(
 				this->mix.fc_cutoff, 0.0, 48000.0),
-			SPA_PROP_INFO_params, SPA_POD_Bool(true));
+			SPA_PROP_INFO_params, SPA_POD_Bool(true),
+			0);
 		break;
 	case 17:
-		*param = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, id,
+		spa_pod_builder_add(b,
 			SPA_PROP_INFO_name, SPA_POD_String("channelmix.rear-delay"),
 			SPA_PROP_INFO_description, SPA_POD_String("Rear channels delay (ms)"),
 			SPA_PROP_INFO_type, SPA_POD_CHOICE_RANGE_Float(
 				this->mix.rear_delay, 0.0, 1000.0),
-			SPA_PROP_INFO_params, SPA_POD_Bool(true));
+			SPA_PROP_INFO_params, SPA_POD_Bool(true),
+			0);
 		break;
 	case 18:
-		*param = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, id,
+		spa_pod_builder_add(b,
 			SPA_PROP_INFO_name, SPA_POD_String("channelmix.stereo-widen"),
 			SPA_PROP_INFO_description, SPA_POD_String("Stereo widen"),
 			SPA_PROP_INFO_type, SPA_POD_CHOICE_RANGE_Float(
 				this->mix.widen, 0.0, 1.0),
-			SPA_PROP_INFO_params, SPA_POD_Bool(true));
+			SPA_PROP_INFO_params, SPA_POD_Bool(true),
+			0);
 		break;
 	case 19:
-		*param = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, id,
+		spa_pod_builder_add(b,
 			SPA_PROP_INFO_name, SPA_POD_String("channelmix.center-level"),
 			SPA_PROP_INFO_description, SPA_POD_String("Center up/downmix level"),
 			SPA_PROP_INFO_type, SPA_POD_CHOICE_RANGE_Float(
 				this->mix.center_level, 0.0, 10.0),
-			SPA_PROP_INFO_params, SPA_POD_Bool(true));
+			SPA_PROP_INFO_params, SPA_POD_Bool(true),
+			0);
 		break;
 	case 20:
-		*param = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, id,
+		spa_pod_builder_add(b,
 			SPA_PROP_INFO_name, SPA_POD_String("channelmix.surround-level"),
 			SPA_PROP_INFO_description, SPA_POD_String("Surround up/downmix level"),
 			SPA_PROP_INFO_type, SPA_POD_CHOICE_RANGE_Float(
 				this->mix.surround_level, 0.0, 10.0),
-			SPA_PROP_INFO_params, SPA_POD_Bool(true));
+			SPA_PROP_INFO_params, SPA_POD_Bool(true),
+			0);
 		break;
 	case 21:
-		*param = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, id,
+		spa_pod_builder_add(b,
 			SPA_PROP_INFO_name, SPA_POD_String("channelmix.lfe-level"),
 			SPA_PROP_INFO_description, SPA_POD_String("LFE up/downmix level"),
 			SPA_PROP_INFO_type, SPA_POD_CHOICE_RANGE_Float(
 				this->mix.lfe_level, 0.0, 10.0),
-			SPA_PROP_INFO_params, SPA_POD_Bool(true));
+			SPA_PROP_INFO_params, SPA_POD_Bool(true),
+			0);
 		break;
 
 	case 22:
-		*param = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, id,
+		spa_pod_builder_add(b,
 			SPA_PROP_INFO_name, SPA_POD_String("channelmix.hilbert-taps"),
 			SPA_PROP_INFO_description, SPA_POD_String("Taps for phase shift of rear"),
 			SPA_PROP_INFO_type, SPA_POD_CHOICE_RANGE_Int(
 				this->mix.hilbert_taps, 0, MAX_TAPS),
-			SPA_PROP_INFO_params, SPA_POD_Bool(true));
+			SPA_PROP_INFO_params, SPA_POD_Bool(true),
+			0);
 		break;
 	case 23:
-		spa_pod_builder_push_object(b, &f[0], SPA_TYPE_OBJECT_PropInfo, id);
 		spa_pod_builder_add(b,
 			SPA_PROP_INFO_name, SPA_POD_String("channelmix.upmix-method"),
 			SPA_PROP_INFO_description, SPA_POD_String("Upmix method to use"),
@@ -779,42 +815,40 @@ static int node_param_prop_info(struct impl *this, uint32_t id, uint32_t index,
 			spa_pod_builder_string(b, i->description);
 		}
 		spa_pod_builder_pop(b, &f[1]);
-		*param = spa_pod_builder_pop(b, &f[0]);
 		break;
 	case 24:
-		*param = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, id,
+		spa_pod_builder_add(b,
 			SPA_PROP_INFO_id, SPA_POD_Id(SPA_PROP_rate),
 			SPA_PROP_INFO_description, SPA_POD_String("Rate scaler"),
-			SPA_PROP_INFO_type, SPA_POD_CHOICE_RANGE_Double(p->rate, 0.0, 10.0));
+			SPA_PROP_INFO_type, SPA_POD_CHOICE_RANGE_Double(p->rate, 0.0, 10.0),
+			0);
 		break;
 	case 25:
-		*param = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, id,
+		spa_pod_builder_add(b,
 			SPA_PROP_INFO_id, SPA_POD_Id(SPA_PROP_quality),
 			SPA_PROP_INFO_name, SPA_POD_String("resample.quality"),
 			SPA_PROP_INFO_description, SPA_POD_String("Resample Quality"),
 			SPA_PROP_INFO_type, SPA_POD_CHOICE_RANGE_Int(p->resample_quality, 0, 14),
-			SPA_PROP_INFO_params, SPA_POD_Bool(true));
+			SPA_PROP_INFO_params, SPA_POD_Bool(true),
+			0);
 		break;
 	case 26:
-		*param = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, id,
+		spa_pod_builder_add(b,
 			SPA_PROP_INFO_name, SPA_POD_String("resample.disable"),
 			SPA_PROP_INFO_description, SPA_POD_String("Disable Resampling"),
 			SPA_PROP_INFO_type, SPA_POD_CHOICE_Bool(p->resample_disabled),
-			SPA_PROP_INFO_params, SPA_POD_Bool(true));
+			SPA_PROP_INFO_params, SPA_POD_Bool(true),
+			0);
 		break;
 	case 27:
-		*param = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, id,
+		spa_pod_builder_add(b,
 			SPA_PROP_INFO_name, SPA_POD_String("dither.noise"),
 			SPA_PROP_INFO_description, SPA_POD_String("Add noise bits"),
 			SPA_PROP_INFO_type, SPA_POD_CHOICE_RANGE_Int(this->dir[1].conv.noise_bits, 0, 16),
-			SPA_PROP_INFO_params, SPA_POD_Bool(true));
+			SPA_PROP_INFO_params, SPA_POD_Bool(true),
+			0);
 		break;
 	case 28:
-		spa_pod_builder_push_object(b, &f[0], SPA_TYPE_OBJECT_PropInfo, id);
 		spa_pod_builder_add(b,
 			SPA_PROP_INFO_name, SPA_POD_String("dither.method"),
 			SPA_PROP_INFO_description, SPA_POD_String("The dithering method"),
@@ -829,47 +863,41 @@ static int node_param_prop_info(struct impl *this, uint32_t id, uint32_t index,
 			spa_pod_builder_string(b, i->description);
 		}
 		spa_pod_builder_pop(b, &f[1]);
-		*param = spa_pod_builder_pop(b, &f[0]);
 		break;
 	case 29:
-		*param = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, id,
+		spa_pod_builder_add(b,
 			SPA_PROP_INFO_name, SPA_POD_String("debug.wav-path"),
 			SPA_PROP_INFO_description, SPA_POD_String("Path to WAV file"),
 			SPA_PROP_INFO_type, SPA_POD_String(p->wav_path),
-			SPA_PROP_INFO_params, SPA_POD_Bool(true));
+			SPA_PROP_INFO_params, SPA_POD_Bool(true),
+			0);
 		break;
 	case 30:
-		*param = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, id,
+		spa_pod_builder_add(b,
 			SPA_PROP_INFO_name, SPA_POD_String("channelmix.lock-volumes"),
 			SPA_PROP_INFO_description, SPA_POD_String("Disable volume updates"),
 			SPA_PROP_INFO_type, SPA_POD_CHOICE_Bool(p->lock_volumes),
-			SPA_PROP_INFO_params, SPA_POD_Bool(true));
+			SPA_PROP_INFO_params, SPA_POD_Bool(true),
+			0);
 		break;
 	case 31:
-		*param = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, id,
+		spa_pod_builder_add(b,
 			SPA_PROP_INFO_name, SPA_POD_String("audioconvert.filter-graph.disable"),
 			SPA_PROP_INFO_description, SPA_POD_String("Disable Filter graph updates"),
 			SPA_PROP_INFO_type, SPA_POD_CHOICE_Bool(p->filter_graph_disabled),
-			SPA_PROP_INFO_params, SPA_POD_Bool(true));
+			SPA_PROP_INFO_params, SPA_POD_Bool(true),
+			0);
 		break;
 	case 32:
-		*param = spa_pod_builder_add_object(b,
-			SPA_TYPE_OBJECT_PropInfo, id,
+		spa_pod_builder_add(b,
 			SPA_PROP_INFO_name, SPA_POD_String("audioconvert.filter-graph.N"),
 			SPA_PROP_INFO_description, SPA_POD_String("A filter graph to load"),
 			SPA_PROP_INFO_type, SPA_POD_String(""),
-			SPA_PROP_INFO_params, SPA_POD_Bool(true));
+			SPA_PROP_INFO_params, SPA_POD_Bool(true),
+			0);
 		break;
-	default:
-		if (this->filter_graph[0] && this->filter_graph[0]->graph) {
-			return spa_filter_graph_enum_prop_info(this->filter_graph[0]->graph,
-					index - 33, b, param);
-		}
-		return 0;
 	}
+	*param = spa_pod_builder_pop(b, &f[0]);
 	return 1;
 }
 
@@ -884,6 +912,11 @@ static int node_param_props(struct impl *this, uint32_t id, uint32_t index,
 	case 0:
 		spa_pod_builder_push_object(b, &f[0],
                                SPA_TYPE_OBJECT_Props, id);
+		if (this->group_name[0]) {
+			spa_pod_builder_add(b,
+				SPA_PROP_group, SPA_POD_String(this->group_name),
+				0);
+		}
 		spa_pod_builder_add(b,
 			SPA_PROP_volume,		SPA_POD_Float(p->volume),
 			SPA_PROP_mute,			SPA_POD_Bool(p->channel.mute),
@@ -905,6 +938,8 @@ static int node_param_props(struct impl *this, uint32_t id, uint32_t index,
 								SPA_TYPE_Float,
 								p->monitor.n_volumes,
 								p->monitor.volumes),
+			SPA_PROP_volumeMin,		SPA_POD_Float(p->min_volume),
+			SPA_PROP_volumeMax,		SPA_POD_Float(p->max_volume),
 			0);
 		spa_pod_builder_prop(b, SPA_PROP_params, 0);
 		spa_pod_builder_push_struct(b, &f[1]);
@@ -995,8 +1030,8 @@ static int impl_node_enum_params(void *object, int seq,
 {
 	struct impl *this = object;
 	struct spa_pod *param;
-	struct spa_pod_builder b = { 0 };
-	uint8_t buffer[16384];
+	struct spa_pod_dynamic_builder b;
+	uint8_t buffer[4096];
 	struct spa_result_node_params result;
 	uint32_t count = 0;
 	int res = 0;
@@ -1009,37 +1044,45 @@ static int impl_node_enum_params(void *object, int seq,
       next:
 	result.index = result.next++;
 
-	spa_pod_builder_init(&b, buffer, sizeof(buffer));
+	spa_pod_dynamic_builder_init(&b, buffer, sizeof(buffer), 4096);
 
 	param = NULL;
 	switch (id) {
 	case SPA_PARAM_EnumPortConfig:
-		res = node_param_enum_port_config(this, id, result.index, &param, &b);
+		res = node_param_enum_port_config(this, id, result.index, &param, &b.b);
 		break;
 	case SPA_PARAM_PortConfig:
-		res = node_param_port_config(this, id, result.index, &param, &b);
+		res = node_param_port_config(this, id, result.index, &param, &b.b);
 		break;
 	case SPA_PARAM_PropInfo:
-		res = node_param_prop_info(this, id, result.index, &param, &b);
+		res = node_param_prop_info(this, id, result.index, &param, &b.b);
 		break;
 	case SPA_PARAM_Props:
-		res = node_param_props(this, id, result.index, &param, &b);
+		res = node_param_props(this, id, result.index, &param, &b.b);
 		break;
 	default:
-		return 0;
+		res = 0;
+		break;
 	}
 	if (res <= 0)
-		return res;
+		goto done;
 
-	if (param == NULL || spa_pod_filter(&b, &result.param, param, filter) < 0)
+	if (param == NULL || spa_pod_filter(&b.b, &result.param, param, filter) < 0) {
+		spa_pod_dynamic_builder_clean(&b);
 		goto next;
+	}
 
 	spa_node_emit_result(&this->hooks, seq, 0, SPA_RESULT_TYPE_NODE_PARAMS, &result);
+
+	spa_pod_dynamic_builder_clean(&b);
 
 	if (++count != num)
 		goto next;
 
 	return 0;
+done:
+	spa_pod_dynamic_builder_clean(&b);
+	return res;
 }
 
 static int impl_node_set_io(void *object, uint32_t id, void *data, size_t size)
@@ -1062,8 +1105,7 @@ static int impl_node_set_io(void *object, uint32_t id, void *data, size_t size)
 		this->io_position = data;
 
 		if (this->io_position && this->io_clock &&
-		    this->io_position->clock.target_rate.denom != this->io_clock->target_rate.denom &&
-		    !this->props.resample_disabled) {
+		    this->io_position->clock.target_rate.denom != this->io_clock->target_rate.denom) {
 			spa_log_debug(this->log, "driver %d changed rate:%u -> %u", this->io_position->clock.id,
 					this->io_clock->target_rate.denom,
 					this->io_position->clock.target_rate.denom);
@@ -1193,7 +1235,7 @@ static void graph_info(void *object, const struct spa_filter_graph_info *info)
 	emit_info(g->impl, false);
 }
 
-static int apply_props(struct impl *impl, const struct spa_pod *props);
+static int apply_props(struct impl *impl, const struct spa_pod *props, const void *props_body);
 
 static void graph_apply_props(void *object, enum spa_direction direction, const struct spa_pod *props)
 {
@@ -1201,7 +1243,7 @@ static void graph_apply_props(void *object, enum spa_direction direction, const 
 	struct impl *impl = g->impl;
 	if (g->removing)
 		return;
-	apply_props(impl, props);
+	apply_props(impl, props, SPA_POD_BODY(props));
 
 	emit_info(impl, false);
 }
@@ -1252,6 +1294,12 @@ static int setup_filter_graph(struct impl *this, struct filter_graph *g,
 					     SPA_DICT_ITEM("filter-graph.n_inputs", channels ? in_ports : NULL)));
 
 	g->setup = res >= 0;
+	if (g->setup) {
+		spa_filter_graph_set_io(g->graph, SPA_TYPE_INFO_IO_BASE "Position",
+				this->io_position, sizeof(struct spa_io_position));
+		spa_filter_graph_set_io(g->graph, SPA_TYPE_INFO_IO_BASE "Latency",
+				&this->io_latency, sizeof(this->io_latency));
+	}
 
 	return res;
 }
@@ -1338,44 +1386,6 @@ static int ensure_tmp(struct impl *this)
 	return 0;
 }
 
-
-static int setup_filter_graphs(struct impl *impl, bool force)
-{
-	int res;
-	uint32_t channels, *position;
-	struct dir *in, *out;
-	struct filter_graph *g, *t;
-
-	in = &impl->dir[SPA_DIRECTION_INPUT];
-	out = &impl->dir[SPA_DIRECTION_OUTPUT];
-
-	channels = in->format.info.raw.channels;
-	position = in->format.info.raw.position;
-	impl->maxports = SPA_MAX(in->format.info.raw.channels, out->format.info.raw.channels);
-
-	spa_list_for_each_safe(g, t, &impl->active_graphs, link) {
-		if (g->removing)
-			continue;
-		if (force)
-			g->setup = false;
-		if ((res = setup_filter_graph(impl, g, channels, position)) < 0) {
-			g->removing = true;
-			spa_log_warn(impl->log, "failed to activate graph %d: %s", g->order,
-					spa_strerror(res));
-		} else {
-			channels = g->n_outputs;
-			position = g->outputs_position;
-			impl->maxports = SPA_MAX(impl->maxports, channels);
-		}
-	}
-	if ((res = ensure_tmp(impl)) < 0)
-		return res;
-	if ((res = setup_channelmix(impl, channels, position)) < 0)
-		return res;
-
-	return 0;
-}
-
 static int do_sync_filter_graph(struct spa_loop *loop, bool async, uint32_t seq,
 		const void *data, size_t size, void *user_data)
 {
@@ -1399,12 +1409,77 @@ static void sync_filter_graph(struct impl *impl)
 		do_sync_filter_graph(NULL, false, 0, NULL, 0, impl);
 }
 
+/* Pull graphs that the data-loop must not run anymore out of its view (under
+ * the loop lock, via sync_filter_graph). A forced unpublish also drops graphs
+ * that are about to be deactivated and re-instantiated, which frees and
+ * recreates the underlying plugin handles, so the RT thread cannot run a graph
+ * while its handles are NULL. They are republished by the sync_filter_graph()
+ * that follows setup. */
+static void unpublish_filter_graphs(struct impl *impl, bool force)
+{
+	struct filter_graph *g;
+	bool sync = false;
+
+	spa_list_for_each(g, &impl->active_graphs, link) {
+		if (force && !g->removing)
+			g->setup = false;
+		if (g->removing || !g->setup)
+			sync = true;
+	}
+	if (sync)
+		sync_filter_graph(impl);
+}
+
+static int setup_filter_graphs(struct impl *impl, bool force)
+{
+	int res;
+	uint32_t channels, *position;
+	struct dir *in, *out;
+	struct filter_graph *g, *t;
+
+	in = &impl->dir[SPA_DIRECTION_INPUT];
+	out = &impl->dir[SPA_DIRECTION_OUTPUT];
+
+	channels = in->format.info.raw.channels;
+	position = in->format.info.raw.position;
+	impl->maxports = SPA_MAX(in->format.info.raw.channels, out->format.info.raw.channels);
+
+	/* Only a forced setup rebuilds the graphs. Without it the currently
+	 * published graphs stay valid and must keep running until the new ones
+	 * are activated, so that the sync_filter_graph() after setup swaps them
+	 * in without a gap. */
+	if (force)
+		unpublish_filter_graphs(impl, true);
+
+	spa_list_for_each_safe(g, t, &impl->active_graphs, link) {
+		if (g->removing)
+			continue;
+		if ((res = setup_filter_graph(impl, g, channels, position)) < 0) {
+			g->removing = true;
+			spa_log_warn(impl->log, "failed to activate graph %d: %s", g->order,
+					spa_strerror(res));
+		} else {
+			channels = g->n_outputs;
+			position = g->outputs_position;
+			impl->maxports = SPA_MAX(impl->maxports, channels);
+		}
+	}
+	if ((res = ensure_tmp(impl)) < 0)
+		return res;
+	if ((res = setup_channelmix(impl, channels, position)) < 0)
+		return res;
+
+	return 0;
+}
+
 static void clean_filter_handles(struct impl *impl, bool force)
 {
 	struct filter_graph *g, *t;
 
+	unpublish_filter_graphs(impl, force);
+
 	spa_list_for_each_safe(g, t, &impl->active_graphs, link) {
-		if (!g->removing)
+		if (!g->removing && !force)
 			continue;
 		spa_list_remove(&g->link);
 		if (g->graph)
@@ -1450,13 +1525,16 @@ static int load_filter_graph(struct impl *impl, const char *graph, int order)
 	pending->order = order;
 	pending->removing = false;
 
+	/* free the stored descriptor before we walk matching active graphs */
+	free(impl->graph_descs[order]);
+	impl->graph_descs[order] = NULL;
+
 	/* move active graphs with same order to inactive list */
 	spa_list_for_each_safe(g, t, &impl->active_graphs, link) {
 		if (g->order == order) {
 			g->removing = true;
 			spa_log_info(impl->log, "removing filter-graph order:%d", order);
 		}
-		free(impl->graph_descs[order]);
 	}
 
 	if (graph != NULL && graph[0] != '\0') {
@@ -1466,6 +1544,7 @@ static int load_filter_graph(struct impl *impl, const char *graph, int order)
 				&SPA_DICT_ITEMS(
 					SPA_DICT_ITEM(SPA_KEY_LIBRARY_NAME, "filter-graph/libspa-filter-graph"),
 					SPA_DICT_ITEM("clock.quantum-limit", qlimit),
+					SPA_DICT_ITEM("library.filter-path", "true"),
 					SPA_DICT_ITEM("filter.graph", graph)));
 		if (new_handle == NULL)
 			goto error;
@@ -1575,53 +1654,57 @@ static int audioconvert_set_param(struct impl *this, const char *k, const char *
 					order, spa_strerror(res));
 		}
 	}
+	else if (spa_streq(k, "fade.gap"))
+		spa_atou32(s, &this->gaps.gap, 0);
+	else if (spa_streq(k, "fade.duration"))
+		spa_atof(s, &this->props.fade_duration);
 	else
 		return 0;
 	return 1;
 }
 
-static int parse_prop_params(struct impl *this, struct spa_pod *params)
+static int parse_prop_params(struct impl *this, struct spa_pod *params, const void *params_body)
 {
 	struct spa_pod_parser prs;
 	struct spa_pod_frame f;
 	int changed = 0;
 	bool filter_graph_disabled = this->props.filter_graph_disabled;
 
-	spa_pod_parser_pod(&prs, params);
+	spa_pod_parser_init_pod_body(&prs, params, params_body);
 	if (spa_pod_parser_push_struct(&prs, &f) < 0)
 		return 0;
 
 	while (true) {
-		const char *name;
-		struct spa_pod *pod;
-		char value[4096];
+		const char *name, *value;
+		struct spa_pod pod;
+		char buffer[64];
+		const void *body;
 
 		if (spa_pod_parser_get_string(&prs, &name) < 0)
 			break;
 
-		if (spa_pod_parser_get_pod(&prs, &pod) < 0)
+		if (spa_pod_parser_get_pod_body(&prs, &pod, &body) < 0)
 			break;
 
-		if (spa_pod_is_string(pod)) {
-			spa_pod_copy_string(pod, sizeof(value), value);
-		} else if (spa_pod_is_float(pod)) {
-			spa_dtoa(value, sizeof(value),
-					SPA_POD_VALUE(struct spa_pod_float, pod));
-		} else if (spa_pod_is_double(pod)) {
-			spa_dtoa(value, sizeof(value),
-					SPA_POD_VALUE(struct spa_pod_double, pod));
-		} else if (spa_pod_is_int(pod)) {
-			snprintf(value, sizeof(value), "%d",
-					SPA_POD_VALUE(struct spa_pod_int, pod));
-		} else if (spa_pod_is_long(pod)) {
-			snprintf(value, sizeof(value), "%"PRIi64,
-					SPA_POD_VALUE(struct spa_pod_long, pod));
-		} else if (spa_pod_is_bool(pod)) {
-			snprintf(value, sizeof(value), "%s",
-					SPA_POD_VALUE(struct spa_pod_bool, pod) ?
-					"true" : "false");
-		} else if (spa_pod_is_none(pod)) {
-			spa_zero(value);
+		if (spa_pod_is_string(&pod)) {
+			if (spa_pod_body_get_string(&pod, body, &value) < 0)
+				continue;
+		} else if (spa_pod_is_float(&pod)) {
+			spa_dtoa(buffer, sizeof(buffer), *(float*)body);
+			value = buffer;
+		} else if (spa_pod_is_double(&pod)) {
+			spa_dtoa(buffer, sizeof(buffer), *(double*)body);
+			value = buffer;
+		} else if (spa_pod_is_int(&pod)) {
+			snprintf(buffer, sizeof(buffer), "%d", *(int32_t*)body);
+			value = buffer;
+		} else if (spa_pod_is_long(&pod)) {
+			snprintf(buffer, sizeof(buffer), "%"PRIi64, *(int64_t*)body);
+			value = buffer;
+		} else if (spa_pod_is_bool(&pod)) {
+			value = (*(int32_t*)body) ? "true" : "false";
+		} else if (spa_pod_is_none(&pod)) {
+			value = "";
 		} else
 			continue;
 
@@ -1631,7 +1714,7 @@ static int parse_prop_params(struct impl *this, struct spa_pod *params)
 	if (changed) {
 		this->props.filter_graph_disabled = filter_graph_disabled;
 		if (this->setup)
-			channelmix_init(&this->mix);
+			channelmix_reconfigure(&this->mix);
 	}
 	return changed;
 }
@@ -1715,22 +1798,22 @@ static struct spa_pod *generate_ramp_seq(struct impl *this, struct volume_ramp_p
 static void generate_volume_ramp(struct impl *this, struct volume_ramp_params *vrp,
 		void *buffer, size_t size)
 {
-	void *sequence;
+	struct spa_pod *sequence;
 
 	sequence = generate_ramp_seq(this, vrp, buffer, size);
-	if (!sequence)
+	if (!sequence) {
 		spa_log_error(this->log, "unable to generate sequence");
-
-	this->vol_ramp_sequence = (struct spa_pod_sequence *) sequence;
-	this->vol_ramp_sequence_data = (void*)sequence == buffer ? NULL : sequence;
-	this->vol_ramp_offset = 0;
+	} else {
+		this->vol_ramp_seq = *sequence;
+		this->vol_ramp_seq_body = SPA_POD_BODY_CONST(sequence);
+		this->vol_ramp_sequence_data = sequence == buffer ? NULL : sequence;
+		this->vol_ramp_offset = 0;
+	}
 	this->recalc = true;
 }
 
-static int apply_props(struct impl *this, const struct spa_pod *param)
+static int apply_props(struct impl *this, const struct spa_pod *param, const void *param_body)
 {
-	struct spa_pod_prop *prop;
-	struct spa_pod_object *obj = (struct spa_pod_object *) param;
 	struct props *p = &this->props;
 	bool have_channel_volume = false;
 	bool have_soft_volume = false;
@@ -1740,93 +1823,101 @@ static int apply_props(struct impl *this, const struct spa_pod *param)
 	uint32_t n;
 	int32_t value;
 	uint32_t id;
+	struct spa_pod_parser parser;
+	struct spa_pod_frame frame;
+	struct spa_pod_prop prop;
+	const void *prop_body;
+
+	spa_pod_parser_init_pod_body(&parser, param, param_body);
+	if (spa_pod_parser_push_object(&parser, &frame, SPA_TYPE_OBJECT_Props, NULL) < 0)
+		return -EINVAL;
 
 	spa_zero(vrp);
 
-	SPA_POD_OBJECT_FOREACH(obj, prop) {
-		switch (prop->key) {
+	while (spa_pod_parser_get_prop_body(&parser, &prop, &prop_body) >= 0) {
+		switch (prop.key) {
 		case SPA_PROP_volume:
 			p->prev_volume = p->volume;
 
 			if (!p->lock_volumes &&
-			    spa_pod_get_float(&prop->value, &p->volume) == 0) {
+			    spa_pod_body_get_float(&prop.value, prop_body, &p->volume) == 0) {
 				spa_log_debug(this->log, "%p new volume %f", this, p->volume);
 				changed++;
 			}
 			break;
 		case SPA_PROP_mute:
 			if (!p->lock_volumes &&
-			    spa_pod_get_bool(&prop->value, &p->channel.mute) == 0) {
+			    spa_pod_body_get_bool(&prop.value, prop_body, &p->channel.mute) == 0) {
 				have_channel_volume = true;
 				changed++;
 			}
 			break;
 		case SPA_PROP_volumeRampSamples:
-			if (this->vol_ramp_sequence) {
+			if (this->vol_ramp_seq_body) {
 				spa_log_error(this->log, "%p volume ramp sequence is being "
 						"applied try again", this);
 				break;
 			}
 
-			if (spa_pod_get_int(&prop->value, &value) == 0 && value) {
+			if (spa_pod_body_get_int(&prop.value, prop_body, &value) == 0 && value) {
 				vrp.volume_ramp_samples = value;
 				spa_log_info(this->log, "%p volume ramp samples %d", this, value);
 				vol_ramp_params_changed++;
 			}
 			break;
 		case SPA_PROP_volumeRampStepSamples:
-			if (this->vol_ramp_sequence) {
+			if (this->vol_ramp_seq_body) {
 				spa_log_error(this->log, "%p volume ramp sequence is being "
 						"applied try again", this);
 				break;
 			}
 
-			if (spa_pod_get_int(&prop->value, &value) == 0 && value) {
+			if (spa_pod_body_get_int(&prop.value, prop_body, &value) == 0 && value) {
 				vrp.volume_ramp_step_samples = value;
 				spa_log_info(this->log, "%p volume ramp step samples is %d",
 						this, value);
 			}
 			break;
 		case SPA_PROP_volumeRampTime:
-			if (this->vol_ramp_sequence) {
+			if (this->vol_ramp_seq_body) {
 				spa_log_error(this->log, "%p volume ramp sequence is being "
 						"applied try again", this);
 				break;
 			}
 
-			if (spa_pod_get_int(&prop->value, &value) == 0 && value) {
+			if (spa_pod_body_get_int(&prop.value, prop_body, &value) == 0 && value) {
 				vrp.volume_ramp_time = value;
 				spa_log_info(this->log, "%p volume ramp time %d", this, value);
 				vol_ramp_params_changed++;
 			}
 			break;
 		case SPA_PROP_volumeRampStepTime:
-			if (this->vol_ramp_sequence) {
+			if (this->vol_ramp_seq_body) {
 				spa_log_error(this->log, "%p volume ramp sequence is being "
 						"applied try again", this);
 				break;
 			}
 
-			if (spa_pod_get_int(&prop->value, &value) == 0 && value) {
+			if (spa_pod_body_get_int(&prop.value, prop_body, &value) == 0 && value) {
 				vrp.volume_ramp_step_time = value;
 				spa_log_info(this->log, "%p volume ramp time %d", this, value);
 			}
 			break;
 		case SPA_PROP_volumeRampScale:
-			if (this->vol_ramp_sequence) {
+			if (this->vol_ramp_seq_body) {
 				spa_log_error(this->log, "%p volume ramp sequence is being "
 						"applied try again", this);
 				break;
 			}
 
-			if (spa_pod_get_id(&prop->value, &id) == 0 && id) {
+			if (spa_pod_body_get_id(&prop.value, prop_body, &id) == 0 && id) {
 				vrp.scale = id;
 				spa_log_info(this->log, "%p volume ramp scale %d", this, id);
 			}
 			break;
 		case SPA_PROP_channelVolumes:
 			if (!p->lock_volumes &&
-			    (n = spa_pod_copy_array(&prop->value, SPA_TYPE_Float,
+			    (n = spa_pod_body_copy_array(&prop.value, prop_body, SPA_TYPE_Float, sizeof(float),
 					p->channel.volumes, SPA_N_ELEMENTS(p->channel.volumes))) > 0) {
 				have_channel_volume = true;
 				p->channel.n_volumes = n;
@@ -1834,7 +1925,7 @@ static int apply_props(struct impl *this, const struct spa_pod *param)
 			}
 			break;
 		case SPA_PROP_channelMap:
-			if ((n = spa_pod_copy_array(&prop->value, SPA_TYPE_Id,
+			if ((n = spa_pod_body_copy_array(&prop.value, prop_body, SPA_TYPE_Id, sizeof(uint32_t),
 					p->channel_map, SPA_N_ELEMENTS(p->channel_map))) > 0) {
 				p->n_channels = n;
 				changed++;
@@ -1842,33 +1933,47 @@ static int apply_props(struct impl *this, const struct spa_pod *param)
 			break;
 		case SPA_PROP_softMute:
 			if (!p->lock_volumes &&
-			    spa_pod_get_bool(&prop->value, &p->soft.mute) == 0) {
+			    spa_pod_body_get_bool(&prop.value, prop_body, &p->soft.mute) == 0) {
 				have_soft_volume = true;
 				changed++;
 			}
 			break;
 		case SPA_PROP_softVolumes:
 			if (!p->lock_volumes &&
-			    (n = spa_pod_copy_array(&prop->value, SPA_TYPE_Float,
-					p->soft.volumes, SPA_N_ELEMENTS(p->soft.volumes))) > 0) {
+			    (n = spa_pod_body_copy_array(&prop.value, prop_body, SPA_TYPE_Float,
+					 sizeof(float), p->soft.volumes, SPA_N_ELEMENTS(p->soft.volumes))) > 0) {
 				have_soft_volume = true;
 				p->soft.n_volumes = n;
 				changed++;
 			}
 			break;
 		case SPA_PROP_monitorMute:
-			if (spa_pod_get_bool(&prop->value, &p->monitor.mute) == 0)
+			if (spa_pod_body_get_bool(&prop.value, prop_body, &p->monitor.mute) == 0)
 				changed++;
 			break;
 		case SPA_PROP_monitorVolumes:
-			if ((n = spa_pod_copy_array(&prop->value, SPA_TYPE_Float,
+			if ((n = spa_pod_body_copy_array(&prop.value, prop_body, SPA_TYPE_Float, sizeof(float),
 					p->monitor.volumes, SPA_N_ELEMENTS(p->monitor.volumes))) > 0) {
 				p->monitor.n_volumes = n;
 				changed++;
 			}
 			break;
+		case SPA_PROP_volumeMin:
+			if (!p->lock_volumes &&
+			    spa_pod_body_get_float(&prop.value, prop_body, &p->min_volume) == 0) {
+				spa_log_debug(this->log, "%p new min-volume %f", this, p->min_volume);
+				changed++;
+			}
+			break;
+		case SPA_PROP_volumeMax:
+			if (!p->lock_volumes &&
+			    spa_pod_body_get_float(&prop.value, prop_body, &p->max_volume) == 0) {
+				spa_log_debug(this->log, "%p new max-volume %f", this, p->min_volume);
+				changed++;
+			}
+			break;
 		case SPA_PROP_rate:
-			if (spa_pod_get_double(&prop->value, &p->rate) == 0 &&
+			if (spa_pod_body_get_double(&prop.value, prop_body, &p->rate) == 0 &&
 			    !this->rate_adjust && p->rate != 1.0) {
 				this->rate_adjust = true;
 				spa_log_info(this->log, "%p: activating adaptive resampler",
@@ -1877,7 +1982,7 @@ static int apply_props(struct impl *this, const struct spa_pod *param)
 			break;
 		case SPA_PROP_params:
 			if (this->filter_props_count == 0)
-				changed += parse_prop_params(this, &prop->value);
+				changed += parse_prop_params(this, &prop.value, prop_body);
 			break;
 		default:
 			break;
@@ -1907,16 +2012,26 @@ static int apply_props(struct impl *this, const struct spa_pod *param)
 	return changed;
 }
 
-static int apply_midi(struct impl *this, const struct spa_pod *value)
+static int apply_midi(struct impl *this, uint32_t type, const struct spa_pod *value, const void *value_body)
 {
 	struct props *p = &this->props;
-	uint8_t ev[8];
+	uint8_t evd[8];
+	const uint8_t *ev;
 	int ev_size;
-	const uint32_t *body = SPA_POD_BODY_CONST(value);
 	size_t size = SPA_POD_BODY_SIZE(value);
 	uint64_t state = 0;
 
-	ev_size = spa_ump_to_midi(&body, &size, ev, sizeof(ev), &state);
+	if (!spa_pod_is_bytes(value))
+		return -EINVAL;
+
+	if (type == SPA_CONTROL_UMP) {
+		const uint32_t *body = value_body;
+		ev_size = spa_ump_to_midi(&body, &size, evd, sizeof(evd), &state);
+		ev = evd;
+	} else {
+		ev_size = size;
+		ev = value_body;
+	}
 	if (ev_size < 3)
 		return -EINVAL;
 
@@ -2014,6 +2129,7 @@ static int node_set_param_port_config(struct impl *this, uint32_t flags,
 {
 	struct spa_audio_info info = { 0, }, *infop = NULL;
 	struct spa_pod *format = NULL;
+	const char *group = NULL;
 	enum spa_direction direction;
 	enum spa_param_port_config_mode mode;
 	bool monitor = false, control = false;
@@ -2028,8 +2144,12 @@ static int node_set_param_port_config(struct impl *this, uint32_t flags,
 			SPA_PARAM_PORT_CONFIG_mode,		SPA_POD_Id(&mode),
 			SPA_PARAM_PORT_CONFIG_monitor,		SPA_POD_OPT_Bool(&monitor),
 			SPA_PARAM_PORT_CONFIG_control,		SPA_POD_OPT_Bool(&control),
-			SPA_PARAM_PORT_CONFIG_format,		SPA_POD_OPT_Pod(&format)) < 0)
+			SPA_PARAM_PORT_CONFIG_format,		SPA_POD_OPT_Pod(&format),
+			SPA_PARAM_PORT_CONFIG_group,		SPA_POD_OPT_String(&group)) < 0)
 		return -EINVAL;
+
+	if (group != NULL && this->group_name[0] && !spa_streq(group, this->group_name))
+		return -ENOENT;
 
 	if (format) {
 		if (!spa_pod_is_object_type(format, SPA_TYPE_OBJECT_Format))
@@ -2062,7 +2182,8 @@ static int node_set_param_props(struct impl *this, uint32_t flags,
 
 	if (param == NULL)
 		return 0;
-
+	if (!spa_pod_is_object_type(param, SPA_TYPE_OBJECT_Props))
+		return -EINVAL;
 	this->filter_props_count = 0;
 
 	spa_list_for_each_safe(g, t, &this->active_graphs, link) {
@@ -2076,7 +2197,7 @@ static int node_set_param_props(struct impl *this, uint32_t flags,
 		this->in_filter_props--;
 	}
 	if (!have_graph)
-		apply_props(this, param);
+		apply_props(this, param, SPA_POD_BODY(param));
 
 	clean_filter_handles(this, false);
 	return 0;
@@ -2170,11 +2291,31 @@ static int setup_in_convert(struct impl *this)
 	if ((res = convert_init(&in->conv)) < 0)
 		return res;
 
-	spa_log_debug(this->log, "%p: got converter features %08x:%08x passthrough:%d remap:%d %s", this,
-			this->cpu_flags, in->conv.func_cpu_flags, in->conv.is_passthrough,
+	spa_log_debug(this->log, "%p: got converter features %08x:%08x flags:%08x remap:%d %s", this,
+			this->cpu_flags, in->conv.func_cpu_flags, in->conv.flags,
 			remap, in->conv.func_name);
 
 	return 0;
+}
+
+static int setup_gaps(struct impl *this)
+{
+	struct dir *in = &this->dir[SPA_DIRECTION_INPUT];
+	int res;
+
+	if (this->gaps.free)
+		gaps_free(&this->gaps);
+
+	this->gaps.channels = in->format.info.raw.channels;
+	this->gaps.log = this->log;
+	this->gaps.cpu_flags = this->cpu_flags;
+	this->gaps.duration = (uint32_t)(this->props.fade_duration * in->format.info.raw.rate);
+	res = gaps_init(&this->gaps);
+
+	spa_log_debug(this->log, "%p: got gaps %d features %08x:%08x %s",
+			this, res, this->cpu_flags, this->gaps.cpu_flags,
+			this->gaps.func_name);
+	return res;
 }
 
 static void fix_volumes(struct impl *this, struct volumes *vols, uint32_t channels)
@@ -2266,10 +2407,12 @@ static void set_volume(struct impl *this)
 
 static char *format_position(char *str, size_t len, uint32_t channels, uint32_t *position)
 {
-	uint32_t i, idx = 0;
+	uint32_t i;
 	char buf[8];
+	struct spa_strbuf b;
+	spa_strbuf_init(&b, str, len);
 	for (i = 0; i < channels; i++)
-		idx += snprintf(str + idx, len - idx, "%s%s", i == 0 ? "" : " ",
+		spa_strbuf_append(&b, "%s%s", i == 0 ? "" : " ",
 				spa_type_audio_channel_make_short_name(position[i],
 				buf, sizeof(buf), "UNK"));
 	return str;
@@ -2313,6 +2456,9 @@ static int setup_channelmix(struct impl *this, uint32_t channels, uint32_t *posi
 	if (this->props.mix_disabled &&
 	    (src_chan != dst_chan || src_mask != dst_mask))
 		return -EPERM;
+
+	if (this->mix.free)
+		channelmix_free(&this->mix);
 
 	this->mix.src_chan = src_chan;
 	this->mix.src_mask = src_mask;
@@ -2467,9 +2613,9 @@ static int setup_out_convert(struct impl *this)
 		return res;
 
 	spa_log_debug(this->log, "%p: got converter features %08x:%08x quant:%d:%d"
-			" passthrough:%d remap:%d %s", this,
+			" flags:%08x remap:%d %s", this,
 			this->cpu_flags, out->conv.func_cpu_flags, out->conv.method,
-			out->conv.noise_bits, out->conv.is_passthrough, remap, out->conv.func_name);
+			out->conv.noise_bits, out->conv.flags, remap, out->conv.func_name);
 
 	return 0;
 }
@@ -2585,6 +2731,8 @@ static int setup_convert(struct impl *this)
 
 	if ((res = setup_in_convert(this)) < 0)
 		return res;
+	if ((res = setup_gaps(this)) < 0)
+		return res;
 	if ((res = setup_filter_graphs(this, true)) < 0)
 		return res;
 	if ((res = setup_resample(this)) < 0)
@@ -2617,6 +2765,10 @@ static int setup_convert(struct impl *this)
 static void reset_node(struct impl *this)
 {
 	struct filter_graph *g;
+
+	/* deactivating a graph tears down its plugin instances, so take the
+	 * graphs out of the data-loop's view first */
+	unpublish_filter_graphs(this, true);
 
 	spa_list_for_each(g, &this->active_graphs, link) {
 		if (g->graph)
@@ -2657,6 +2809,9 @@ static int impl_node_send_command(void *object, const struct spa_command *comman
 		break;
 	case SPA_NODE_COMMAND_Flush:
 		reset_node(this);
+		break;
+	case SPA_NODE_COMMAND_ParamBegin:
+	case SPA_NODE_COMMAND_ParamEnd:
 		break;
 	default:
 		return -ENOTSUP;
@@ -2996,6 +3151,8 @@ static int clear_buffers(struct impl *this, struct port *port)
 			SPA_FLAG_CLEAR(b->flags, BUFFER_FLAG_MAPPED);
 		}
 	}
+	free(port->buffers);
+	port->buffers = NULL;
 	port->n_buffers = 0;
 	spa_list_init(&port->queue);
 	return 0;
@@ -3017,6 +3174,9 @@ static int port_set_latency(void *object,
 			this, direction, port_id, latency);
 
 	port = GET_PORT(this, direction, port_id);
+	if (port == NULL)
+		return -EINVAL;
+
 	if (latency == NULL) {
 		info = SPA_LATENCY_INFO(other);
 		have_latency = false;
@@ -3045,8 +3205,8 @@ static int port_set_latency(void *object,
 
 		if (oport != NULL)
 			port_update_latency(oport, &info, have_latency);
-	}
-	recalc_latencies(this, direction);
+	} else
+		recalc_latencies(this, direction);
 	return 0;
 }
 
@@ -3296,6 +3456,21 @@ impl_node_port_use_buffers(void *object,
 
 	maxsize = this->quantum_limit * sizeof(float);
 
+	if (n_buffers > 0) {
+		void **datas;
+		size_t buffers_size = n_buffers * sizeof(struct buffer);
+
+		port->buffers = calloc(1, buffers_size +
+				n_buffers * port->blocks * sizeof(void*));
+		if (port->buffers == NULL) {
+			res = -errno;
+			goto error;
+		}
+		datas = SPA_PTROFF(port->buffers, buffers_size, void*);
+		for (i = 0; i < n_buffers; i++)
+			port->buffers[i].datas = &datas[i * port->blocks];
+	}
+
 	for (i = 0; i < n_buffers; i++) {
 		struct buffer *b;
 		uint32_t n_datas = buffers[i]->n_datas;
@@ -3314,7 +3489,8 @@ impl_node_port_use_buffers(void *object,
 		if (n_datas != port->blocks) {
 			spa_log_error(this->log, "%p: invalid blocks %d on buffer %d",
 					this, n_datas, i);
-			return -EINVAL;
+			res = -EINVAL;
+			goto error;
 		}
 
 		for (j = 0; j < n_datas; j++) {
@@ -3346,7 +3522,6 @@ impl_node_port_use_buffers(void *object,
 				spa_log_warn(this->log, "%p: memory %d on buffer %d not aligned",
 						this, j, i);
 			}
-
 			b->datas[j] = data;
 
 			maxsize = SPA_MAX(maxsize, d[j].maxsize);
@@ -3364,15 +3539,46 @@ error:
 }
 
 struct io_data {
+	struct impl *impl;
 	struct port *port;
 	void *data;
 	size_t size;
 };
 
+static void capture_state(struct impl *impl, struct port *port)
+{
+	struct gaps_state *gs = port->id < SPA_AUDIO_MAX_CHANNELS ? impl->gaps.states[port->id] : NULL;
+
+	if (gs != NULL && port->is_dsp && port->last_buffer < port->n_buffers) {
+		struct buffer *buf = &port->buffers[port->last_buffer];
+		uint32_t offs, size;
+		float *s;
+		struct spa_data *bd = &buf->buf->datas[0];
+
+		offs = SPA_MIN(bd->chunk->offset, bd->maxsize);
+		size = SPA_MIN(bd->maxsize - offs, bd->chunk->size);
+		s = SPA_PTROFF(bd->data, offs, float);
+		size /= sizeof(float);
+
+		spa_history_push(&gs->hist, s, size);
+
+		port->ramp_start = true;
+		port->last_buffer = SPA_ID_INVALID;
+	}
+}
+
 static int do_set_port_io(struct spa_loop *loop, bool async, uint32_t seq,
 		const void *data, size_t size, void *user_data)
 {
 	const struct io_data *d = user_data;
+	if (d->data == NULL && d->port->io != NULL) {
+		spa_log_debug(d->impl->log, "%p: %p ramp true %p %p", d->impl, d->port, d->data, d->port->io);
+		capture_state(d->impl, d->port);
+	} else if (d->data != NULL) {
+		spa_log_debug(d->impl->log, "%p: %p ramp false %p %p", d->impl, d->port, d->data, d->port->io);
+		d->port->ramp_start = false;
+		d->port->last_buffer = SPA_ID_INVALID;
+	}
 	d->port->io = d->data;
 	return 0;
 }
@@ -3396,13 +3602,14 @@ impl_node_port_set_io(void *object,
 
 	switch (id) {
 	case SPA_IO_Buffers:
-		if (this->data_loop) {
-			struct io_data d = { .port = port, .data = data, .size = size };
+	{
+		struct io_data d = { .impl = this, .port = port, .data = data, .size = size };
+		if (this->data_loop)
 			spa_loop_locked(this->data_loop, do_set_port_io, 0, NULL, 0, &d);
-		}
 		else
-			port->io = data;
+			do_set_port_io(NULL, false, 0, NULL, 0, &d);
 		break;
+	}
 	case SPA_IO_RateMatch:
 		this->io_rate_match = data;
 		break;
@@ -3427,53 +3634,65 @@ static int impl_node_port_reuse_buffer(void *object, uint32_t port_id, uint32_t 
 }
 
 static int channelmix_process_apply_sequence(struct impl *this,
-			const struct spa_pod_sequence *sequence, uint32_t *processed_offset,
+			const struct spa_pod *pod, const void *body,
+			uint32_t *processed_offset,
 			void *SPA_RESTRICT dst[], const void *SPA_RESTRICT src[],
 			uint32_t n_samples)
 {
-	struct spa_pod_control *c, *prev = NULL;
+	struct spa_pod_control c, prev;
+	const void *c_body = NULL, *prev_body = NULL;
 	uint32_t avail_samples = n_samples;
 	uint32_t i;
 	const float *s[MAX_PORTS], **ss = (const float**) src;
 	float *d[MAX_PORTS], **sd = (float **) dst;
-	const struct spa_pod_sequence_body *body = &(sequence)->body;
-	uint32_t size = SPA_POD_BODY_SIZE(sequence);
 	bool end = false;
+	struct spa_pod_parser parser;
+	struct spa_pod_frame frame;
+	struct spa_pod_sequence seq;
+	const void *seq_body;
 
-	c = spa_pod_control_first(body);
+	spa_pod_parser_init_pod_body(&parser, pod, body);
+	if (spa_pod_parser_push_sequence_body(&parser, &frame, &seq, &seq_body) < 0)
+		return -EINVAL;
+
+	if (spa_pod_parser_get_control_body(&parser, &c, &c_body) < 0)
+		c_body = NULL;
+
 	while (true) {
 		uint32_t chunk;
 
-		if (c == NULL || !spa_pod_control_is_inside(body, size, c)) {
-			c = NULL;
+		if (c_body == NULL) {
+			c_body = NULL;
 			end = true;
 		}
 		if (avail_samples == 0)
 			break;
 
-		/* ignore old control offsets */
-		if (c != NULL) {
-			if (c->offset <= *processed_offset) {
+		if (c_body != NULL) {
+			if (c.offset <= *processed_offset) {
+				/* ignore old control offsets */
 				prev = c;
-				if (c != NULL)
-					c = spa_pod_control_next(c);
+				prev_body = c_body;
+				if (spa_pod_parser_get_control_body(&parser, &c, &c_body) < 0)
+					c_body = NULL;
 				continue;
 			}
-			chunk = SPA_MIN(avail_samples, c->offset - *processed_offset);
+			chunk = SPA_MIN(avail_samples, c.offset - *processed_offset);
 			spa_log_trace_fp(this->log, "%p: process %d-%d %d/%d", this,
-					*processed_offset, c->offset, chunk, avail_samples);
+					*processed_offset, c.offset, chunk, avail_samples);
 		} else {
 			chunk = avail_samples;
 			spa_log_trace_fp(this->log, "%p: process remain %d", this, chunk);
 		}
 
-		if (prev) {
-			switch (prev->type) {
+		if (prev_body) {
+			switch (prev.type) {
 			case SPA_CONTROL_UMP:
-				apply_midi(this, &prev->value);
+			case SPA_CONTROL_Midi:
+				apply_midi(this, prev.type, &prev.value, prev_body);
 				break;
 			case SPA_CONTROL_Properties:
-				apply_props(this, &prev->value);
+				apply_props(this, &prev.value, prev_body);
 				break;
 			default:
 				continue;
@@ -3631,7 +3850,7 @@ static void run_src_convert_stage(struct stage *s, struct stage_context *c)
 	} else {
 		dst = c->datas[s->out_idx];
 	}
-	if (c->empty && dir->conv.clear)
+	if (c->empty && dir->conv.clear && convert_is_clear_on_empty(&dir->conv))
 		convert_clear(&dir->conv, dst, c->n_samples);
 	else
 		convert_process(&dir->conv, dst, (const void**)c->datas[s->in_idx], c->n_samples);
@@ -3648,6 +3867,38 @@ static void add_src_convert_stage(struct impl *impl, struct stage_context *ctx)
 	spa_log_trace(impl->log, "%p: stage %d", impl, impl->n_stages);
 	impl->n_stages++;
 	ctx->src_idx = s->out_idx;
+}
+
+static void run_gap_detect_stage(struct stage *s, struct stage_context *c)
+{
+	struct impl *impl = s->impl;
+	impl->gaps.empty = c->empty;
+	if (gaps_check(&impl->gaps, (const float**)c->datas[s->in_idx], c->n_samples)) {
+		gaps_fix(&impl->gaps, (float**)c->datas[s->out_idx],
+				(const float**)c->datas[s->in_idx], c->n_samples);
+		c->datas[CTX_DATA_GAP] = c->datas[s->out_idx];
+	} else {
+		c->datas[CTX_DATA_GAP] = c->datas[s->in_idx];
+	}
+	c->empty = impl->gaps.empty;
+	spa_log_trace_fp(impl->log, "%p: gap %d", impl, c->n_samples);
+}
+
+static bool is_src(uint32_t idx)
+{
+	return idx == CTX_DATA_REMAP_SRC || idx == CTX_DATA_SRC;
+}
+static void add_gap_detect_stage(struct impl *impl, struct stage_context *ctx)
+{
+	struct stage *s = &impl->stages[impl->n_stages];
+	s->impl = impl;
+	s->in_idx = ctx->src_idx;
+	s->out_idx = is_src(s->in_idx) ? get_dst_idx(ctx) : ctx->src_idx;
+	s->run = run_gap_detect_stage;
+	s->data = NULL;
+	spa_log_trace(impl->log, "%p: stage %d", impl, impl->n_stages);
+	impl->n_stages++;
+	ctx->src_idx = CTX_DATA_GAP;
 }
 
 static void run_resample_stage(struct stage *s, struct stage_context *c)
@@ -3707,18 +3958,18 @@ static void run_channelmix_stage(struct stage *s, struct stage_context *c)
 	struct port *ctrlport = c->ctrlport;
 
 	spa_log_trace_fp(impl->log, "%p: channelmix %d", impl, c->n_samples);
-	if (ctrlport != NULL && ctrlport->ctrl != NULL) {
-		if (channelmix_process_apply_sequence(impl, ctrlport->ctrl,
+	if (ctrlport != NULL && ctrlport->seq_body != NULL) {
+		if (channelmix_process_apply_sequence(impl, &ctrlport->seq, ctrlport->seq_body,
 					&ctrlport->ctrl_offset, out_datas, in_datas, c->n_samples) == 1) {
 			ctrlport->io->status = SPA_STATUS_OK;
-			ctrlport->ctrl = NULL;
+			ctrlport->seq_body = NULL;
 		}
-	} else if (impl->vol_ramp_sequence) {
-		if (channelmix_process_apply_sequence(impl, impl->vol_ramp_sequence,
+	} else if (impl->vol_ramp_seq_body) {
+		if (channelmix_process_apply_sequence(impl, &impl->vol_ramp_seq, impl->vol_ramp_seq_body,
 				&impl->vol_ramp_offset, out_datas, in_datas, c->n_samples) == 1) {
 			free(impl->vol_ramp_sequence_data);
 			impl->vol_ramp_sequence_data = NULL;
-			impl->vol_ramp_sequence = NULL;
+			impl->vol_ramp_seq_body = NULL;
 		}
 	} else {
 		channelmix_process(&impl->mix, out_datas, in_datas, c->n_samples);
@@ -3745,7 +3996,7 @@ static void run_dst_convert_stage(struct stage *s, struct stage_context *c)
 	struct dir *dir = &impl->dir[SPA_DIRECTION_OUTPUT];
 	void *remap_datas[MAX_PORTS], **src;
 
-	spa_log_trace_fp(impl->log, "%p: output convert %d", impl, c->n_samples);
+	spa_log_trace_fp(impl->log, "%p: output convert %d %d", impl, c->n_samples, c->empty);
 	if (dir->need_remap) {
 		uint32_t i;
 		for (i = 0; i < dir->conv.n_channels; i++) {
@@ -3756,7 +4007,7 @@ static void run_dst_convert_stage(struct stage *s, struct stage_context *c)
 	} else {
 		src = c->datas[s->in_idx];
 	}
-	if (c->empty && dir->conv.clear)
+	if (c->empty && dir->conv.clear && convert_is_clear_on_empty(&dir->conv))
 		convert_clear(&dir->conv, c->datas[s->out_idx], c->n_samples);
 	else
 		convert_process(&dir->conv, c->datas[s->out_idx], (const void **)src, c->n_samples);
@@ -3777,7 +4028,7 @@ static void add_dst_convert_stage(struct impl *impl, struct stage_context *ctx)
 static void recalc_stages(struct impl *this, struct stage_context *ctx)
 {
 	struct dir *dir;
-	bool test, do_wav;
+	bool test, do_wav, do_gap;
 	struct port *ctrlport = ctx->ctrlport;
 	bool in_need_remap, out_need_remap;
 	uint32_t i;
@@ -3793,11 +4044,11 @@ static void recalc_stages(struct impl *this, struct stage_context *ctx)
 
 	/* set bits for things we need to do */
 	dir = &this->dir[SPA_DIRECTION_INPUT];
-	SPA_FLAG_UPDATE(ctx->bits, SRC_CONVERT_BIT, !dir->conv.is_passthrough);
+	SPA_FLAG_UPDATE(ctx->bits, SRC_CONVERT_BIT, !convert_is_passthrough(&dir->conv));
 	in_need_remap = dir->need_remap;
 
 	dir = &this->dir[SPA_DIRECTION_OUTPUT];
-	SPA_FLAG_UPDATE(ctx->bits, DST_CONVERT_BIT, !dir->conv.is_passthrough);
+	SPA_FLAG_UPDATE(ctx->bits, DST_CONVERT_BIT, !convert_is_passthrough(&dir->conv));
 	out_need_remap = dir->need_remap;
 
 	this->resample_passthrough = resample_is_passthrough(this);
@@ -3806,8 +4057,10 @@ static void recalc_stages(struct impl *this, struct stage_context *ctx)
 	SPA_FLAG_UPDATE(ctx->bits, FILTER_BIT, this->n_graph != 0);
 
 	test = SPA_FLAG_IS_SET(this->mix.flags, CHANNELMIX_FLAG_IDENTITY) &&
-		(ctrlport == NULL || ctrlport->ctrl == NULL) && (this->vol_ramp_sequence == NULL);
+		(ctrlport == NULL || ctrlport->seq_body == NULL) && (this->vol_ramp_seq_body == NULL);
 	SPA_FLAG_UPDATE(ctx->bits, MIX_BIT, !test);
+
+	do_gap = this->gaps.duration > 0;
 
 	/* if we have nothing to do, force a conversion to the destination to make sure we
 	 * actually write something to the destination buffer */
@@ -3828,6 +4081,8 @@ static void recalc_stages(struct impl *this, struct stage_context *ctx)
 		if (in_need_remap)
 			add_src_remap_stage(this, ctx);
 	}
+	if (do_gap)
+		add_gap_detect_stage(this, ctx);
 
 	if (this->direction == SPA_DIRECTION_INPUT) {
 		if (SPA_FLAG_IS_SET(ctx->bits, RESAMPLE_BIT))
@@ -3875,7 +4130,6 @@ static int impl_node_process(void *object)
 	bool in_avail = false, flush_in = false, flush_out = false;
 	bool draining = false, in_empty = this->out_offset == 0, out_empty;
 	struct spa_io_buffers *io;
-	const struct spa_pod_sequence *ctrl = NULL;
 	uint64_t current_time;
 	struct stage_context ctx;
 
@@ -3946,9 +4200,11 @@ static int impl_node_process(void *object)
 					this, port->id, io, io->status, io->buffer_id,
 					port->n_buffers);
 			buf = &port->buffers[io->buffer_id];
+			port->last_buffer = io->buffer_id;
 		}
 
 		if (SPA_UNLIKELY(buf == NULL)) {
+			port->last_buffer = SPA_ID_INVALID;
 			for (j = 0; j < port->blocks; j++) {
 				if (port->is_control) {
 					spa_log_trace_fp(this->log, "%p: empty control %d", this,
@@ -3956,6 +4212,13 @@ static int impl_node_process(void *object)
 				} else {
 					remap = n_src_datas++;
 					src_datas[remap] = SPA_PTR_ALIGN(this->empty, MAX_ALIGN, void);
+					if (SPA_UNLIKELY(port->ramp_start)) {
+						struct gaps_state *gs = this->gaps.states[remap];
+						spa_log_info(this->log, "%p: %p ramp start", this, port);
+						gs->mode = GAPS_MODE_FADE_OUT;
+						gs->count = 0;
+						port->ramp_start = false;
+					}
 					spa_log_trace_fp(this->log, "%p: empty input %d->%d", this,
 							i * port->blocks + j, remap);
 					max_in = SPA_MIN(max_in, this->scratch_size / port->stride);
@@ -3975,24 +4238,35 @@ static int impl_node_process(void *object)
 					in_empty = false;
 
 				if (SPA_UNLIKELY(port->is_control)) {
+					struct spa_pod seq;
+					const void *seq_body = NULL;
+
 					spa_log_trace_fp(this->log, "%p: control %d", this,
 							i * port->blocks + j);
+
+					if (spa_pod_body_from_data(data, bd->maxsize,
+							bd->chunk->offset, bd->chunk->size,
+							&seq, &seq_body) < 0)
+						continue;
+
 					ctrlport = port;
-					ctrl = spa_pod_from_data(data, bd->maxsize,
-							bd->chunk->offset, bd->chunk->size);
-					if (ctrl && !spa_pod_is_sequence(&ctrl->pod))
-						ctrl = NULL;
-					if (ctrl != ctrlport->ctrl) {
-						ctrlport->ctrl = ctrl;
+					if (seq_body != ctrlport->seq_body) {
+						ctrlport->seq = seq;
+						ctrlport->seq_body = seq_body;
 						ctrlport->ctrl_offset = 0;
 						this->recalc = true;
 					}
 				} else  {
+					struct gaps_state *gs;
+
 					max_in = SPA_MIN(max_in, size / port->stride);
 
 					remap = n_src_datas++;
 					offs += this->in_offset * port->stride;
 					src_datas[remap] = SPA_PTROFF(data, offs, void);
+
+					gs = this->gaps.states[remap];
+					gs->fading = SPA_FLAG_IS_SET(bd->chunk->flags, SPA_CHUNK_FLAG_FADE);
 
 					spa_log_trace_fp(this->log, "%p: input %d:%d:%d %d %d %d->%d", this,
 							offs, size, port->stride, this->in_offset, max_in,
@@ -4162,8 +4436,8 @@ static int impl_node_process(void *object)
 	this->out_offset += ctx.n_samples;
 	out_empty = ctx.empty;
 
-	spa_log_trace_fp(this->log, "%d/%d  %d/%d %d->%d", this->in_offset, max_in,
-			this->out_offset, max_out, n_samples, n_out);
+	spa_log_trace_fp(this->log, "%d/%d  %d/%d %d->%d %d->%d", this->in_offset, max_in,
+			this->out_offset, max_out, n_samples, n_out, in_empty, out_empty);
 
 	dir = &this->dir[SPA_DIRECTION_INPUT];
 	if (SPA_LIKELY(this->in_offset >= max_in || flush_in)) {
@@ -4280,11 +4554,16 @@ static int impl_get_interface(struct spa_handle *handle, const char *type, void 
 	return 0;
 }
 
-static void free_dir(struct dir *dir)
+static void free_dir(struct impl *this, enum spa_direction direction)
 {
+	struct dir *dir = &this->dir[direction];
 	uint32_t i;
-	for (i = 0; i < MAX_PORTS; i++)
-		free(dir->ports[i]);
+	for (i = 0; i < MAX_PORTS; i++) {
+		if (dir->ports[i] != NULL) {
+			clear_buffers(this, dir->ports[i]);
+			free(dir->ports[i]);
+		}
+	}
 	if (dir->conv.free)
 		convert_free(&dir->conv);
 	free(dir->tag);
@@ -4299,8 +4578,8 @@ static int impl_clear(struct spa_handle *handle)
 
 	this = (struct impl *) handle;
 
-	free_dir(&this->dir[SPA_DIRECTION_INPUT]);
-	free_dir(&this->dir[SPA_DIRECTION_OUTPUT]);
+	free_dir(this, SPA_DIRECTION_INPUT);
+	free_dir(this, SPA_DIRECTION_OUTPUT);
 
 	free_tmp(this);
 
@@ -4310,8 +4589,12 @@ static int impl_clear(struct spa_handle *handle)
 	                free(this->graph_descs[i]);
 	}
 
+	if (this->mix.free)
+		channelmix_free(&this->mix);
 	if (this->resample.free)
 		resample_free(&this->resample);
+	if (this->gaps.free)
+		gaps_free(&this->gaps);
 	if (this->wav_file != NULL)
 		wav_file_close(this->wav_file);
 	free (this->vol_ramp_sequence_data);
@@ -4371,6 +4654,10 @@ impl_init(const struct spa_handle_factory *factory,
 
 	channelmix_reset(&this->mix);
 
+	this->gaps.history = 256;
+	this->gaps.order = 16;
+	this->gaps.threshold = 0.98;
+
 	for (i = 0; info && i < info->n_items; i++) {
 		const char *k = info->items[i].key;
 		const char *s = info->items[i].value;
@@ -4407,6 +4694,12 @@ impl_init(const struct spa_handle_factory *factory,
 			spa_scnprintf(this->group_name, sizeof(this->group_name), "%s", s);
 		else if (spa_streq(k, "monitor.passthrough"))
 			this->monitor_passthrough = spa_atob(s);
+		else if (spa_streq(k, "predict.history"))
+			spa_atou32(s, &this->gaps.history, 0);
+		else if (spa_streq(k, "predict.order"))
+			spa_atou32(s, &this->gaps.order, 0);
+		else if (spa_streq(k, "predict.threshold"))
+			spa_atod(s, &this->gaps.threshold);
 	}
 	this->props.channel.n_volumes = this->props.n_channels;
 	this->props.soft.n_volumes = this->props.n_channels;

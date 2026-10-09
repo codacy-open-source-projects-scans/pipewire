@@ -675,6 +675,7 @@ static int parse_prop_params(struct impl *this, struct spa_pod *params)
 		const char *name;
 		struct spa_pod *pod;
 		char value[512];
+		int res;
 
 		if (spa_pod_parser_get_string(&prs, &name) < 0)
 			break;
@@ -683,7 +684,11 @@ static int parse_prop_params(struct impl *this, struct spa_pod *params)
 			break;
 
 		if (spa_pod_is_string(pod)) {
-			spa_pod_copy_string(pod, sizeof(value), value);
+			if ((res = spa_pod_copy_string(pod, sizeof(value), value)) < 0) {
+				spa_log_error(this->log, "can't copy value for '%s' (max %zu bytes): %s",
+						name, sizeof(value)-1, spa_strerror(res));
+				continue;
+			}
 		} else if (spa_pod_is_float(pod)) {
 			spa_dtoa(value, sizeof(value),
 					SPA_POD_VALUE(struct spa_pod_float, pod));
@@ -713,6 +718,9 @@ static int apply_props(struct impl *this, const struct spa_pod *param)
 	struct spa_pod_prop *prop;
 	struct spa_pod_object *obj = (struct spa_pod_object *) param;
 	int changed = 0;
+
+	if (!spa_pod_is_object_type(param, SPA_TYPE_OBJECT_Props))
+		return -EINVAL;
 
 	SPA_POD_OBJECT_FOREACH(obj, prop) {
 		switch (prop->key) {
@@ -810,9 +818,6 @@ static int node_set_param_port_config(struct impl *this, uint32_t flags,
 	bool monitor = false, control = false;
 	int res;
 
-	if (param == NULL)
-		return 0;
-
 	if (spa_pod_parse_object(param,
 			SPA_TYPE_OBJECT_ParamPortConfig, NULL,
 			SPA_PARAM_PORT_CONFIG_direction,	SPA_POD_Id(&direction),
@@ -834,15 +839,6 @@ static int node_set_param_port_config(struct impl *this, uint32_t flags,
 	return reconfigure_mode(this, mode, direction, monitor, control, infop);
 }
 
-static int node_set_param_props(struct impl *this, uint32_t flags,
-				const struct spa_pod *param)
-{
-	if (param == NULL)
-		return 0;
-
-	apply_props(this, param);
-	return 0;
-}
 static int impl_node_set_param(void *object, uint32_t id, uint32_t flags,
 			       const struct spa_pod *param)
 {
@@ -853,10 +849,10 @@ static int impl_node_set_param(void *object, uint32_t id, uint32_t flags,
 
 	switch (id) {
 	case SPA_PARAM_PortConfig:
-		res = node_set_param_port_config(this, flags, param);
+		res = param ? node_set_param_port_config(this, flags, param) : 0;
 		break;
 	case SPA_PARAM_Props:
-		res = node_set_param_props(this, flags, param);
+		res = param ? apply_props(this, param) : 0;
 		break;
 	default:
 		return -ENOENT;
@@ -1071,6 +1067,9 @@ static int impl_node_send_command(void *object, const struct spa_command *comman
 		break;
 	case SPA_NODE_COMMAND_Flush:
 		reset_node(this);
+		break;
+	case SPA_NODE_COMMAND_ParamBegin:
+	case SPA_NODE_COMMAND_ParamEnd:
 		break;
 	default:
 		return -ENOTSUP;
@@ -2015,6 +2014,8 @@ static int port_set_peer_enum_format(void *object,
 	if (formats) {
 		uint32_t count = 0;
 		port->peer_format_pod = spa_pod_copy(formats);
+		if (port->peer_format_pod == NULL)
+			return -errno;
 
 		for (i = 0; i < SPA_N_ELEMENTS(subtypes); i++) {
 			state = NULL;
@@ -2028,6 +2029,8 @@ static int port_set_peer_enum_format(void *object,
 			}
 		}
 		port->peer_formats = calloc(count, sizeof(struct spa_pod *));
+		if (port->peer_formats == NULL)
+			return -errno;
 		for (i = 0; i < SPA_N_ELEMENTS(subtypes); i++) {
 			state = NULL;
 			while (spa_peer_param_parse(port->peer_format_pod, &info, sizeof(info), &state) > 0) {

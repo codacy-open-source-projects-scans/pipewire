@@ -45,7 +45,6 @@
 #endif
 
 #define LISTEN_BACKLOG 32
-#define MAX_CLIENTS 64
 
 PW_LOG_TOPIC_EXTERN(pulse_conn);
 
@@ -104,7 +103,7 @@ finish:
 static void stream_clear_data(struct stream *stream,
 		uint32_t offset, uint32_t len)
 {
-	uint32_t l0 = SPA_MIN(len, MAXLENGTH - offset), l1 = len - l0;
+	uint32_t l0 = SPA_MIN(len, stream->bufsize - offset), l1 = len - l0;
 	sample_spec_silence(&stream->ss, SPA_PTROFF(stream->buffer, offset, void), l0);
 	if (SPA_UNLIKELY(l1 > 0))
 		sample_spec_silence(&stream->ss, stream->buffer, l1);
@@ -124,18 +123,19 @@ static int handle_memblock(struct client *client, struct message *msg)
 		(((uint64_t) ntohl(client->desc.offset_lo))));
 	flags = ntohl(client->desc.flags);
 
-	pw_log_debug("client %p: received memblock channel:%d offset:%" PRIi64 " flags:%08x size:%u",
+	pw_log_trace("client %p: received memblock channel:%d offset:%" PRIi64 " flags:%08x size:%u",
 		     client, channel, offset, flags, msg->length);
 
 	stream = pw_map_lookup(&client->streams, channel);
-	if (stream == NULL || stream->type == STREAM_TYPE_RECORD) {
+	if (stream == NULL || stream->type == STREAM_TYPE_RECORD ||
+	    (stream->type != STREAM_TYPE_UPLOAD && stream->create_tag != SPA_ID_INVALID)) {
 		pw_log_info("client %p [%s]: received memblock for unknown channel %d",
 			    client, client->name, channel);
 		goto finish;
 	}
 
 	filled = spa_ringbuffer_get_write_index(&stream->ring, &index);
-	pw_log_debug("new block %p %p/%u filled:%d index:%d flags:%02x offset:%" PRIu64,
+	pw_log_trace("new block %p %p/%u filled:%d index:%d flags:%02x offset:%" PRIu64,
 		     msg, msg->data, msg->length, filled, index, flags, offset);
 
 	switch (flags & FLAG_SEEKMASK) {
@@ -162,7 +162,7 @@ static int handle_memblock(struct client *client, struct message *msg)
 		 * play back old data. FIXME, if the write pointer goes backwards and
 		 * forwards, this might clear valid data. We should probably keep track of
 		 * the highest write pointer and only clear when we go past that one. */
-		stream_clear_data(stream, index % MAXLENGTH, SPA_MIN(diff, MAXLENGTH));
+		stream_clear_data(stream, index % stream->bufsize, SPA_MIN(diff, stream->bufsize));
 	}
 
 	index += diff;
@@ -181,10 +181,10 @@ static int handle_memblock(struct client *client, struct message *msg)
 	/* always write data to ringbuffer, we expect the other side
 	 * to recover */
 	spa_ringbuffer_write_data(&stream->ring,
-			stream->buffer, MAXLENGTH,
-			index % MAXLENGTH,
+			stream->buffer, stream->bufsize,
+			index % stream->bufsize,
 			msg->data,
-			SPA_MIN(msg->length, MAXLENGTH));
+			SPA_MIN(msg->length, stream->bufsize));
 	index += msg->length;
 	spa_ringbuffer_write_update(&stream->ring, index);
 
@@ -274,6 +274,10 @@ static int do_read(struct client *client)
 			message_free(client->message, false, false);
 
 		client->message = message_alloc(impl, channel, length);
+		if (client->message == NULL) {
+			res = -ENOMEM;
+			goto exit;
+		}
 	} else if (client->message &&
 	    client->in_index >= client->message->length + sizeof(client->desc)) {
 		struct message * const msg = client->message;
@@ -391,7 +395,6 @@ on_connect(void *data, int fd, uint32_t mask)
 	}
 
 	if (server->n_clients >= server->max_clients) {
-		close(client_fd);
 		error_reason = "too many client application connections";
 		errno = ECONNREFUSED;
 		goto error;
@@ -404,7 +407,7 @@ on_connect(void *data, int fd, uint32_t mask)
 	pw_log_debug("server %p: new client %p fd:%d", server, client, client_fd);
 
 	client->source = pw_loop_add_io(impl->main_loop,
-					client_fd,
+					spa_steal_fd(client_fd),
 					SPA_IO_ERR | SPA_IO_HUP | SPA_IO_IN,
 					true, on_client_data, client);
 	if (client->source == NULL)
@@ -444,10 +447,10 @@ on_connect(void *data, int fd, uint32_t mask)
 
 #ifdef SO_PRIORITY
 		val = 6;
-		if (setsockopt(client_fd, SOL_SOCKET, SO_PRIORITY, &val, sizeof(val)) < 0)
+		if (setsockopt(client->source->fd, SOL_SOCKET, SO_PRIORITY, &val, sizeof(val)) < 0)
 			pw_log_warn("setsockopt(SO_PRIORITY) failed: %m");
 #endif
-		pid = get_client_pid(client, client_fd);
+		pid = get_client_pid(client, client->source->fd);
 		if (pid != 0 && pw_check_flatpak(pid, &app_id, &instance_id, &devices) == 1) {
 			/*
 			 * XXX: we should really use Portal client access here
@@ -483,7 +486,7 @@ on_connect(void *data, int fd, uint32_t mask)
 		}
 		// check SNAP permissions
 #ifdef HAVE_SNAP
-		snap_access = pw_snap_get_audio_permissions(client, client_fd, &snap_app_id);
+		snap_access = pw_snap_get_audio_permissions(client, client->source->fd, &snap_app_id);
 		if ((snap_access & PW_SANDBOX_ACCESS_NOT_A_SANDBOX) == 0) {
 			pw_properties_set(client->props, PW_KEY_SNAP_ID, snap_app_id);
 
@@ -500,12 +503,12 @@ on_connect(void *data, int fd, uint32_t mask)
 	else if (server->addr.ss_family == AF_INET || server->addr.ss_family == AF_INET6) {
 
 		val = 1;
-		if (setsockopt(client_fd, IPPROTO_TCP, TCP_NODELAY, &val, sizeof(val)) < 0)
+		if (setsockopt(client->source->fd, IPPROTO_TCP, TCP_NODELAY, &val, sizeof(val)) < 0)
 			pw_log_warn("setsockopt(TCP_NODELAY) failed: %m");
 
 		if (server->addr.ss_family == AF_INET) {
 			val = IPTOS_LOWDELAY;
-			if (setsockopt(client_fd, IPPROTO_IP, IP_TOS, &val, sizeof(val)) < 0)
+			if (setsockopt(client->source->fd, IPPROTO_IP, IP_TOS, &val, sizeof(val)) < 0)
 				pw_log_warn("setsockopt(IP_TOS) failed: %m");
 		}
 		if (client_access == NULL)
@@ -521,6 +524,8 @@ error:
 
 	if (client)
 		client_free(client);
+	if (client_fd >= 0)
+		close(client_fd);
 }
 
 static int parse_unix_address(const char *address, struct sockaddr_storage *addrs, int len)
@@ -786,31 +791,17 @@ static int parse_ipv4_address(const char *address, struct sockaddr_in *out)
 static int format_ip_address(const struct sockaddr_storage *addr, char *buffer, size_t buflen)
 {
 	char ip[INET6_ADDRSTRLEN];
-	const void *src;
-	bool is_ipv6 = false;
-	int port;
+	bool is_ipv4 = true;
+	uint16_t port = 0;
+	int res;
 
-	switch (addr->ss_family) {
-	case AF_INET:
-		src = &((struct sockaddr_in *) addr)->sin_addr.s_addr;
-		port = ntohs(((struct sockaddr_in *) addr)->sin_port);
-		break;
-	case AF_INET6:
-		is_ipv6 = true;
-		src = &((struct sockaddr_in6 *) addr)->sin6_addr.s6_addr;
-		port = ntohs(((struct sockaddr_in6 *) addr)->sin6_port);
-		break;
-	default:
-		return -EAFNOSUPPORT;
-	}
-
-	if (inet_ntop(addr->ss_family, src, ip, sizeof(ip)) == NULL)
-		return -errno;
+	if ((res = pw_net_get_ip(addr, ip, sizeof(ip), &is_ipv4, &port)) < 0)
+		return res;
 
 	return snprintf(buffer, buflen, "%s%s%s:%d",
-			is_ipv6 ? "[" : "",
+			is_ipv4 ? "" : "[",
 			ip,
-			is_ipv6 ? "]" : "",
+			is_ipv4 ? "" : "]",
 			port);
 }
 
@@ -1060,7 +1051,7 @@ int servers_create_and_start(struct impl *impl, const char *addresses, struct pw
 				continue;
 			}
 
-			server->max_clients = max_clients;
+			server->max_clients = SPA_MAX(max_clients, 0);
 			server->listen_backlog = listen_backlog;
 			memcpy(server->client_access, client_access, sizeof(client_access));
 

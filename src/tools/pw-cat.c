@@ -89,7 +89,7 @@ enum unit {
 
 struct data;
 
-typedef int (*fill_fn)(struct data *d, void *dest, unsigned int n_frames, bool *null_frame);
+typedef int (*fill_fn)(struct data *d, void *dest, uint32_t maxsize, unsigned int n_frames, bool *null_frame);
 
 struct data {
 	struct pw_main_loop *loop;
@@ -185,6 +185,7 @@ struct data {
 	struct {
 		FILE *file;
 		bool close;
+		bool first;
 	} sysex;
 	struct {
 		FILE *file;
@@ -206,7 +207,7 @@ static const struct format_info {
 	uint32_t flags;
 } format_info[] = {
 	{  "ulaw", SF_FORMAT_ULAW, 1, "ulaw", SPA_AUDIO_FORMAT_ULAW, 1, 0 },
-	{  "alaw", SF_FORMAT_ULAW, 1, "alaw", SPA_AUDIO_FORMAT_ALAW, 1, 0 },
+	{  "alaw", SF_FORMAT_ALAW, 1, "alaw", SPA_AUDIO_FORMAT_ALAW, 1, 0 },
 	{  "s8", SF_FORMAT_PCM_S8, 1, "s8", SPA_AUDIO_FORMAT_S8, 1, 0 },
 	{  "u8", SF_FORMAT_PCM_U8, 1, "u8", SPA_AUDIO_FORMAT_U8, 1, 0 },
 	{  "s16", SF_FORMAT_PCM_16, 2, "s16", SPA_AUDIO_FORMAT_S16, 2, 0 },
@@ -271,7 +272,7 @@ static void list_formats(struct data *d)
 		fprintf(stdout, "  %s\n", i->sf_name);
 }
 
-static int sf_playback_fill_x8(struct data *d, void *dest, unsigned int n_frames, bool *null_frame)
+static int sf_playback_fill_x8(struct data *d, void *dest, uint32_t maxsize, unsigned int n_frames, bool *null_frame)
 {
 	sf_count_t rn;
 
@@ -279,7 +280,7 @@ static int sf_playback_fill_x8(struct data *d, void *dest, unsigned int n_frames
 	return (int)rn / d->stride;
 }
 
-static int sf_playback_fill_s16(struct data *d, void *dest, unsigned int n_frames, bool *null_frame)
+static int sf_playback_fill_s16(struct data *d, void *dest, uint32_t maxsize, unsigned int n_frames, bool *null_frame)
 {
 	sf_count_t rn;
 
@@ -288,7 +289,7 @@ static int sf_playback_fill_s16(struct data *d, void *dest, unsigned int n_frame
 	return (int)rn;
 }
 
-static int sf_playback_fill_s32(struct data *d, void *dest, unsigned int n_frames, bool *null_frame)
+static int sf_playback_fill_s32(struct data *d, void *dest, uint32_t maxsize, unsigned int n_frames, bool *null_frame)
 {
 	sf_count_t rn;
 
@@ -297,7 +298,7 @@ static int sf_playback_fill_s32(struct data *d, void *dest, unsigned int n_frame
 	return (int)rn;
 }
 
-static int sf_playback_fill_f32(struct data *d, void *dest, unsigned int n_frames, bool *null_frame)
+static int sf_playback_fill_f32(struct data *d, void *dest, uint32_t maxsize, unsigned int n_frames, bool *null_frame)
 {
 	sf_count_t rn;
 
@@ -306,7 +307,7 @@ static int sf_playback_fill_f32(struct data *d, void *dest, unsigned int n_frame
 	return (int)rn;
 }
 
-static int sf_playback_fill_f64(struct data *d, void *dest, unsigned int n_frames, bool *null_frame)
+static int sf_playback_fill_f64(struct data *d, void *dest, uint32_t maxsize, unsigned int n_frames, bool *null_frame)
 {
 	sf_count_t rn;
 
@@ -316,7 +317,7 @@ static int sf_playback_fill_f64(struct data *d, void *dest, unsigned int n_frame
 }
 
 #ifdef HAVE_PW_CAT_FFMPEG_INTEGRATION
-static int encoded_playback_fill(struct data *d, void *dest, unsigned int n_frames, bool *null_frame)
+static int encoded_playback_fill(struct data *d, void *dest, uint32_t maxsize, unsigned int n_frames, bool *null_frame)
 {
 	AVPacket *packet = d->encoded.packet;
 	int ret;
@@ -382,8 +383,8 @@ static int encoded_playback_fill(struct data *d, void *dest, unsigned int n_fram
 		 * interested in. This is relevant when playing data that contains
 		 * several multiplexed streams. */
 		while (true) {
-			if ((ret = av_read_frame(d->encoded.format_context, packet) < 0))
-				break;
+			if ((ret = av_read_frame(d->encoded.format_context, packet)) < 0)
+				return dest_ptr - (uint8_t *)dest;
 
 			if (packet->stream_index == d->encoded.stream_index)
 				break;
@@ -594,7 +595,7 @@ playback_fill_fn(uint32_t fmt)
 	return NULL;
 }
 
-static int sf_record_fill_x8(struct data *d, void *src, unsigned int n_frames, bool *null_frame)
+static int sf_record_fill_x8(struct data *d, void *src, uint32_t maxsize, unsigned int n_frames, bool *null_frame)
 {
 	sf_count_t rn;
 
@@ -602,7 +603,7 @@ static int sf_record_fill_x8(struct data *d, void *src, unsigned int n_frames, b
 	return (int)rn / d->stride;
 }
 
-static int sf_record_fill_s16(struct data *d, void *src, unsigned int n_frames, bool *null_frame)
+static int sf_record_fill_s16(struct data *d, void *src, uint32_t maxsize, unsigned int n_frames, bool *null_frame)
 {
 	sf_count_t rn;
 
@@ -611,7 +612,7 @@ static int sf_record_fill_s16(struct data *d, void *src, unsigned int n_frames, 
 	return (int)rn;
 }
 
-static int sf_record_fill_s32(struct data *d, void *src, unsigned int n_frames, bool *null_frame)
+static int sf_record_fill_s32(struct data *d, void *src, uint32_t maxsize, unsigned int n_frames, bool *null_frame)
 {
 	sf_count_t rn;
 
@@ -620,7 +621,7 @@ static int sf_record_fill_s32(struct data *d, void *src, unsigned int n_frames, 
 	return (int)rn;
 }
 
-static int sf_record_fill_f32(struct data *d, void *src, unsigned int n_frames, bool *null_frame)
+static int sf_record_fill_f32(struct data *d, void *src, uint32_t maxsize, unsigned int n_frames, bool *null_frame)
 {
 	sf_count_t rn;
 
@@ -629,7 +630,7 @@ static int sf_record_fill_f32(struct data *d, void *src, unsigned int n_frames, 
 	return (int)rn;
 }
 
-static int sf_record_fill_f64(struct data *d, void *src, unsigned int n_frames, bool *null_frame)
+static int sf_record_fill_f64(struct data *d, void *src, uint32_t maxsize, unsigned int n_frames, bool *null_frame)
 {
 	sf_count_t rn;
 
@@ -1003,7 +1004,7 @@ static void on_process(void *userdata)
 			n_frames = SPA_MIN(n_frames, (int)samples_left);
 		}
 
-		n_fill_frames = data->fill(data, p, n_frames, &null_frame);
+		n_fill_frames = data->fill(data, p, d->maxsize, n_frames, &null_frame);
 
 		if (data->sample_limit > 0 && n_fill_frames > 0)
 			data->samples_processed += n_fill_frames;
@@ -1048,7 +1049,7 @@ static void on_process(void *userdata)
 			n_frames = SPA_MIN(n_frames, (int)samples_left);
 		}
 
-		n_fill_frames = data->fill(data, p, n_frames, &null_frame);
+		n_fill_frames = data->fill(data, p, d->maxsize - offset, n_frames, &null_frame);
 
 		if (data->sample_limit > 0 && n_fill_frames > 0)
 			data->samples_processed += n_fill_frames;
@@ -1220,7 +1221,7 @@ static void show_usage(const char *name, bool is_error)
 	     "      --volume                          Stream volume 0-1.0 (default %.3f)\n"
 	     "  -q  --quality                         Resampler quality (0 - 15) (default %d)\n"
 	     "  -a, --raw                             RAW mode\n"
-	     "  -M, --force-midi                      Force midi format, one of \"midi\" or \"ump\", (default ump)\n"
+	     "  -M, --force-midi                      Force midi format, one of \"none\", \"midi\" or \"ump\", (default none)\n"
 	     "  -n, --sample-count COUNT              Stop after COUNT samples\n"
 	     "\n"),
 	     DEFAULT_RATE,
@@ -1244,7 +1245,7 @@ static void show_usage(const char *name, bool is_error)
 	}
 }
 
-static int midi_play(struct data *d, void *src, unsigned int n_frames, bool *null_frame)
+static int midi_play(struct data *d, void *src, uint32_t maxsize, unsigned int n_frames, bool *null_frame)
 {
 	int res;
 	struct spa_pod_builder b;
@@ -1253,7 +1254,7 @@ static int midi_play(struct data *d, void *src, unsigned int n_frames, bool *nul
 	bool have_data = false;
 
 	spa_zero(b);
-	spa_pod_builder_init(&b, src, n_frames);
+	spa_pod_builder_init(&b, src, maxsize);
 
 	spa_pod_builder_push_sequence(&b, &f, 0);
 
@@ -1338,7 +1339,7 @@ static int midi_play(struct data *d, void *src, unsigned int n_frames, bool *nul
 	return b.state.offset;
 }
 
-static int midi_record(struct data *d, void *src, unsigned int n_frames, bool *null_frame)
+static int midi_record(struct data *d, void *src, uint32_t maxsize, unsigned int n_frames, bool *null_frame)
 {
 	struct spa_pod_parser parser;
 	struct spa_pod_frame frame;
@@ -1410,7 +1411,7 @@ static int setup_midifile(struct data *data)
 	return 0;
 }
 
-static int clip_play(struct data *d, void *src, unsigned int n_frames, bool *null_frame)
+static int clip_play(struct data *d, void *src, uint32_t maxsize, unsigned int n_frames, bool *null_frame)
 {
 	int res;
 	struct spa_pod_builder b;
@@ -1419,7 +1420,7 @@ static int clip_play(struct data *d, void *src, unsigned int n_frames, bool *nul
 	bool have_data = false;
 
 	spa_zero(b);
-	spa_pod_builder_init(&b, src, n_frames);
+	spa_pod_builder_init(&b, src, maxsize);
 
 	spa_pod_builder_push_sequence(&b, &f, 0);
 
@@ -1478,7 +1479,7 @@ static int clip_play(struct data *d, void *src, unsigned int n_frames, bool *nul
 	return b.state.offset;
 }
 
-static int clip_record(struct data *d, void *src, unsigned int n_frames, bool *null_frame)
+static int clip_record(struct data *d, void *src, uint32_t maxsize, unsigned int n_frames, bool *null_frame)
 {
 	struct spa_pod_parser parser;
 	struct spa_pod_frame frame;
@@ -1547,23 +1548,51 @@ static int setup_midiclip(struct data *data)
 	return 0;
 }
 
-static int sysex_play(struct data *d, void *dst, unsigned int n_frames, bool *null_frame)
+static int sysex_play(struct data *d, void *dst, uint32_t maxsize, unsigned int n_frames, bool *null_frame)
 {
 	struct spa_pod_builder b;
 	struct spa_pod_frame f;
-	size_t size, to_read = n_frames - 64;
-	uint8_t bytes[to_read];
+	size_t size, to_read = maxsize - 64;
+	uint8_t data[to_read+2], *bytes;
+
+	bytes = &data[1];
+	size = fread(bytes, 1, to_read, d->sysex.file);
+
+	if (size != to_read) {
+		if (ferror(d->sysex.file))
+			return -EIO;
+	}
+	if (feof(d->sysex.file)) {
+		if (size == 0)
+			return 0;
+		if (bytes[size-1] != 0xf7) {
+			bytes[size] = 0xf7;
+			size += 1;
+		}
+	}
+	if (d->sysex.first) {
+		if (bytes[0] != 0xf0) {
+			bytes = &data[0];
+			bytes[0] = 0xf0;
+			size += 1;
+		}
+		d->sysex.first = false;
+	} else {
+		if (bytes[0] != 0xf7) {
+			bytes = &data[0];
+			bytes[0] = 0xf7;
+			size += 1;
+		}
+	}
 
 	spa_zero(b);
-	spa_pod_builder_init(&b, dst, n_frames);
+	spa_pod_builder_init(&b, dst, maxsize);
 
 	spa_pod_builder_push_sequence(&b, &f, 0);
 	spa_pod_builder_control(&b, 0, SPA_CONTROL_Midi);
-
-	size = fread(bytes, 1, to_read, d->sysex.file);
-
 	spa_pod_builder_bytes(&b, bytes, size);
-	spa_pod_builder_pop(&b, &f);
+	if (spa_pod_builder_pop(&b, &f) == NULL)
+		fprintf(stderr, "sysex: can't create sequence %m\n");
 
 	return b.state.offset;
 }
@@ -1590,6 +1619,7 @@ static int setup_sysex(struct data *data)
 
 	data->fill = sysex_play;
 	data->stride = 1;
+	data->sysex.first = true;
 
 	return 0;
 }
@@ -1608,12 +1638,12 @@ static const struct dsd_layout_info dsd_layouts[] = {
 	{ 7, { SPA_AUDIO_LAYOUT_5_1R }, },
 };
 
-static int dsf_play(struct data *d, void *src, unsigned int n_frames, bool *null_frame)
+static int dsf_play(struct data *d, void *src, uint32_t maxsize, unsigned int n_frames, bool *null_frame)
 {
 	return dsf_file_read(d->dsf.file, src, n_frames, &d->dsf.layout);
 }
 
-static int dff_play(struct data *d, void *src, unsigned int n_frames, bool *null_frame)
+static int dff_play(struct data *d, void *src, uint32_t maxsize, unsigned int n_frames, bool *null_frame)
 {
 	return dff_file_read(d->dff.file, src, n_frames, &d->dff.layout);
 }
@@ -1656,12 +1686,12 @@ static int setup_dsdfile(struct data *data)
 	return 0;
 }
 
-static int raw_record(struct data *d, void *src, unsigned int n_frames, bool *null_frame)
+static int raw_record(struct data *d, void *src, uint32_t maxsize, unsigned int n_frames, bool *null_frame)
 {
 	return fwrite(src, d->stride, n_frames, d->raw.file);
 }
 
-static int raw_play(struct data *d, void *src, unsigned int n_frames, bool *null_frame)
+static int raw_play(struct data *d, void *src, uint32_t maxsize, unsigned int n_frames, bool *null_frame)
 {
 	return fread(src, d->stride, n_frames, d->raw.file);
 }
@@ -1777,7 +1807,6 @@ static void format_from_filename(SF_INFO *info, const char *filename, const char
 	else
 		extension = filename;
 
-	fprintf(stderr, "%s\n", filename);
 	if (sf_command(NULL, SFC_GET_FORMAT_MAJOR_COUNT, &count, sizeof(int)) != 0)
 		count = 0;
 
@@ -2036,11 +2065,12 @@ static int setup_sndfile(struct data *data)
 			}
 		}
 		fill_properties(data);
-
-		/* try native format first, else decode to float */
-		if ((fi = format_info_by_sf_format(info.format)) == NULL)
-			fi = format_info_by_sf_format(SF_FORMAT_FLOAT);
 	}
+
+	/* try native format first, else decode to float */
+	if ((fi = format_info_by_sf_format(info.format)) == NULL)
+		fi = format_info_by_sf_format(SF_FORMAT_FLOAT);
+
 	if (fi == NULL)
 		return -EIO;
 
@@ -2193,7 +2223,7 @@ int main(int argc, char *argv[])
 	/* negative means no volume adjustment */
 	data.volume = -1.0;
 	data.quality = -1;
-	data.midi.force_type = MIDI_FORCE_UMP;
+	data.midi.force_type = MIDI_FORCE_NONE;
 	data.props = pw_properties_new(
 			PW_KEY_APP_NAME, prog,
 			PW_KEY_NODE_NAME, prog,

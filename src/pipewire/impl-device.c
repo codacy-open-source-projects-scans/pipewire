@@ -184,7 +184,10 @@ struct pw_impl_device *pw_context_create_device(struct pw_context *context,
 	impl->cache_params = true;
 
 	this = &impl->this;
-	this->name = strdup("device");
+	if ((this->name = strdup("device")) == NULL) {
+		res = -errno;
+		goto error_free;
+	}
 	pw_log_debug("%p: new", this);
 
 	if (properties == NULL)
@@ -210,6 +213,7 @@ struct pw_impl_device *pw_context_create_device(struct pw_context *context,
 	return this;
 
 error_free:
+	free(this->name);
 	free(impl);
 error_cleanup:
 	pw_properties_free(properties);
@@ -529,11 +533,30 @@ static int device_set_param(void *object, uint32_t id, uint32_t flags,
 	return res;
 }
 
+static int device_send_command(void *object, const struct spa_command *command)
+{
+	struct resource_data *data = object;
+	struct pw_impl_device *device = data->device;
+	uint32_t id = SPA_DEVICE_COMMAND_ID(command);
+	int res;
+
+	pw_log_debug("%p: got command %d (%s)", device, id,
+		    spa_debug_type_find_name(spa_type_device_command_id, id));
+
+	switch (id) {
+	default:
+		res = spa_device_send_command(device->device, command);
+		break;
+	}
+	return res;
+}
+
 static const struct pw_device_methods device_methods = {
 	PW_VERSION_DEVICE_METHODS,
 	.subscribe_params = device_subscribe_params,
 	.enum_params = device_enum_params,
-	.set_param = device_set_param
+	.set_param = device_set_param,
+	.send_command = device_send_command,
 };
 
 static int

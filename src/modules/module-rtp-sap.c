@@ -18,7 +18,7 @@
 #include <spa/utils/cleanup.h>
 #include <spa/utils/hook.h>
 #include <spa/utils/result.h>
-#include <spa/utils/json.h>
+#include <spa/utils/json-builder.h>
 #include <spa/debug/types.h>
 
 #include <pipewire/pipewire.h>
@@ -59,7 +59,7 @@
  * - `source.ip =<str>`: source IP address, default "0.0.0.0"
  * - `net.ttl = <int>`: TTL to use, default 1
  * - `net.loop = <bool>`: loopback multicast, default false
- * - `stream.rules` = <rules>: match rules, use create-stream and announce-stream actions
+ * - `stream.rules` = \<rules\>: match rules, use create-stream and announce-stream actions
  * - `sap.max-sessions = <int>`: maximum number of concurrent send/receive sessions to track
  * - `sap.preamble-extra = [strings]`: extra attributes to add to the atomic SDP preamble
  * - `sap.end-extra = [strings]`: extra attributes to add to the end of the SDP message
@@ -389,19 +389,6 @@ static void session_free(struct session *sess)
 	free(sess);
 }
 
-static bool is_multicast(struct sockaddr *sa, socklen_t salen)
-{
-	if (sa->sa_family == AF_INET) {
-		static const uint32_t ipv4_mcast_mask = 0xe0000000;
-		struct sockaddr_in *sa4 = (struct sockaddr_in*)sa;
-		return (ntohl(sa4->sin_addr.s_addr) & ipv4_mcast_mask) == ipv4_mcast_mask;
-	} else if (sa->sa_family == AF_INET6) {
-		struct sockaddr_in6 *sa6 = (struct sockaddr_in6*)sa;
-		return sa6->sin6_addr.s6_addr[0] == 0xff;
-	}
-	return false;
-}
-
 static int make_unix_ptp_mgmt_socket(const char *path) {
 	struct sockaddr_un addr;
 
@@ -451,7 +438,7 @@ static int make_send_socket(
 		pw_log_error("connect() failed: %m");
 		goto error;
 	}
-	if (is_multicast((struct sockaddr*)sa, salen)) {
+	if (pw_net_is_multicast(sa)) {
 		if (sa->ss_family == AF_INET) {
 			val = loop;
 			if (setsockopt(fd, IPPROTO_IP, IP_MULTICAST_LOOP, &val, sizeof(val)) < 0)
@@ -591,13 +578,13 @@ static bool update_ts_refclk(struct impl *impl)
 			return false;
 	}
 
-	// Read if something is left in the socket
-	int avail;
+	int avail = 0;
 	uint8_t tmp;
 
-	ioctl(impl->ptp_fd, FIONREAD, &avail);
-	pw_log_debug("Flushing stale data: %u bytes", avail);
-	while (avail-- && read(impl->ptp_fd, &tmp, 1));
+	if (ioctl(impl->ptp_fd, FIONREAD, &avail) == 0 && avail > 0) {
+		pw_log_debug("Flushing stale data: %d bytes", avail);
+		while (avail-- > 0 && read(impl->ptp_fd, &tmp, 1) == 1);
+	}
 
 	struct ptp_management_msg req;
 	spa_zero(req);
@@ -631,7 +618,7 @@ static bool update_ts_refclk(struct impl *impl)
 	}
 
 	uint8_t buf[sizeof(struct ptp_management_msg) + sizeof(struct ptp_parent_data_set)];
-	if (read(impl->ptp_fd, &buf, sizeof(buf)) == -1) {
+	if (read(impl->ptp_fd, buf, sizeof(buf)) != (ssize_t)sizeof(buf)) {
 		pw_log_warn("Failed to receive PTP management response: %m");
 		return false;
 	}
@@ -762,7 +749,7 @@ static int make_sdp(struct impl *impl, struct session *sess, char *buffer, size_
 	if ((user_name = pw_get_user_name()) == NULL)
 		user_name = "-";
 
-	multicast = is_multicast((struct sockaddr*)&sdp->dst_addr, sdp->dst_len);
+	multicast = pw_net_is_multicast(&sdp->dst_addr);
 
 	spa_zero(dst_ttl);
 	if (multicast)
@@ -813,7 +800,7 @@ static int make_sdp(struct impl *impl, struct session *sess, char *buffer, size_
 				sdp->payload, sdp->mime_type, sdp->rate);
 	}
 
-	if (is_multicast((struct sockaddr*)&sdp->dst_addr, sdp->dst_len))
+	if (pw_net_is_multicast(&sdp->dst_addr))
 		spa_strbuf_append(&buf,
 			"a=source-filter: incl IN %s %s %s\n", dst_ip4 ? "IP4" : "IP6",
 				dst_addr, src_addr);
@@ -880,7 +867,7 @@ static int send_sap(struct impl *impl, struct session *sess, bool bye)
 
 		if ((str = pw_properties_get(sess->props, "source.ip")) == NULL) {
 			if (impl->ifname) {
-				int fd = socket(impl->sap_addr.ss_family, SOCK_DGRAM, 0);
+				int fd = socket(impl->sap_addr.ss_family, SOCK_DGRAM | SOCK_CLOEXEC, 0);
 				if (fd >= 0) {
 					struct ifreq req;
 					spa_zero(req);
@@ -1164,7 +1151,7 @@ static struct session *session_new_announce(struct impl *impl, struct node *node
 
 	if ((str = pw_properties_get(props, "rtp.destination.port")) == NULL)
 		goto error_free;
-	if (!spa_atou32(str, &port, 0))
+	if ((port = pw_net_parse_port(str, 0)) == 0)
 		goto error_free;
 	sdp->dst_port = port;
 
@@ -1269,37 +1256,34 @@ static int session_load_source(struct session *session, struct pw_properties *pr
 {
 	struct impl *impl = session->impl;
 	struct pw_context *context = pw_impl_module_get_context(impl->module);
-	FILE *f = NULL;
-	char *args = NULL;
+	struct spa_json_builder b;
+	spa_autofree char *args = NULL;
 	size_t size;
 	const char *str, *media;
 	int res;
 
-	if ((f = open_memstream(&args, &size)) == NULL) {
-		res = -errno;
+	if ((res = spa_json_builder_memstream(&b, &args, &size, 0)) < 0) {
 		pw_log_error("Can't open memstream: %m");
-		goto done;
+		return res;
 	}
-	fprintf(f, "{");
+	spa_json_builder_array_push(&b, "{");
 
 	if ((str = pw_properties_get(props, "rtp.destination.ip")) != NULL)
-		fprintf(f, "\"source.ip\" = \"%s\", ", str);
+		spa_json_builder_object_string(&b, "source.ip", str);
 	if ((str = pw_properties_get(props, "rtp.destination.port")) != NULL)
-		fprintf(f, "\"source.port\" = %s, ", str);
+		spa_json_builder_object_value(&b, false, "source.port", str);
 	if ((str = pw_properties_get(props, "rtp.session")) != NULL)
-		fprintf(f, "\"sess.name\" = \"%s\", ", str);
+		spa_json_builder_object_string(&b, "sess.name", str);
 
 	/* Use an interface if explicitly specified, else use the SAP interface if that was specified */
-	if ((str = pw_properties_get(props, "local.ifname")) != NULL || (str = impl->ifname) != NULL) {
-		fprintf(f, "\"local.ifname\" = \"%s\", ", str);
-	}
+	if ((str = pw_properties_get(props, "local.ifname")) != NULL || (str = impl->ifname) != NULL)
+		spa_json_builder_object_string(&b, "local.ifname", str);
 
 	if ((media = pw_properties_get(props, "sess.media")) == NULL)
 		media = "audio";
 
-	if ((str = pw_properties_get(props, "cleanup.sec")) != NULL) {
-		fprintf(f, "\"cleanup.sec\" = \"%s\", ", str);
-	}
+	if ((str = pw_properties_get(props, "cleanup.sec")) != NULL)
+		spa_json_builder_object_string(&b, "cleanup.sec", str);
 
 	if (spa_streq(media, "audio")) {
 		const char *mime;
@@ -1308,15 +1292,16 @@ static int session_load_source(struct session *session, struct pw_properties *pr
 		if ((mime = pw_properties_get(props, "rtp.mime")) == NULL) {
 			pw_log_error("missing rtp.mime property");
 			res = -EINVAL;
-			goto done;
+			goto error;
 		}
 		format_info = find_audio_format_info(mime);
 		if (format_info == NULL) {
 			pw_log_error("unknown rtp.mime type %s", mime);
 			res = -ENOTSUP;
-			goto done;
+			goto error;
 		}
-		fprintf(f, "\"sess.media\" = \"%s\", ", format_info->media_type);
+		spa_json_builder_object_string(&b, "sess.media", format_info->media_type);
+
 		if (format_info->format_str != NULL) {
 			pw_properties_set(props, "audio.format", format_info->format_str);
 			if ((str = pw_properties_get(props, "rtp.rate")) != NULL)
@@ -1325,21 +1310,21 @@ static int session_load_source(struct session *session, struct pw_properties *pr
 				pw_properties_set(props, "audio.channels", str);
 		}
 		if ((str = pw_properties_get(props, "rtp.ssrc")) != NULL)
-			fprintf(f, "\"rtp.receiver-ssrc\" = \"%s\", ", str);
+			spa_json_builder_object_string(&b, "rtp.receiver-ssrc", str);
 	} else {
 		pw_log_error("Unhandled media %s", media);
 		res = -EINVAL;
-		goto done;
+		goto error;
 	}
 	if ((str = pw_properties_get(props, "rtp.ts-offset")) != NULL)
-		fprintf(f, "\"sess.ts-offset\" = %s, ", str);
+		spa_json_builder_object_value(&b, false, "sess.ts-offset", str);
 
-	fprintf(f, " stream.props = {");
-	pw_properties_serialize_dict(f, &props->dict, 0);
-	fprintf(f, " }");
-	fprintf(f, "}");
-        fclose(f);
-	f = NULL;
+	spa_json_builder_object_push(&b, "stream.props", "{");
+	pw_properties_serialize_dict(b.f, &props->dict, 0);
+	spa_json_builder_pop(&b,         "}");
+	spa_json_builder_pop(&b,       "}");
+	if ((res = spa_json_builder_close(&b)) < 0)
+		return res;
 
 	pw_log_info("loading new RTP source");
 	session->module = pw_context_load_module(context,
@@ -1347,20 +1332,17 @@ static int session_load_source(struct session *session, struct pw_properties *pr
 				args, NULL);
 
 	if (session->module == NULL) {
-		res = -errno;
 		pw_log_error("Can't load module: %m");
-		goto done;
+		return -errno;
 	}
 
 	pw_impl_module_add_listener(session->module,
 			&session->module_listener,
 			&session_module_events, session);
 
-	res = 0;
-done:
-	if (f != NULL)
-		fclose(f);
-	free(args);
+	return 0;
+error:
+	spa_json_builder_close(&b);
 	return res;
 }
 
@@ -1393,6 +1375,9 @@ static int rule_matched(void *data, const char *location, const char *action,
 		pw_properties_update_string(props, str, len);
 
 		session_new_announce(i->impl, i->node, props);
+	}
+	else if (i->node && i->node->session && spa_streq(action, "deannounce-stream")) {
+		session_free(i->node->session);
 	}
 	return res;
 }
@@ -1535,6 +1520,8 @@ static int parse_sdp_m(struct impl *impl, char *c, struct sdp_info *info)
 		return -EINVAL;
 
 	info->media_type = strdup(media_type);
+	if (info->media_type == NULL)
+		return -errno;
 	info->dst_port = (uint16_t) port;
 	info->payload = (uint8_t) payload;
 
@@ -1548,25 +1535,25 @@ static int parse_sdp_m(struct impl *impl, char *c, struct sdp_info *info)
  * This is Audinate format. TODO: parse RAVENNA `i=CH1,CH2,CH3` format */
 static int parse_sdp_i(struct impl *impl, char *c, struct sdp_info *info)
 {
-	if (!strstr(c, " channels: ")) {
+	char *chstr;
+	uint32_t channels;
+
+	chstr = strstr(c, " channels: ");
+	if (chstr == NULL)
 		return 0;
-	}
 
 	c += strlen("i=");
-	c[strcspn(c, " ")] = '\0';
-
-	uint32_t channels;
 	if (sscanf(c, "%u", &channels) != 1 || channels <= 0 || channels > MAX_CHANNELS)
 		return 0;
 
-	c += strcspn(c, "\0");
-	c += strlen(" channels: ");
-
-	strncpy(info->channelmap, c, sizeof(info->channelmap) - 1);
+	chstr += strlen(" channels: ");
+	strncpy(info->channelmap, chstr, sizeof(info->channelmap) - 1);
 
 	return 0;
 }
 
+/* a=rtpmap:<payload type> <encoding name>/<clock rate> [/<encoding parameters>]
+ */
 static int parse_sdp_a_rtpmap(struct impl *impl, char *c, struct sdp_info *info)
 {
 	int payload, len, rate, channels;
@@ -1586,9 +1573,14 @@ static int parse_sdp_a_rtpmap(struct impl *impl, char *c, struct sdp_info *info)
 		return 0;
 
 	c += len;
-	c[strcspn(c, "/")] = 0;
+	len = strcspn(c, "/");
+	if (c[len] == '\0')
+		return -EINVAL;
+	c[len] = 0;
 	info->mime_type = strdup(c);
-	c += strlen(c) + 1;
+	if (info->mime_type == NULL)
+		return -errno;
+	c += len + 1;
 
 	if (sscanf(c, "%u/%u", &rate, &channels) == 2) {
 		info->channels = channels;
@@ -1652,6 +1644,8 @@ static int parse_sdp_a_ts_refclk(struct impl *impl, char *c, struct sdp_info *in
 
 	c += strlen("a=ts-refclk:");
 	info->ts_refclk = strdup(c);
+	if (info->ts_refclk == NULL)
+		return -errno;
 	return 0;
 }
 
@@ -1673,11 +1667,15 @@ static int parse_sdp(struct impl *impl, char *sdp, struct sdp_info *info)
 		if (count++ == 0 && strcmp(s, "v=0") != 0)
 			goto invalid_version;
 
-		if (spa_strstartswith(s, "o="))
+		if (spa_strstartswith(s, "o=")) {
 			info->origin = strdup(&s[2]);
-		else if (spa_strstartswith(s, "s="))
+			if (info->origin == NULL)
+				res = -errno;
+		} else if (spa_strstartswith(s, "s=")) {
 			info->session_name = strdup(&s[2]);
-		else if (spa_strstartswith(s, "c="))
+			if (info->session_name == NULL)
+				res = -errno;
+		} else if (spa_strstartswith(s, "c="))
 			res = parse_sdp_c(impl, s, info);
 		else if (spa_strstartswith(s, "m="))
 			res = parse_sdp_m(impl, s, info);
@@ -1751,9 +1749,11 @@ static int parse_sap(struct impl *impl, void *data, size_t len)
 	if (spa_strstartswith(mime, "v=0")) {
 		sdp = mime;
 		mime = SAP_MIME_TYPE;
-	} else if (spa_streq(mime, SAP_MIME_TYPE))
+	} else if (spa_streq(mime, SAP_MIME_TYPE)) {
 		sdp = SPA_PTROFF(mime, strlen(mime)+1, char);
-	else
+		if (sdp >= SPA_PTROFF(data, len, char))
+			return -EINVAL;
+	} else
 		return -EINVAL;
 
 	pw_log_debug("got SAP: %s %s", mime, sdp);
@@ -1878,7 +1878,7 @@ finish:
 	return res;
 
 error:
-	if (fd > 0)
+	if (fd >= 0)
 		close(fd);
 	goto finish;
 }
@@ -2182,6 +2182,10 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 		goto out;
 
 	impl->registry = pw_core_get_registry(impl->core, PW_VERSION_REGISTRY, 0);
+	if (impl->registry == NULL) {
+		res = -errno;
+		goto out;
+	}
 	pw_registry_add_listener(impl->registry, &impl->registry_listener,
 			&registry_events, impl);
 

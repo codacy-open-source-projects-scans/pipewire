@@ -980,29 +980,9 @@ int pa_alsa_ucm_query_profiles(pa_alsa_ucm_config *ucm, int card_index) {
         return -PA_ALSA_ERR_UNSPECIFIED;
     err = snd_use_case_mgr_open(&ucm->ucm_mgr, card_name);
     if (err < 0) {
-        char *ucm_card_name;
-
-        /* fallback longname: is UCM available for this card ? */
-        pa_xfree(card_name);
-        err = snd_card_get_name(card_index, &ucm_card_name);
-        if (err < 0) {
-            pa_log("Card can't get card_name from card_index %d", card_index);
-            err = -PA_ALSA_ERR_UNSPECIFIED;
-            goto name_fail;
-        }
-        card_name = pa_sprintf_malloc("%s%s", split_prefix, ucm_card_name);
-        free(ucm_card_name);
-        if (card_name == NULL) {
-            err = -PA_ALSA_ERR_UNSPECIFIED;
-            goto name_fail;
-        }
-
-        err = snd_use_case_mgr_open(&ucm->ucm_mgr, card_name);
-        if (err < 0) {
-            pa_log_info("UCM not available for card %s", card_name);
-            err = -PA_ALSA_ERR_UCM_OPEN;
-            goto ucm_mgr_fail;
-        }
+        pa_log_info("UCM not available for card %s", card_name);
+        err = -PA_ALSA_ERR_UCM_OPEN;
+        goto ucm_mgr_fail;
     }
 
     err = snd_use_case_get(ucm->ucm_mgr, "=Linked", &value);
@@ -1064,7 +1044,6 @@ ucm_verb_fail:
 ucm_mgr_fail:
     pa_xfree(card_name);
 
-name_fail:
     return err;
 }
 
@@ -2637,8 +2616,6 @@ static void ucm_probe_profile_set(pa_alsa_ucm_config *ucm, pa_alsa_profile_set *
 
     /* restore ucm state */
     snd_use_case_set(ucm->ucm_mgr, "_verb", SND_USE_CASE_VERB_INACTIVE);
-
-    pa_alsa_profile_set_drop_unsupported(ps);
 }
 
 pa_alsa_profile_set* pa_alsa_ucm_add_profile_set(pa_alsa_ucm_config *ucm, pa_channel_map *default_channel_map) {

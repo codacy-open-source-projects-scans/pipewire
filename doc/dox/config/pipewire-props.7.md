@@ -91,7 +91,7 @@ monitor.bluez.rules = [
 Native client configuration (requires client application restart to apply).
 See \ref client_conf__stream_rules "pipewire-client.conf(5)"
 ```css
-# ~/.config/pipewire/client.conf/custom-props.conf
+# ~/.config/pipewire/client.conf.d/custom-props.conf
 
 stream.rules = [
   {
@@ -104,7 +104,7 @@ stream.rules = [
 Pulseaudio client configuration (requires \ref page_man_pipewire-pulse_1 "pipewire-pulse(1)" restart to apply).
 See \ref pipewire-pulse_conf__stream_rules "pipewire-pulse.conf(5)"
 ```css
-# ~/.config/pipewire/pipewire-pulse.conf/custom-props.conf
+# ~/.config/pipewire/pipewire-pulse.conf.d/custom-props.conf
 
 stream.rules = [
   {
@@ -117,7 +117,7 @@ stream.rules = [
 JACK client configuration (requires client restart to apply).
 See \ref jack_conf__match_rules "pipewire-jack.conf(5)"
 ```css
-# ~/.config/pipewire/jack.conf/custom-props.conf
+# ~/.config/pipewire/jack.conf.d/custom-props.conf
 
 jack.rules = [
   {
@@ -485,7 +485,7 @@ Value ``0`` means the node will not be suspended.
 @PAR@ node-prop  state.restore-props = true
 Whether session manager should save state for this node.
 
-## Format Properties
+## Format Properties  @IDX@ props
 
 Streams and also most device nodes can be configured in a certain format with properties.
 
@@ -505,7 +505,7 @@ Valid formats include: S16, S32, F32, F64, S16LE, S16BE, ...
 @PAR@ node-prop  audio.allowed-rates
 An array of allowed samplerates for the node. ex. "[ 44100 48000 ]"
 
-## Other Properties
+## Other Properties  @IDX@ props
 
 @PAR@ node-prop  node.param.PARAM = { ... }   # JSON
 \parblock
@@ -527,7 +527,7 @@ performs sample format, sample rate and channel mixing operations.
 
 All properties listed below are node properties.
 
-## Merger Parameters
+## Merger Parameters  @IDX@ props
 
 The merger is used as the input for a sink device node or a capture stream. It takes the various channels and merges them into a single stream for further processing.
 
@@ -538,7 +538,7 @@ apply a software volume on the monitor signal.
 The volume of the input channels is applied to the volume of the monitor ports. Normally
 the monitor ports expose the raw unmodified signal on the input ports.
 
-## Resampler Parameters
+## Resampler Parameters  @IDX@ props
 
 Source, sinks, capture and playback streams contain a high quality adaptive resampler.
 It uses [sinc](https://ccrma.stanford.edu/~jos/resample/resample.pdf) based resampling
@@ -694,7 +694,7 @@ with this property.
 The default quality setting for the kaiser window is 4.254931.
 \endparblock
 
-## Channel Mixer Parameters
+## Channel Mixer Parameters  @IDX@ props
 
 Source, sinks, capture and playback streams can apply channel mixing on the incoming signal.
 
@@ -842,12 +842,32 @@ Dithering is only useful for conversion to a format with less than 24 bits and w
 disabled otherwise.
 \endparblock
 
-## Debug Parameters
+@PAR@ node-prop  fade.gap = 0
+\parblock
+This instructs the audio converter to run gap detection. If fade.gap consecutive
+silence samples are found, the audio converter will perform a fade-in or fade-out with
+new/old samples respectively.
+
+Fade-in and fade-out are important when the signal has a sudden changes to and from silence
+samples, which can cause loud pops and cracks.
+
+When an application uses the proper PipeWire pause and resume functions, fades will be
+performed automatically where needed. For applications that simply send silence when
+paused (chrome, ...), fade.gap detection can be a workaround.
+
+This is disabled by default because it might corrupt the signal with excessive fades in
+case the signal has large silence gaps.
+\endparblock
+
+@PAR@ node-prop  fade.duration = 0.020
+The duration of fade-in and fade-out of the signal in seconds on silence gaps.
+
+## Debug Parameters  @IDX@ props
 
 @PAR@ node-prop  debug.wav-path = ""
 Make the stream to also write the raw samples to a WAV file for debugging purposes.
 
-## Other Parameters
+## Other Parameters  @IDX@ props
 
 These control low-level technical features:
 
@@ -886,7 +906,7 @@ See \ref spa_param_port_config for the meaning.
 ## Monitor properties
 
 @PAR@ monitor-prop  alsa.use-acp = true      # boolean
-Use \ref monitor-prop__alsa_card_profiles "ALSA Card Profiles" (ACP) for device configuration.
+Use \ref props__alsa_card_profiles "ALSA Card Profiles" (ACP) for device configuration.
 This autodetects available ALSA devices and configures port and hardware mixers.
 
 @PAR@ monitor-prop  alsa.use-ucm             # boolean
@@ -974,24 +994,49 @@ Disable the "Pro Audio" profile for this device.
 Use the channel count and mapping the connected HDMI device
 provides via ELD information.
 
+@PAR@ device-prop api.acp.min-volume = 0.0 # float
+The minimum default volume for all the nodes from this device.
+
+@PAR@ device-prop api.acp.max-volume = FLT_MAX # float
+The maximum default volume for all the nodes from this device.
+
+@PAR@ device-prop api.acp.device.<node-name>.min-volume = 0.0 # float
+The default minimum volume for the node with the given node-name. This
+overrides the api.acp.min-volume for the device.
+
+@PAR@ device-prop api.acp.device.<node-name>.max-volume = FLT_MAX # float
+The default maximum volume for the node with the given node-name. This
+overrides the api.acp.max-volume for the device.
+
+@PAR@ device-prop api.acp.port.<port-name>.min-volume = FLT_MAX # float
+The minimum volume for the port with the given port-name. This overrides
+the api.acp.device.<node-name>.min-volume for the node. The port name
+can be found as the name property in the EnumRoute param of the device.
+
+@PAR@ device-prop api.acp.port.<port-name>.max-volume = FLT_MAX # float
+The maximum volume for the port with the given port-name. This overrides
+the api.acp.device.<node-name>.max-volume for the node. The port name
+can be found as the name property in the EnumRoute param of the device.
+
+
 ## Node properties
 
-@PAR@ node-prop  audio.channels    # integer
+\par audio.channels    # integer
 The number of audio channels to open the device with. Defaults depends on the profile of the device.
 
-@PAR@ node-prop  audio.rate    # integer
+\par audio.rate    # integer
 The audio rate to open the device with. Default is 0, which means to open the device with a rate as close to the graph rate as possible.
 
-@PAR@ node-prop  audio.format    # string
+\par audio.format    # string
 The audio format to open the device in. By default this is "UNKNOWN", which will open the device in the best possible bits (32/24/16/8..). You can force a format like S16_LE or S32_LE.
 
-@PAR@ node-prop  audio.position    # JSON array of strings
+\par audio.position    # JSON array of strings
 The audio position of the channels in the device. This is auto detected based on the profile. You can configure an array of channel positions, like "[ FL, FR ]".
 
-@PAR@ node-prop  audio.layout    # string
+\par audio.layout    # string
 The audio layout of the channels in the device. You can use any of the predefined layouts, like "Stereo", "5.1" etc.
 
-@PAR@ node-prop  audio.allowed-rates    # JSON array of integers
+\par audio.allowed-rates    # JSON array of integers
 \parblock
 The allowed audio rates to open the device with. Default is "[ ]", which means the device can be opened in any supported rate.
 
@@ -1358,6 +1403,19 @@ Available values:
 - sq   (Standard Quality, 660/606kbps)
 - mq   (Mobile use Quality, 330/303kbps)
 
+@PAR@ device-prop  bluez5.a2dp.lhdc.quality = "auto"   # string
+LHDC v5 encoding quality
+Available values:
+- auto  (default, use the negotiated bitrate range)
+- 400k
+- 500k
+- 900k
+- 1000k
+
+The fixed values select LHDC v5 encoder quality indices. They may exceed the
+selected AVDTP maximum bitrate class reported by the device, so use auto or a
+lower fixed value if audio is unstable.
+
 @PAR@ device-prop  bluez5.a2dp.aac.bitratemode = 0   # integer
 AAC variable bitrate mode.
 Available values: 0 (cbr, default), 1-5 (quality level)
@@ -1401,6 +1459,11 @@ BAP QoS target latency profile forced for QoS configuration selection.
 If not set or set to "balanced", both low-latency and high-reliability QoS configuration table are used.
 This property is experimental.
 Available: low-latency, high-reliability, balanced
+
+@PAR@ device-prop  bluez5.bap-server.ascs-announcement = "general" # string
+BAP server announcement forced for ASCS advertisement. By default this is set to "general".
+This property is experimental.
+Available: general, targeted
 
 ## Node properties
 
@@ -1570,7 +1633,7 @@ For ACP, PipeWire looks for the profile configuration files under
 
 - ~/.config/alsa-card-profile
 - /etc/alsa-card-profile
-- /usr/share/alsa-card-profile/mixer`.
+- /usr/share/alsa-card-profile/mixer.
 
 The `path` and `profile-set` files are in subdirectories `paths` and `profile-sets` of these directories.
 It is possible to override individual files locally by putting a modified copy into the ACP directories under `~/.config` or `/etc`.

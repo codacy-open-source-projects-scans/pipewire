@@ -37,6 +37,7 @@ extern "C" {
 #define PW_KEY_SEC_PID			"pipewire.sec.pid"	/**< Client pid, set by protocol */
 #define PW_KEY_SEC_UID			"pipewire.sec.uid"	/**< Client uid, set by protocol*/
 #define PW_KEY_SEC_GID			"pipewire.sec.gid"	/**< client gid, set by protocol*/
+#define PW_KEY_SEC_GIDS			"pipewire.sec.gids"	/**< client supplementary gids, set by protocol */
 #define PW_KEY_SEC_LABEL		"pipewire.sec.label"	/**< client security label, set by protocol*/
 
 #define PW_KEY_SEC_SOCKET		"pipewire.sec.socket"	/**< client socket name, set by protocol */
@@ -213,8 +214,10 @@ extern "C" {
 								  *  object */
 #define PW_KEY_NODE_PASSIVE		"node.passive"		/**< indicate that a node wants passive links
 								  *  on output/input/all ports. A ','-separated
-								  *  array of values  "out"/"out-follow"/"in"/
-								  *  "in-follow"/"true"/"follow" is accepted. */
+								  *  array of values  "out"/"out-follow"/
+								  *  "out-follow-suspend"/"in"/"in-follow"/
+								  *  "in-follow-suspend"/"true"/"follow"/
+								  *  "follow-suspend" is accepted. */
 #define PW_KEY_NODE_LINK_GROUP		"node.link-group"	/**< the node is internally linked to
 								  *  nodes with the same link-group. Can be an
 								  *  array of group names. */
@@ -249,7 +252,8 @@ extern "C" {
 #define PW_KEY_PORT_EXTRA		"port.extra"		/**< api specific extra port info, API name
 								  *  should be prefixed. "jack:flags:56" */
 #define PW_KEY_PORT_PASSIVE		"port.passive"		/**< the ports wants passive links. Values
-								  *  can be "true" or "follow". Since 0.3.67 */
+								  *  can be "true"/"follow"/"follow-suspend".
+								  *  Since 0.3.67 */
 #define PW_KEY_PORT_IGNORE_LATENCY	"port.ignore-latency"	/**< latency ignored by peers, since 0.3.71 */
 #define PW_KEY_PORT_GROUP		"port.group"		/**< the port group of the port 1.2.0 */
 #define PW_KEY_PORT_EXCLUSIVE		"port.exclusive"	/**< link port only once 1.6.0 */

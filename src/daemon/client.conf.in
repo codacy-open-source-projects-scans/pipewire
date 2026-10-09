@@ -47,6 +47,11 @@ context.modules = [
             #rt.prio      = @rtprio_client@
             #rt.time.soft = -1
             #rt.time.hard = -1
+            #rlimits.enabled = true
+            #rtportal.enabled = true
+            #rtkit.enabled = true
+            #uclamp.min = 0
+            #uclamp.max = 1024
         }
         flags = [ ifexists nofail ]
         condition = [ { module.rt = !false } ]
@@ -106,7 +111,9 @@ stream.properties = {
     #channelmix.lfe-level      = 0.5
     #channelmix.stereo-widen = 0.0
     #channelmix.hilbert-taps = 0
-    #dither.noise = 0
+    #dither.noise            = 0
+    #fade.gap                = 0
+    #fade.duration           = 0.020
 }
 
 stream.rules = [

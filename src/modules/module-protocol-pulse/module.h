@@ -17,6 +17,28 @@ struct client;
 struct message;
 struct extension;
 
+struct module_args {
+	const char *key;
+	const char *description;
+#define MODULE_ARG_MANDATORY	(1u<<0)
+#define MODULE_ARG_ENOTIMPL	(1u<<1)
+	uint32_t flags;
+#define MODULE_TYPE_NONE	""
+#define MODULE_TYPE_STRING	"string"
+#define MODULE_TYPE_STRINGV	"stringv"
+#define MODULE_TYPE_STRINGE	"stringe"
+#define MODULE_TYPE_USEC	"usec"
+#define MODULE_TYPE_MSEC	"msec"
+#define MODULE_TYPE_INT		"int"
+#define MODULE_TYPE_BOOL	"bool"
+#define MODULE_TYPE_PROPS	"proplist"
+#define MODULE_TYPE_FORMAT	"format"
+#define MODULE_TYPE_CHMAP	"chmap"
+	const char *type;
+	const char *def;
+	const char **vals;
+};
+
 struct module_info {
 	const char *name;
 
@@ -27,7 +49,7 @@ struct module_info {
 	int (*unload) (struct module *module);
 
 	const struct extension *extension;
-	const char* const *valid_args;
+	const struct module_args *valid_args;
 	const struct spa_dict *properties;
 	size_t data_size;
 };
@@ -64,6 +86,7 @@ struct module {
 
 const struct module_info *module_info_next(struct impl *impl, const struct module_info *info);
 const struct module_info *module_info_find(struct impl *impl, const char *name);
+char *module_info_usage(const struct module_info *info);
 
 struct module *module_create(struct impl *impl, const char *name, const char *args);
 void module_free(struct module *module);

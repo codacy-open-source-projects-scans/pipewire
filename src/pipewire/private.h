@@ -52,6 +52,7 @@ struct settings {
 	unsigned int clock_power_of_two_quantum:1;
 	unsigned int check_quantum:1;
 	unsigned int check_rate:1;
+	unsigned int use_fallback:1;
 #define CLOCK_RATE_UPDATE_MODE_HARD 0
 #define CLOCK_RATE_UPDATE_MODE_SOFT 1
 	int clock_rate_update_mode;
@@ -784,6 +785,7 @@ struct pw_impl_node {
 	unsigned int lazy:1;		/**< the graph is lazy scheduling */
 	unsigned int exclusive:1;	/**< ports can only be linked once */
 	unsigned int reliable:1;	/**< ports need reliable tee */
+	unsigned int can_suspend:1;	/**< node can suspend */
 
 #define PASSIVE_MODE_FALSE		0
 #define PASSIVE_MODE_TRUE		1
@@ -1010,7 +1012,9 @@ static inline uint32_t passive_mode_from_string(const char *str)
 		return PASSIVE_MODE_FOLLOW;
 	else if (spa_streq(str, "follow-suspend"))
 		return PASSIVE_MODE_FOLLOW_SUSPEND;
-	return spa_atob(str);
+	else if (spa_atob(str))
+		return PASSIVE_MODE_TRUE;
+	return PASSIVE_MODE_FALSE;
 }
 
 struct pw_control_link {
@@ -1303,6 +1307,8 @@ int pw_proxy_init(struct pw_proxy *proxy, struct pw_core *core, const char *type
 void pw_proxy_remove(struct pw_proxy *proxy);
 
 int pw_context_recalc_graph(struct pw_context *context, const char *reason);
+int pw_context_freeze_recalc_graph(struct pw_context *context);
+int pw_context_thaw_recalc_graph(struct pw_context *context, const char *reason);
 
 void pw_impl_port_update_info(struct pw_impl_port *port, const struct spa_port_info *info);
 
@@ -1324,6 +1330,9 @@ void pw_impl_port_unlink(struct pw_impl_port *port);
 
 /** Destroy a port */
 void pw_impl_port_destroy(struct pw_impl_port *port);
+
+/** Suepend a port */
+void pw_impl_port_suspend(struct pw_impl_port *port);
 
 /** Iterate the params of the given port. The callback should return
  * 1 to fetch the next item, 0 to stop iteration or <0 on error.
@@ -1347,6 +1356,13 @@ int pw_impl_port_for_each_filtered_param(struct pw_impl_port *in_port,
 						     uint32_t id, uint32_t index, uint32_t next,
 						     struct spa_pod *param),
 				    void *data);
+
+int pw_impl_port_enum_param(struct pw_impl_port *port,
+			   uint32_t param_id,
+			   uint32_t *index,
+			   const struct spa_pod *filter,
+			   struct spa_pod **param,
+			   struct spa_pod_builder *builder);
 
 /** Iterate the links of the port. The callback should return
  * 0 to fetch the next item, any other value stops the iteration and returns

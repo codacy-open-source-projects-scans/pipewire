@@ -5,6 +5,8 @@
 #include <dlfcn.h>
 #include <math.h>
 
+#define MAX_PORTS	512
+
 #include <lilv/lilv.h>
 
 #include <spa/utils/defs.h>
@@ -74,10 +76,19 @@ static LV2_URID uri_table_map(LV2_URID_Map_Handle handle, const char *uri)
 			return i+1;
 
 	if (table->len == table->alloc) {
+		char **p;
 		table->alloc += 64;
-		table->data = realloc(table->data, table->alloc * sizeof(char *));
+		p = realloc(table->data, table->alloc * sizeof(char *));
+		if (p == NULL) {
+			table->alloc -= 64;
+			return 0;
+		}
+		table->data = p;
  	}
-	table->data[table->len++] = strdup(uri);
+	table->data[table->len] = strdup(uri);
+	if (table->data[table->len] == NULL)
+		return 0;
+	table->len++;
 	return table->len;
 }
 
@@ -323,7 +334,12 @@ static const void *state_retrieve_function(LV2_State_Handle handle,
 			if ((len = spa_json_container_len(&it[0], val, len)) <= 0)
 				return NULL;
 
-		sd->tmp = realloc(sd->tmp, len+1);
+		{
+			char *tmp = realloc(sd->tmp, len+1);
+			if (tmp == NULL)
+				return NULL;
+			sd->tmp = tmp;
+		}
 		spa_json_parse_stringn(val, len, sd->tmp, len+1);
 
 		spa_log_info(p->log, "lv2: restore %d %s %s", key, uri, sd->tmp);
@@ -358,8 +374,8 @@ static int log_printf(LV2_Log_Handle handle, LV2_URID type, const char* fmt, ...
 	return ret;
 }
 
-static void *lv2_instantiate(const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor *desc,
-                        unsigned long SampleRate, int index, const char *config)
+static int lv2_instantiate1(const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor *desc,
+                        uint32_t rate, uint32_t index, const char *config, void **hndl)
 {
 	struct descriptor *d = (struct descriptor*)desc;
 	struct plugin *p = d->p;
@@ -369,11 +385,11 @@ static void *lv2_instantiate(const struct spa_fga_plugin *plugin, const struct s
 	static const int32_t min_block_length = 1;
 	static const int32_t max_block_length = 8192;
 	static const int32_t seq_size = 32768;
-	float fsample_rate = SampleRate;
+	float fsample_rate = rate;
 
 	i = calloc(1, sizeof(*i));
 	if (i == NULL)
-		return NULL;
+		return -errno;
 
 	i->block_length = 1024;
 	i->desc = d;
@@ -420,10 +436,10 @@ static void *lv2_instantiate(const struct spa_fga_plugin *plugin, const struct s
 	i->features[n_features++] = NULL;
 	spa_assert(n_features < SPA_N_ELEMENTS(i->features));
 
-	i->instance = lilv_plugin_instantiate(p->p, SampleRate, i->features);
+	i->instance = lilv_plugin_instantiate(p->p, rate, i->features);
 	if (i->instance == NULL) {
 		free(i);
-		return NULL;
+		return -ENOMEM;
 	}
 	if (lilv_plugin_has_extension_data(p->p, c->worker_iface)) {
                 i->work_iface = (const LV2_Worker_Interface*)
@@ -445,7 +461,19 @@ static void *lv2_instantiate(const struct spa_fga_plugin *plugin, const struct s
 				&sd, 0, i->features);
 		free(sd.tmp);
 	}
-	return i;
+	*hndl = i;
+	return 0;
+}
+
+static int lv2_instantiate(const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor *desc,
+		uint32_t rate, const char *config, uint32_t n_hndl, void *hndl[])
+{
+	int res;
+	for (uint32_t i = 0; i < n_hndl; i++) {
+		if ((res = lv2_instantiate1(plugin, desc, rate, i, config, &hndl[i])) < 0)
+			return res;
+	}
+	return 0;
 }
 
 static void lv2_cleanup(void *instance)
@@ -487,10 +515,12 @@ static void lv2_free(const struct spa_fga_descriptor *desc)
 {
 	struct descriptor *d = (struct descriptor*)desc;
 	uint32_t i;
-	for (i = 0; i <  d->desc.n_ports; i++)
-		free((void*)d->desc.ports[i].name);
+	if (d->desc.ports) {
+		for (i = 0; i <  d->desc.n_ports; i++)
+			free((void*)d->desc.ports[i].name);
+		free(d->desc.ports);
+	}
 	free((char*)d->desc.name);
-	free(d->desc.ports);
 	free(d);
 }
 
@@ -519,10 +549,18 @@ static const struct spa_fga_descriptor *lv2_plugin_make_desc(void *plugin, const
 	desc->desc.free = lv2_free;
 
 	desc->desc.name = strdup(name);
+	if (desc->desc.name == NULL)
+		goto error_free;
+
 	desc->desc.flags = 0;
 
 	desc->desc.n_ports = lilv_plugin_get_num_ports(p->p);
+	if (desc->desc.n_ports > MAX_PORTS)
+		goto error_free;
+
 	desc->desc.ports = calloc(desc->desc.n_ports, sizeof(struct spa_fga_port));
+	if (desc->desc.ports == NULL)
+		goto error_free;
 
 	mins = alloca(desc->desc.n_ports * sizeof(float));
 	maxes = alloca(desc->desc.n_ports * sizeof(float));
@@ -540,6 +578,8 @@ static const struct spa_fga_descriptor *lv2_plugin_make_desc(void *plugin, const
 
 		fp->index = i;
 		fp->name = strdup(lilv_node_as_string(symbol));
+		if (fp->name == NULL)
+			goto error_free;
 
 		fp->flags = 0;
 		if (lilv_port_is_a(p->p, port, c->lv2_InputPort))
@@ -573,6 +613,10 @@ static const struct spa_fga_descriptor *lv2_plugin_make_desc(void *plugin, const
 			fp->min = -FLT_MAX;
 	}
 	return &desc->desc;
+
+error_free:
+	lv2_free(&desc->desc);
+	return NULL;
 }
 
 static struct spa_fga_plugin_methods impl_plugin = {

@@ -284,6 +284,10 @@ static void midi_to_jack(struct impl *impl, float *dst, float *src, uint32_t n_s
 			data = tmp;
 			size = 3;
 		}
+		if (size > 1 && data[0] == 0xf7) {
+			data++;
+			size--;
+		}
 		if ((res = jack.midi_event_write(dst, c.offset, data, size)) < 0)
 			pw_log_warn("midi %p: can't write event: %s", dst,
 					spa_strerror(res));
@@ -406,7 +410,7 @@ static void source_process(void *d, struct spa_io_position *position)
 		src = jack.port_get_buffer (p->jack_port, n_samples);
 
 		if (SPA_UNLIKELY(p->is_midi))
-			jack_to_midi(dst, src, n_samples);
+			jack_to_midi(dst, src, n_samples * sizeof(float));
 		else
 			do_volume(dst, src, &s->volume, i, n_samples);
 	}
@@ -589,6 +593,9 @@ static void parse_props(struct stream *s, const struct spa_pod *param)
 	uint8_t buffer[1024];
 	struct spa_pod_builder b;
 	const struct spa_pod *params[1];
+
+	if (!spa_pod_is_object_type(param, SPA_TYPE_OBJECT_Props))
+		return;
 
 	SPA_POD_OBJECT_FOREACH(obj, prop) {
 		switch (prop->key) {

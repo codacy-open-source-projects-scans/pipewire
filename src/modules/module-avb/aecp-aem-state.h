@@ -104,6 +104,9 @@ struct aecp_aem_avb_interface_state {
 	 * has elapsed, then clears dirty and updates last_counters_emit_ns. */
 	bool counters_dirty;
 	int64_t last_counters_emit_ns;
+
+	bool gptp_info_dirty;
+	bool as_path_dirty;
 };
 
 
@@ -179,10 +182,17 @@ struct aecp_aem_stream_input_state {
 	 * most recent valid PDU; media_locked_state is the current edge. */
 	int64_t last_frame_rx_ns;
 	bool media_locked_state;
+
+	/* Settle window after a (re)lock: a Listener binding mid-stream behind an
+	 * SRP bridge sees a one-time sequence step as the bridge opens forwarding a
+	 * beat after the talker is already transmitting. Re-seed prev_seq for this
+	 * many post-lock PDUs instead of counting it as SEQ_NUM_MISMATCH. */
+	uint8_t seq_settle;
 };
 
 struct acmp_stream_status_milan_v12 {
 	uint64_t controller_entity_id;
+	uint64_t talker_entity_id;	/* IEEE 1722.1-2021 Section 7.4.6, BIND_RX_COMMAND talker_guid */
 	uint32_t acmp_flags;
 	uint8_t probing_status;
 	uint8_t acmp_status;

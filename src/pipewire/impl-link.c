@@ -256,11 +256,15 @@ static int link_find_format(struct pw_impl_link *this,
 
 	pw_log_debug("%p: states %d %d", this, state[0], state[1]);
 
+	spa_node_send_command(node[0],
+                        &SPA_NODE_COMMAND_INIT(SPA_NODE_COMMAND_ParamBegin));
+	spa_node_send_command(node[1],
+                        &SPA_NODE_COMMAND_INIT(SPA_NODE_COMMAND_ParamBegin));
+
 	if (state[0] == PW_IMPL_PORT_STATE_CONFIGURE && state[1] > PW_IMPL_PORT_STATE_CONFIGURE) {
 		/* only port 0 needs format, take format from port 1 and filter */
 		spa_pod_builder_init(&fb, fbuf, sizeof(fbuf));
-		if ((res = spa_node_port_enum_params_sync(node[1],
-						     info[1]->port->direction, port_id[1],
+		if ((res = pw_impl_port_enum_param(info[1]->port,
 						     SPA_PARAM_Format, &idx[1],
 						     NULL, &filter, &fb)) != 1) {
 			if (res < 0)
@@ -273,8 +277,7 @@ static int link_find_format(struct pw_impl_link *this,
 		pw_log_debug("%p: Got %s format:", this, dir[1]);
 		pw_log_pod(SPA_LOG_LEVEL_DEBUG, filter);
 
-		if ((res = spa_node_port_enum_params_sync(node[0],
-						     info[0]->port->direction, port_id[0],
+		if ((res = pw_impl_port_enum_param(info[0]->port,
 						     SPA_PARAM_EnumFormat, &idx[0],
 						     filter, format, builder)) <= 0) {
 			if (res == -ENOENT || res == 0) {
@@ -298,8 +301,7 @@ static int link_find_format(struct pw_impl_link *this,
 	} else if (state[1] >= PW_IMPL_PORT_STATE_CONFIGURE && state[0] > PW_IMPL_PORT_STATE_CONFIGURE) {
 		/* only port 1 needs format, take and filter format from port 0 */
 		spa_pod_builder_init(&fb, fbuf, sizeof(fbuf));
-		if ((res = spa_node_port_enum_params_sync(node[0],
-						     info[0]->port->direction, port_id[0],
+		if ((res = pw_impl_port_enum_param(info[0]->port,
 						     SPA_PARAM_Format, &idx[0],
 						     NULL, &filter, &fb)) != 1) {
 			if (res < 0)
@@ -312,8 +314,7 @@ static int link_find_format(struct pw_impl_link *this,
 		pw_log_debug("%p: Got %s format:", this, dir[0]);
 		pw_log_pod(SPA_LOG_LEVEL_DEBUG, filter);
 
-		if ((res = spa_node_port_enum_params_sync(node[1],
-						     info[1]->port->direction, port_id[1],
+		if ((res = pw_impl_port_enum_param(info[1]->port,
 						     SPA_PARAM_EnumFormat, &idx[1],
 						     filter, format, builder)) <= 0) {
 			if (res == -ENOENT || res == 0) {
@@ -343,8 +344,7 @@ static int link_find_format(struct pw_impl_link *this,
 		 * defaults will be prefered. */
 		pw_log_debug("%p: do enum %s %d", this, dir[0], idx[0]);
 		spa_pod_builder_init(&fb, fbuf, sizeof(fbuf));
-		if ((res = spa_node_port_enum_params_sync(node[0],
-						     info[0]->port->direction, port_id[0],
+		if ((res = pw_impl_port_enum_param(info[0]->port,
 						     SPA_PARAM_EnumFormat, &idx[0],
 						     NULL, &filter, &fb)) != 1) {
 			if (res == -ENOENT) {
@@ -371,8 +371,7 @@ static int link_find_format(struct pw_impl_link *this,
 		pw_log_debug("%p: enum %s %d with filter: %p", this, dir[1], idx[1], filter);
 		pw_log_pod(SPA_LOG_LEVEL_DEBUG, filter);
 
-		if ((res = spa_node_port_enum_params_sync(node[1],
-						     info[1]->port->direction, port_id[1],
+		if ((res = pw_impl_port_enum_param(info[1]->port,
 						     SPA_PARAM_EnumFormat, &idx[1],
 						     filter, format, builder)) != 1) {
 			if (res == 0 && filter != NULL) {
@@ -390,11 +389,16 @@ static int link_find_format(struct pw_impl_link *this,
 		*error = spa_aprintf("error bad node state");
 		goto error;
 	}
+exit:
+	spa_node_send_command(node[0],
+                        &SPA_NODE_COMMAND_INIT(SPA_NODE_COMMAND_ParamEnd));
+	spa_node_send_command(node[1],
+                        &SPA_NODE_COMMAND_INIT(SPA_NODE_COMMAND_ParamEnd));
 	return res;
 error:
 	if (res == 0)
 		res = -EINVAL;
-	return res;
+	goto exit;
 }
 
 static int do_negotiate(struct pw_impl_link *this)
@@ -457,7 +461,12 @@ static int do_negotiate(struct pw_impl_link *this)
 		goto error;
 	}
 
-	format = spa_pod_copy(format);
+	if ((format = spa_pod_copy(format)) == NULL) {
+		error = spa_aprintf("error copy format: %m");
+		res = -errno;
+		goto error;
+	}
+
 	pw_log_pod(SPA_LOG_LEVEL_DEBUG, format);
 	spa_pod_fixate(format);
 	pw_log_pod(SPA_LOG_LEVEL_DEBUG, format);
@@ -467,8 +476,7 @@ static int do_negotiate(struct pw_impl_link *this)
 	/* if port 1 had format and is idle, check if it changed. If so, renegotiate */
 	if (state[1] > PW_IMPL_PORT_STATE_CONFIGURE && info[1]->node->info.state == PW_NODE_STATE_IDLE) {
 		index = 0;
-		res = spa_node_port_enum_params_sync(node[1],
-				info[1]->port->direction, port_id[1],
+		res = pw_impl_port_enum_param(info[1]->port,
 				SPA_PARAM_Format, &index,
 				NULL, &current, &b);
 		switch (res) {
@@ -503,8 +511,7 @@ static int do_negotiate(struct pw_impl_link *this)
 	/* if port 0 had format and is idle, check if it changed. If so, renegotiate */
 	if (state[0] > PW_IMPL_PORT_STATE_CONFIGURE && info[0]->node->info.state == PW_NODE_STATE_IDLE) {
 		index = 0;
-		res = spa_node_port_enum_params_sync(node[0],
-				info[0]->port->direction, port_id[0],
+		res = pw_impl_port_enum_param(info[0]->port,
 				SPA_PARAM_Format, &index,
 				NULL, &current, &b);
 		switch (res) {
@@ -601,10 +608,10 @@ static int do_negotiate(struct pw_impl_link *this)
 error:
 	pw_context_debug_port_params(context, node[0],
 			info[0]->port->direction, port_id[0],
-			SPA_PARAM_EnumFormat, res, "input format (%s)", error);
+			SPA_PARAM_EnumFormat, res, "%s format (%s)", dir[0], error);
 	pw_context_debug_port_params(context, node[1],
 			info[1]->port->direction, port_id[1],
-			SPA_PARAM_EnumFormat, res, "output format (%s)", error);
+			SPA_PARAM_EnumFormat, res, "%s format (%s)", dir[1], error);
 	link_update_state(this, PW_LINK_STATE_ERROR, res, error);
 	free(format);
 	return res;
@@ -706,9 +713,6 @@ static int do_allocation(struct pw_impl_link *this)
 		 * because of the exclusive flag */
 		if (output->node->remote || input->node->remote || !output->exclusive)
 			alloc_flags |= PW_BUFFERS_FLAG_SHARED;
-
-		if (output->node->driver)
-			alloc_flags |= PW_BUFFERS_FLAG_IN_PRIORITY;
 
 		/* if output port can alloc buffers, alloc skeleton buffers */
 		if (SPA_FLAG_IS_SET(out_flags, SPA_PORT_FLAG_CAN_ALLOC_BUFFERS)) {
@@ -1044,8 +1048,16 @@ static void port_state_changed(struct pw_impl_link *this, struct pw_impl_port *p
 		struct pw_impl_port *other, enum pw_impl_port_state old,
 		enum pw_impl_port_state state, const char *error)
 {
+	struct impl *impl = SPA_CONTAINER_OF(this, struct impl, this);
+	struct port_info *info;
+
 	pw_log_debug("%p: port %p old:%d -> state:%d prepared:%d preparing:%d",
 			this, port, old, state, this->prepared, this->preparing);
+
+	if (port == impl->output.port)
+		info = &impl->output;
+	else
+		info = &impl->input;
 
 	switch (state) {
 	case PW_IMPL_PORT_STATE_ERROR:
@@ -1053,6 +1065,11 @@ static void port_state_changed(struct pw_impl_link *this, struct pw_impl_port *p
 		break;
 	case PW_IMPL_PORT_STATE_INIT:
 	case PW_IMPL_PORT_STATE_CONFIGURE:
+		if (old == PW_IMPL_PORT_STATE_INIT) {
+			port_set_busy_id(this, info, SPA_ID_INVALID, SPA_ID_INVALID);
+			pw_work_queue_cancel(impl->work, info, SPA_ID_INVALID);
+			old = PW_IMPL_PORT_STATE_READY;
+		}
 		if (this->prepared || state < old) {
 			this->prepared = this->preparing = false;
 			link_update_state(this, PW_LINK_STATE_INIT, 0, NULL);
@@ -1733,8 +1750,8 @@ void pw_impl_link_destroy(struct pw_impl_link *link)
 
 	try_unlink_controls(impl, link->output, link->input);
 
-	output_remove(link);
 	input_remove(link);
+	output_remove(link);
 
 	if (link->global) {
 		spa_hook_remove(&link->global_listener);

@@ -162,6 +162,9 @@ void client_free(struct client *client)
 	free(client->temporary_default_sink);
 	free(client->temporary_default_source);
 
+	free(client->bluetooth_profile_preference);
+	free(client->default_bluetooth_profile_preference);
+
 	pw_properties_free(client->props);
 	pw_properties_free(client->routes);
 
@@ -223,7 +226,8 @@ static int client_try_flush_messages(struct client *client)
 {
 	pw_log_trace("client %p: flushing", client);
 
-	spa_assert(!client->disconnect);
+	if (client->disconnect)
+		return -ENOTCONN;
 
 	while (!spa_list_is_empty(&client->out_messages)) {
 		struct message *m = spa_list_first(&client->out_messages, struct message, link);

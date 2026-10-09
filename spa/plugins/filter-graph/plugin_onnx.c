@@ -272,8 +272,8 @@ static int set_value(void *data, enum ONNXTensorElementDataType type, double val
  * }
  */
 
-static void *onnx_instantiate(const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor *desc,
-                        unsigned long SampleRate, int index, const char *config)
+static int onnx_instantiate1(const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor *desc,
+                        uint32_t rate, uint32_t index, const char *config, void **hndl)
 {
 	struct descriptor *d = (struct descriptor *)desc;
 	struct plugin *p = d->p;
@@ -282,14 +282,12 @@ static void *onnx_instantiate(const struct spa_fga_plugin *plugin, const struct 
 	size_t n, j;
 	int res;
 
-	errno = EINVAL;
-
 	i = calloc(1, sizeof(*i));
 	if (i == NULL)
-		return NULL;
+		return -errno;
 
 	i->desc = d;
-	i->rate = SampleRate;
+	i->rate = rate;
 
 	for (n = 0; n < d->n_tensors; n++) {
 		struct tensor_info *ti = &d->tensors[n];
@@ -309,22 +307,32 @@ static void *onnx_instantiate(const struct spa_fga_plugin *plugin, const struct 
 		CHECK(ort->GetTensorMutableData(i->tensor[n], (void**)&data));
 
 		if (ti->data_type == DATA_PARAM_RATE) {
-			if ((res = set_value(data, ti->type, (double)i->rate)) < 0) {
-				errno = -res;
+			if ((res = set_value(data, ti->type, (double)i->rate)) < 0)
 				goto error;
-			}
-
 		}
 	}
-	return i;
+	*hndl = i;
+	return 0;
 
 error_onnx:
 	const char* msg = ort->GetErrorMessage(status);
 	spa_log_error(p->log, "%s", msg);
 	ort->ReleaseStatus(status);
+	res = -EINVAL;
 error:
 	free(i);
-	return NULL;
+	return res;
+}
+
+static int onnx_instantiate(const struct spa_fga_plugin *plugin, const struct spa_fga_descriptor *desc,
+		uint32_t rate, const char *config, uint32_t n_hndl, void *hndl[])
+{
+	int res;
+	for (uint32_t i = 0; i < n_hndl; i++) {
+		if ((res = onnx_instantiate1(plugin, desc, rate, i, config, &hndl[i])) < 0)
+			return res;
+	}
+	return 0;
 }
 
 static void onnx_cleanup(void *instance)
@@ -475,6 +483,8 @@ static const struct spa_fga_descriptor *onnx_plugin_make_desc(void *plugin, cons
 	desc->desc.run = onnx_run;
 
 	desc->desc.name = strdup(name);
+	if (desc->desc.name == NULL)
+		goto error;
 	desc->desc.flags = 0;
 
 	spa_log_info(p->log, "onnx: loading model %s", path);
@@ -568,6 +578,8 @@ static const struct spa_fga_descriptor *onnx_plugin_make_desc(void *plugin, cons
 	}
 
 	desc->desc.ports = calloc(desc->n_tensors, sizeof(struct spa_fga_port));
+	if (desc->desc.ports == NULL)
+		goto error;
 	desc->desc.n_ports = 0;
 
 	/* make ports */

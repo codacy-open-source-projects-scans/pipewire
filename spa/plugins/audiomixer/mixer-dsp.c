@@ -5,6 +5,7 @@
 #include <errno.h>
 #include <string.h>
 #include <stdio.h>
+#include <math.h>
 #include <sys/mman.h>
 
 #include <spa/support/plugin.h>
@@ -14,6 +15,7 @@
 #include <spa/utils/list.h>
 #include <spa/utils/names.h>
 #include <spa/utils/string.h>
+#include <spa/utils/burg-pred.h>
 #include <spa/node/node.h>
 #include <spa/node/utils.h>
 #include <spa/node/io.h>
@@ -32,6 +34,12 @@ SPA_LOG_TOPIC_DEFINE_STATIC(log_topic, "spa.mixer-dsp");
 #define MAX_DATAS	SPA_AUDIO_MAX_CHANNELS
 #define MAX_PORTS	512
 #define MAX_ALIGN	MIX_OPS_MAX_ALIGN
+#define MAX_CURVE	4096u
+
+#define FADE_DURATION		0.020f
+#define FADE_PRED_HIST		256
+#define FADE_PRED_ORDER		16
+#define FADE_PRED_THRESHOLD	0.98
 
 #define PORT_DEFAULT_VOLUME	1.0
 #define PORT_DEFAULT_MUTE	false
@@ -58,7 +66,7 @@ struct buffer {
 	struct spa_meta_header *h;
 	struct spa_buffer buf;
 
-	void *datas[MAX_DATAS];
+	void **datas;
 };
 
 struct port {
@@ -77,14 +85,27 @@ struct port {
 
 	unsigned int have_format:1;
 
-	struct buffer buffers[MAX_BUFFERS];
+	struct buffer *buffers;
 	uint32_t n_buffers;
+	uint32_t last_buffer;
 
 	struct spa_list queue;
-	size_t queued_bytes;
 
 	struct spa_list mix_link;
 	bool active:1;
+	bool removing:1;
+	uint32_t ramp_up;
+	uint32_t ramp_down;
+
+	struct spa_burg_pred pred;
+	double *coef;
+	double *state;
+};
+
+struct ramp_info {
+	const float *data;
+	struct port *port;
+	int ramp_dir;
 };
 
 struct impl {
@@ -99,6 +120,9 @@ struct impl {
 	struct spa_loop *data_loop;
 
 	uint32_t quantum_limit;
+	uint32_t n_pred_hist;
+	uint32_t n_pred_order;
+	double pred_threshold;
 
 	struct mix_ops ops;
 
@@ -115,12 +139,19 @@ struct impl {
 	struct spa_list port_list;
 	struct spa_list free_list;
 
+	struct port *passthrough_port;
+
 	struct buffer *mix_buffers[MAX_PORTS];
 	const void *mix_datas[MAX_PORTS];
+	struct ramp_info ramp_info[MAX_PORTS];
 
 	int n_formats;
 	struct spa_audio_info format;
 	uint32_t stride;
+
+	float curve[MAX_CURVE];
+	uint32_t n_curve;
+	float fade_duration;
 
 	unsigned int have_format:1;
 	unsigned int started:1;
@@ -140,6 +171,8 @@ struct impl {
 #define GET_OUT_PORT(this,p)         (&this->out_ports[p])
 #define GET_PORT(this,d,p)           (d == SPA_DIRECTION_INPUT ? GET_IN_PORT(this,p) : GET_OUT_PORT(this,p))
 #define GET_PORT_ANY(this,d,p)       (CHECK_ANY_IN(this,d,p) ? NULL : GET_PORT(this,d,p))
+
+static int clear_buffers(struct impl *this, struct port *port);
 
 static int impl_node_enum_params(void *object, int seq,
 				 uint32_t id, uint32_t start, uint32_t num,
@@ -181,6 +214,9 @@ static int impl_node_send_command(void *object, const struct spa_command *comman
 		break;
 	case SPA_NODE_COMMAND_Pause:
 		this->started = false;
+		break;
+	case SPA_NODE_COMMAND_ParamBegin:
+	case SPA_NODE_COMMAND_ParamEnd:
 		break;
 	default:
 		return -ENOTSUP;
@@ -244,13 +280,22 @@ impl_node_set_callbacks(void *object,
 
 static struct port *get_free_port(struct impl *this)
 {
-	struct port *port;
-	if (!spa_list_is_empty(&this->free_list)) {
-		port = spa_list_first(&this->free_list, struct port, link);
-		spa_list_remove(&port->link);
-	} else {
-		port = calloc(1, sizeof(struct port));
+	struct port *port, *tmp;
+	uint32_t pred_size;
+
+	pred_size = sizeof(double) * this->n_pred_order;
+
+	spa_list_for_each_safe(port, tmp, &this->free_list, link) {
+		if (!port->active) {
+			spa_list_remove(&port->link);
+			spa_memzero(port, sizeof(struct port));
+			goto done;
+		}
 	}
+	port = calloc(1, sizeof(struct port) + pred_size * 2);
+done:
+	port->coef = SPA_PTROFF(port, sizeof(struct port), double);
+	port->state = SPA_PTROFF(port->coef, pred_size, double);
 	return port;
 }
 
@@ -313,7 +358,7 @@ impl_node_remove_port(void *object, enum spa_direction direction, uint32_t port_
 		if (--this->n_formats == 0)
 			this->have_format = false;
 	}
-	spa_memzero(port, sizeof(struct port));
+	clear_buffers(this, port);
 	spa_list_append(&this->free_list, &port->link);
 
 	spa_log_debug(this->log, "%p: remove port %d:%d", this,
@@ -459,8 +504,17 @@ next:
 static int clear_buffers(struct impl *this, struct port *port)
 {
 	uint32_t i, j;
+	struct port *outport = GET_OUT_PORT(this, 0);
 
 	spa_log_debug(this->log, "%p: clear buffers %p %d", this, port, port->n_buffers);
+
+	if (this->passthrough_port == port && port != outport) {
+		spa_log_debug(this->log, "%p: restore buffers %p %d", this, outport, outport->n_buffers);
+		for (i = 0; i < outport->n_buffers; i++) {
+			struct buffer *b = &outport->buffers[i];
+			*b->buffer = b->buf;
+		}
+	}
 	for (i = 0; i < port->n_buffers; i++) {
 		struct buffer *b = &port->buffers[i];
 		if (SPA_FLAG_IS_SET(b->flags, BUFFER_FLAG_MAPPED)) {
@@ -475,6 +529,8 @@ static int clear_buffers(struct impl *this, struct port *port)
 			SPA_FLAG_CLEAR(b->flags, BUFFER_FLAG_MAPPED);
 		}
 	}
+	free(port->buffers);
+	port->buffers = NULL;
 	port->n_buffers = 0;
 	spa_list_init(&port->queue);
 	return 0;
@@ -628,15 +684,35 @@ impl_node_port_use_buffers(void *object,
 
 	clear_buffers(this, port);
 
+	if (n_buffers > 0) {
+		size_t buffers_size = n_buffers * sizeof(struct buffer);
+		size_t total_datas = 0;
+		void **datas;
+
+		for (i = 0; i < n_buffers; i++) {
+			if (buffers[i]->n_datas > MAX_DATAS) {
+				res = -ENOSPC;
+				goto error;
+			}
+			total_datas += buffers[i]->n_datas;
+		}
+
+		port->buffers = calloc(1, buffers_size + total_datas * sizeof(void*));
+		if (port->buffers == NULL) {
+			res = -errno;
+			goto error;
+		}
+		datas = SPA_PTROFF(port->buffers, buffers_size, void*);
+		for (i = 0; i < n_buffers; i++) {
+			port->buffers[i].datas = datas;
+			datas += buffers[i]->n_datas;
+		}
+	}
+
 	for (i = 0; i < n_buffers; i++) {
 		struct buffer *b;
 		uint32_t n_datas = buffers[i]->n_datas;
 		struct spa_data *d = buffers[i]->datas;
-
-		if (n_datas > MAX_DATAS) {
-			res = -ENOSPC;
-			goto error;
-		}
 
 		b = &port->buffers[i];
 		b->buffer = buffers[i];
@@ -704,13 +780,55 @@ static int do_port_set_io(struct spa_loop *loop, bool async, uint32_t seq,
 {
 	struct io_info *info = user_data;
 	struct port *port = info->port;
+	struct impl *impl = info->impl;
 
-	if (info->data == NULL || info->size < sizeof(struct spa_io_buffers)) {
+	if ((info->data == NULL || info->size < sizeof(struct spa_io_buffers))) {
 		port->io[0] = NULL;
 		port->io[1] = NULL;
-		if (port->active) {
-			spa_list_remove(&port->mix_link);
-			port->active = false;
+		if (port->removing)
+			return 0;
+		port->removing = true;
+
+		if (port->direction == SPA_DIRECTION_INPUT &&
+		    port->last_buffer < port->n_buffers) {
+			struct buffer *buf = &port->buffers[port->last_buffer];
+			uint32_t offs, size, order, hist;
+			float *s;
+			struct spa_data *bd = &buf->buffer->datas[0];
+			bool fading;
+
+			offs = SPA_MIN(bd->chunk->offset, bd->maxsize);
+			size = SPA_MIN(bd->maxsize - offs, bd->chunk->size);
+			size /= sizeof(float);
+
+			hist = SPA_MIN(size, impl->n_pred_hist);
+			offs += (size - hist) * sizeof(float);
+
+			s = SPA_PTROFF(bd->data, offs, float);
+
+			/* check if the buffer was completely faded to silence */
+			fading = SPA_FLAG_IS_SET(bd->chunk->flags, SPA_CHUNK_FLAG_FADE);
+			if (fading && hist > 0)
+				fading = s[hist-1] == 0.0f;
+
+			if (!fading) {
+				/* was not faded out, start extrapolation and
+				 * fade out */
+				order = SPA_MIN(impl->n_pred_order, hist / 4);
+
+				spa_burg_pred_fit(&port->pred, s, hist,
+						impl->pred_threshold, port->state,
+						port->coef, order);
+				port->ramp_down = impl->n_curve;
+			} else {
+				/* was faded out */
+				port->ramp_down = 0;
+			}
+			spa_log_info(impl->log, "fade-out %d:%u %u/%u/%u %d", port->direction,
+					port->id, port->ramp_up, port->ramp_down, impl->n_curve,
+					port->pred.n_coef);
+		} else {
+			port->ramp_down = 0;
 		}
 	} else {
 		if (info->size >= sizeof(struct spa_io_async_buffers)) {
@@ -721,8 +839,12 @@ static int do_port_set_io(struct spa_loop *loop, bool async, uint32_t seq,
 			port->io[0] = info->data;
 			port->io[1] = info->data;
 		}
+		spa_log_info(impl->log, "fade-in %d:%u %u/%u/%u", port->direction, port->id,
+				port->ramp_up, port->ramp_down, impl->n_curve);
+		port->removing = false;
+		port->ramp_up = 0;
 		if (port->direction == SPA_DIRECTION_INPUT && !port->active) {
-			spa_list_append(&info->impl->mix_list, &port->mix_link);
+			spa_list_append(&impl->mix_list, &port->mix_link);
 			port->active = true;
 		}
 	}
@@ -778,16 +900,48 @@ static int impl_node_port_reuse_buffer(void *object, uint32_t port_id, uint32_t 
 	return queue_buffer(this, port, &port->buffers[buffer_id]);
 }
 
+static void ramp_up(struct impl *this, float *dst, uint32_t size, struct ramp_info *ri)
+{
+	uint32_t i, c;
+	struct port *port = ri->port;
+
+	spa_log_trace(this->log, "fade-in %u/%u", port->ramp_up, this->n_curve);
+
+	for (c = port->ramp_up, i = 0; i < size && c < this->n_curve; i++, c++)
+		dst[i] += ri->data[i] * this->curve[c];
+	for (; i < size; i++)
+		dst[i] += ri->data[i];
+	port->ramp_up = c;
+}
+
+static void ramp_down(struct impl *this, float *dst, uint32_t size, struct ramp_info *ri)
+{
+	uint32_t i, c;
+	struct port *port = ri->port;
+
+	spa_log_trace(this->log, "fade-out %u", port->ramp_down);
+
+	for (c = port->ramp_down, i = 0; i < size && c > 0; i++, c--)
+		dst[i] += spa_burg_pred_next(&port->pred) * this->curve[c-1];
+
+	port->ramp_down = c;
+	if (c == 0 && port->active && port->removing) {
+		spa_list_remove(&port->mix_link);
+		port->active = false;
+	}
+}
+
 static int impl_node_process(void *object)
 {
 	struct impl *this = object;
-	struct port *outport, *inport;
+	struct port *outport, *inport, *passthrough_port = NULL;
 	struct spa_io_buffers *outio;
-	uint32_t n_buffers, maxsize;
-	struct buffer **buffers;
-	struct buffer *outb;
+	uint32_t n_buffers, maxsize, n_ramps, i;
+	struct buffer *outb, *passthrough_buffer = NULL;
+	struct ramp_info *ramps;
 	const void **datas;
 	uint32_t cycle = this->position->clock.cycle & 1;
+	uint32_t duration = this->position->clock.duration;
 	struct spa_data *d;
 
 	spa_return_val_if_fail(this != NULL, -EINVAL);
@@ -808,43 +962,71 @@ static int impl_node_process(void *object)
 		outio->buffer_id = SPA_ID_INVALID;
 	}
 
-	buffers = this->mix_buffers;
 	datas = this->mix_datas;
-	n_buffers = 0;
+	ramps = this->ramp_info;
+	n_buffers = n_ramps = 0;
 
-	maxsize = UINT32_MAX;
+	maxsize = duration * sizeof(float);
 
 	spa_list_for_each(inport, &this->mix_list, mix_link) {
-		struct spa_io_buffers *inio = inport->io[cycle];
-		struct buffer *inb;
+		struct spa_io_buffers *inio;
+		struct buffer *inb = NULL;
 		struct spa_data *bd;
 		uint32_t size, offs;
+		float *s;
 
-		if (inio->buffer_id >= inport->n_buffers ||
+		if (SPA_UNLIKELY((inio = inport->io[cycle]) == NULL)) {
+			spa_log_trace_fp(this->log, "%p: skip input id:%d io:%p/%p/%d ramp:%d/%d",
+					this, inport->id, inport->io[0], inport->io[1], cycle,
+					inport->ramp_up, inport->ramp_down);
+		}
+		else if (inio->buffer_id >= inport->n_buffers ||
 		    inio->status != SPA_STATUS_HAVE_DATA) {
-			spa_log_trace_fp(this->log, "%p: skip input idx:%d "
-					"io:%p status:%d buf_id:%d n_buffers:%d", this,
-				inport->id, inio, inio->status, inio->buffer_id, inport->n_buffers);
-			continue;
+			spa_log_trace_fp(this->log, "%p: skip input id:%d "
+					"io:%p status:%d buf_id:%d n_buffers:%d ramp:%d/%d", this,
+				inport->id, inio, inio->status, inio->buffer_id, inport->n_buffers,
+				inport->ramp_up, inport->ramp_down);
+		} else {
+			inb = &inport->buffers[inio->buffer_id];
 		}
+		if (inb != NULL) {
+			bd = &inb->buffer->datas[0];
 
-		inb = &inport->buffers[inio->buffer_id];
-		bd = &inb->buffer->datas[0];
+			offs = SPA_MIN(bd->chunk->offset, bd->maxsize);
+			size = SPA_MIN(bd->maxsize - offs, bd->chunk->size);
+			maxsize = SPA_MIN(maxsize, size);
+			s = SPA_PTROFF(bd->data, offs, float);
 
-		offs = SPA_MIN(bd->chunk->offset, bd->maxsize);
-		size = SPA_MIN(bd->maxsize - offs, bd->chunk->size);
-		maxsize = SPA_MIN(maxsize, size);
+			spa_log_trace_fp(this->log, "%p: mix input %d %p->%p %d %d/%d %d:%d/%d %u", this,
+					inport->id, inio, outio, inio->status, inio->buffer_id, inport->n_buffers,
+					offs, size, (int)sizeof(float),
+					bd->chunk->flags);
 
-		spa_log_trace_fp(this->log, "%p: mix input %d %p->%p %d %d/%d %d:%d/%d %u", this,
-				inport->id, inio, outio, inio->status, inio->buffer_id, inport->n_buffers,
-				offs, size, (int)sizeof(float),
-				bd->chunk->flags);
-
-		if (!SPA_FLAG_IS_SET(bd->chunk->flags, SPA_CHUNK_FLAG_EMPTY)) {
-			datas[n_buffers] = SPA_PTROFF(bd->data, offs, void);
-			buffers[n_buffers++] = inb;
+			if (SPA_UNLIKELY(inport->ramp_up < this->n_curve)) {
+				if (SPA_FLAG_IS_SET(bd->chunk->flags, SPA_CHUNK_FLAG_FADE) &&
+				    size > 0 && s[0] == 0.0f)
+					/* new buffer was fade in from silence, complete ramp-up */
+					inport->ramp_up = this->n_curve;
+			}
+			if (SPA_UNLIKELY(inport->ramp_up < this->n_curve)) {
+				struct ramp_info *ri = &ramps[n_ramps++];
+				ri->port = inport;
+				ri->ramp_dir = 1;
+				ri->data = s;
+			} else {
+				datas[n_buffers++] = s;
+				passthrough_buffer = inb;
+				passthrough_port = inport;
+			}
+			inport->last_buffer = inio->buffer_id;
+			inio->status = SPA_STATUS_NEED_DATA;
 		}
-		inio->status = SPA_STATUS_NEED_DATA;
+		if (inport->ramp_down > 0) {
+			/* removed port, ramp down */
+			struct ramp_info *ri = &ramps[n_ramps++];
+			ri->port = inport;
+			ri->ramp_dir = -1;
+		}
 	}
 
 	outb = dequeue_buffer(this, outport);
@@ -857,26 +1039,40 @@ static int impl_node_process(void *object)
 					suppressed, outport->n_buffers);
 		return -EPIPE;
 	}
-
 	d = outb->buf.datas;
 
-	if (n_buffers == 1 && SPA_FLAG_IS_SET(d[0].flags, SPA_DATA_FLAG_DYNAMIC)) {
+	if (n_buffers == 1 && SPA_FLAG_IS_SET(d[0].flags, SPA_DATA_FLAG_DYNAMIC) && n_ramps == 0) {
 		spa_log_trace_fp(this->log, "%p: %d passthrough", this, n_buffers);
-		*outb->buffer = *buffers[0]->buffer;
+		*outb->buffer = *passthrough_buffer->buffer;
+		this->passthrough_port = passthrough_port;
 	} else {
+		bool empty = n_buffers == 0 && n_ramps == 0;
+		float *dst = d[0].data;
+		uint32_t dst_samples;
+
+		this->passthrough_port = NULL;
 		*outb->buffer = outb->buf;
 
 		maxsize = SPA_MIN(maxsize, d[0].maxsize);
+		dst_samples = maxsize / sizeof(float);
 
 		d[0].chunk->offset = 0;
 		d[0].chunk->size = maxsize;
 		d[0].chunk->stride = sizeof(float);
-		SPA_FLAG_UPDATE(d[0].chunk->flags, SPA_CHUNK_FLAG_EMPTY, n_buffers == 0);
+		SPA_FLAG_UPDATE(d[0].chunk->flags, SPA_CHUNK_FLAG_EMPTY, empty);
+		SPA_FLAG_UPDATE(d[0].chunk->flags, SPA_CHUNK_FLAG_FADE, n_ramps > 0);
 
-		spa_log_trace_fp(this->log, "%p: %d mix %d", this, n_buffers, maxsize);
+		spa_log_trace_fp(this->log, "%p: %d mix %d %u", this, n_buffers, maxsize, n_ramps);
 
-		mix_ops_process(&this->ops, d[0].data,
-				datas, n_buffers, maxsize / sizeof(float));
+		mix_ops_process(&this->ops, dst, datas, n_buffers, dst_samples);
+
+		for (i = 0; i < n_ramps; i++) {
+			struct ramp_info *ri = &ramps[i];
+			if (ri->ramp_dir < 0)
+				ramp_down(this, dst, dst_samples, ri);
+			else
+				ramp_up(this, dst, dst_samples, ri);
+		}
 	}
 
 	outio->buffer_id = outb->id;
@@ -929,9 +1125,11 @@ static int impl_clear(struct spa_handle *handle)
 
 	this = (struct impl *) handle;
 
+	clear_buffers(this, GET_OUT_PORT(this, 0));
 	spa_list_insert_list(&this->free_list, &this->port_list);
 	spa_list_consume(port, &this->free_list, link) {
 		spa_list_remove(&port->link);
+		clear_buffers(this, port);
 		free(port);
 	}
 	return 0;
@@ -978,12 +1176,30 @@ impl_init(const struct spa_handle_factory *factory,
 		this->max_align = SPA_MIN(MAX_ALIGN, spa_cpu_get_max_align(this->cpu));
 	}
 
+	this->fade_duration = FADE_DURATION;
+	this->n_pred_hist = FADE_PRED_HIST;
+	this->n_pred_order = FADE_PRED_ORDER;
+	this->pred_threshold = FADE_PRED_THRESHOLD;
+
 	for (i = 0; info && i < info->n_items; i++) {
 		const char *k = info->items[i].key;
 		const char *s = info->items[i].value;
 		if (spa_streq(k, "clock.quantum-limit"))
 			spa_atou32(s, &this->quantum_limit, 0);
+		if (spa_streq(k, "fade.duration"))
+			spa_atof(s, &this->fade_duration);
+		if (spa_streq(k, "fade.predict.threshold"))
+			spa_atod(s, &this->pred_threshold);
+		if (spa_streq(k, "fade.predict.history"))
+			spa_atou32(s, &this->n_pred_hist, 0);
+		if (spa_streq(k, "fade.predict.order"))
+			spa_atou32(s, &this->n_pred_order, 0);
 	}
+
+	this->n_curve = SPA_MIN((uint32_t)(this->fade_duration * 48000), MAX_CURVE);
+	/* S-shaped curve */
+	for (i = 0; i < this->n_curve; i++)
+		this->curve[i] = (float)(0.5 + 0.5 * cos(M_PI + M_PI * i / this->n_curve));
 
 	spa_hook_list_init(&this->hooks);
 	spa_list_init(&this->port_list);

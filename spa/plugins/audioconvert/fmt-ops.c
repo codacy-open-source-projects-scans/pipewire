@@ -89,10 +89,12 @@ static struct conv_info conv_table[] =
 	MAKE(F32, F32, 0, conv_copy32_c),
 	MAKE(F32P, F32P, 0, conv_copy32d_c),
 #if defined (HAVE_SSE2)
+	MAKE(F32, F32P, 2, conv_32_to_32d_2_sse2, SPA_CPU_FLAG_SSE2),
 	MAKE(F32, F32P, 0, conv_32_to_32d_sse2, SPA_CPU_FLAG_SSE2),
 #endif
 	MAKE(F32, F32P, 0, conv_32_to_32d_c),
 #if defined (HAVE_SSE2)
+	MAKE(F32P, F32, 2, conv_32d_to_32_2_sse2, SPA_CPU_FLAG_SSE2),
 	MAKE(F32P, F32, 0, conv_32d_to_32_sse2, SPA_CPU_FLAG_SSE2),
 #endif
 	MAKE(F32P, F32, 0, conv_32d_to_32_c),
@@ -110,9 +112,11 @@ static struct conv_info conv_table[] =
 	MAKE(U32, F32P, 0, conv_u32_to_f32d_c),
 
 #if defined (HAVE_AVX2)
+	MAKE(S32, F32P, 2, conv_s32_to_f32d_2_avx2, SPA_CPU_FLAG_AVX2),
 	MAKE(S32, F32P, 0, conv_s32_to_f32d_avx2, SPA_CPU_FLAG_AVX2),
 #endif
 #if defined (HAVE_SSE2)
+	MAKE(S32, F32P, 2, conv_s32_to_f32d_2_sse2, SPA_CPU_FLAG_SSE2),
 	MAKE(S32, F32P, 0, conv_s32_to_f32d_sse2, SPA_CPU_FLAG_SSE2),
 #endif
 #if defined (HAVE_RVV)
@@ -325,10 +329,12 @@ static struct conv_info conv_table[] =
 	MAKE(S32, S32, 0, conv_copy32_c),
 	MAKE(S32P, S32P, 0, conv_copy32d_c),
 #if defined (HAVE_SSE2)
+	MAKE(S32, S32P, 2, conv_32_to_32d_2_sse2, SPA_CPU_FLAG_SSE2),
 	MAKE(S32, S32P, 0, conv_32_to_32d_sse2, SPA_CPU_FLAG_SSE2),
 #endif
 	MAKE(S32, S32P, 0, conv_32_to_32d_c),
 #if defined (HAVE_SSE2)
+	MAKE(S32P, S32, 2, conv_32d_to_32_2_sse2, SPA_CPU_FLAG_SSE2),
 	MAKE(S32P, S32, 0, conv_32d_to_32_sse2, SPA_CPU_FLAG_SSE2),
 #endif
 	MAKE(S32P, S32, 0, conv_32d_to_32_c),
@@ -343,10 +349,12 @@ static struct conv_info conv_table[] =
 	MAKE(S24_32, S24_32, 0, conv_copy32_c),
 	MAKE(S24_32P, S24_32P, 0, conv_copy32d_c),
 #if defined (HAVE_SSE2)
+	MAKE(S24_32, S24_32P, 2, conv_32_to_32d_2_sse2, SPA_CPU_FLAG_SSE2),
 	MAKE(S24_32, S24_32P, 0, conv_32_to_32d_sse2, SPA_CPU_FLAG_SSE2),
 #endif
 	MAKE(S24_32, S24_32P, 0, conv_32_to_32d_c),
 #if defined (HAVE_SSE2)
+	MAKE(S24_32P, S24_32, 2, conv_32d_to_32_2_sse2, SPA_CPU_FLAG_SSE2),
 	MAKE(S24_32P, S24_32, 0, conv_32d_to_32_sse2, SPA_CPU_FLAG_SSE2),
 #endif
 	MAKE(S24_32P, S24_32, 0, conv_32d_to_32_c),
@@ -516,6 +524,14 @@ static const float wan3[] = { /* Table 3; 3 Coefficients */
 static const float lips44[] = { /* improved E-weighted (appendix: 5) */
 	2.033f, -2.165f, 1.959f, -1.590f, 0.6149f
 };
+/* Shifts noise to the ultrasonic spectrum */
+static const float highpass3[] = {
+	3.0f, -3.f,  1.f
+};
+/* Shifts noise to the ultrasonic spectrum, less aggressive for higher rates */
+static const float highpass2[] = {
+	2.0f, -1.f
+};
 
 static const struct dither_info {
 	uint32_t method;
@@ -529,7 +545,9 @@ static const struct dither_info {
 	{ DITHER_METHOD_TRIANGULAR, NOISE_METHOD_TRIANGULAR, },
 	{ DITHER_METHOD_TRIANGULAR_HF, NOISE_METHOD_TRIANGULAR_HF, },
 	{ DITHER_METHOD_WANNAMAKER_3, NOISE_METHOD_TRIANGULAR_HF, 44100, wan3, SPA_N_ELEMENTS(wan3) },
-	{ DITHER_METHOD_LIPSHITZ, NOISE_METHOD_TRIANGULAR, 44100, lips44, SPA_N_ELEMENTS(lips44) }
+	{ DITHER_METHOD_LIPSHITZ, NOISE_METHOD_TRIANGULAR, 44100, lips44, SPA_N_ELEMENTS(lips44) },
+	{ DITHER_METHOD_HIGHPASS3, NOISE_METHOD_TRIANGULAR, 88200, highpass3, SPA_N_ELEMENTS(highpass3) },
+	{ DITHER_METHOD_HIGHPASS2, NOISE_METHOD_TRIANGULAR, 172000, highpass2, SPA_N_ELEMENTS(highpass2) }
 };
 
 static const struct dither_info *find_dither_info(uint32_t method, uint32_t rate)
@@ -539,7 +557,7 @@ static const struct dither_info *find_dither_info(uint32_t method, uint32_t rate
 			continue;
 		/* don't use shaped for too low rates, it moves the noise to
 		 * audible ranges */
-		if (di->ns != NULL && rate < di->rate * 3 / 4)
+		if (di->ns != NULL && rate < 22050)
 			return find_dither_info(DITHER_METHOD_TRIANGULAR_HF, rate);
 		return di;
 	}
@@ -640,7 +658,8 @@ int convert_init(struct convert *conv)
 	for (i = 0; i < RANDOM_SIZE; i++)
 		conv->random[i] = random();
 
-	conv->is_passthrough = conv->src_fmt == conv->dst_fmt;
+	SPA_FLAG_UPDATE(conv->flags, CONVERT_FLAG_CLEAR_ON_EMPTY, conv->noise_bits == 0);
+	SPA_FLAG_UPDATE(conv->flags, CONVERT_FLAG_PASSTHROUGH, conv->src_fmt == conv->dst_fmt);
 	conv->func_cpu_flags = info->cpu_flags;
 	conv->update_noise = ninfo->noise;
 	conv->process = info->process;

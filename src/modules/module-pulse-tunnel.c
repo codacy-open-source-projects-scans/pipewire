@@ -79,6 +79,7 @@
  * - \ref PW_KEY_NODE_DESCRIPTION
  * - \ref PW_KEY_NODE_GROUP
  * - \ref PW_KEY_NODE_VIRTUAL
+ * - \ref PW_KEY_NODE_NETWORK
  * - \ref PW_KEY_MEDIA_CLASS
  * - \ref PW_KEY_TARGET_OBJECT to specify the remote node.name or serial.id to link to
  *
@@ -270,6 +271,9 @@ static void stream_param_changed(void *d, uint32_t id, const struct spa_pod *par
 	struct spa_pod_prop *prop;
 
 	if (param == NULL || id != SPA_PARAM_Props)
+		return;
+
+	if (!spa_pod_is_object_type(param, SPA_TYPE_OBJECT_Props))
 		return;
 
 	spa_pod_builder_push_object(&b, &f[0], SPA_TYPE_OBJECT_Props, SPA_PARAM_Props);
@@ -1149,6 +1153,10 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 
 	spa_ringbuffer_init(&impl->ring);
 	impl->buffer = calloc(1, RINGBUFFER_SIZE);
+	if (impl->buffer == NULL) {
+		res = -errno;
+		goto error;
+	}
 	spa_dll_init(&impl->dll);
 	impl->rate_limit.interval = 2 * SPA_NSEC_PER_SEC;
 	impl->rate_limit.burst = 1;

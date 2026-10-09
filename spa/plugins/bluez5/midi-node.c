@@ -1358,11 +1358,13 @@ static int apply_props(struct impl *this, const struct spa_pod *param)
 	if (param == NULL) {
 		reset_props(&new_props);
 	} else {
-		spa_pod_parse_object(param,
+		changed = spa_pod_parse_object(param,
 				SPA_TYPE_OBJECT_Props, NULL,
 				SPA_PROP_latencyOffsetNsec, SPA_POD_OPT_Long(&new_props.latency_offset),
 				SPA_PROP_deviceName, SPA_POD_OPT_Stringn(new_props.device_name,
 						sizeof(new_props.device_name)));
+		if (changed < 0)
+			return changed;
 	}
 
 	changed = (memcmp(&new_props, &this->props, sizeof(struct props)) != 0);
@@ -1425,6 +1427,9 @@ static int impl_node_send_command(void *object, const struct spa_command *comman
 			return res;
 		if (res2 < 0)
 			return res2;
+		break;
+	case SPA_NODE_COMMAND_ParamBegin:
+	case SPA_NODE_COMMAND_ParamEnd:
 		break;
 	default:
 		return -ENOTSUP;
@@ -2089,6 +2094,10 @@ impl_init(const struct spa_handle_factory *factory,
 
 	this->timerfd = spa_system_timerfd_create(this->data_system,
 			CLOCK_MONOTONIC, SPA_FD_CLOEXEC | SPA_FD_NONBLOCK);
+	if (this->timerfd < 0) {
+		res = this->timerfd;
+		goto fail;
+	}
 
 	return 0;
 

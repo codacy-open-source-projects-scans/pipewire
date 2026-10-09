@@ -15,6 +15,8 @@
 #include "channelmix-ops.h"
 #include "hilbert.h"
 
+#define MAX_BUFFER_SIZE 4096
+
 #define ANY	((uint32_t)-1)
 #define EQ	((uint32_t)-2)
 
@@ -192,8 +194,9 @@ static bool match_mix(struct channelmix *mix,
 	return matched;
 }
 
-static int make_matrix(struct channelmix *mix)
+static void impl_channelmix_reconfigure(struct channelmix *mix)
 {
+	CHANNELMIX_DEF_MATRIX(matrix_orig, mix, matrix_orig);
 	float matrix[MAX_CHANNELS][MAX_CHANNELS] = {{ 0.0f }};
 	uint64_t src_mask = mix->src_mask, src_paired;
 	uint64_t dst_mask = mix->dst_mask, dst_paired;
@@ -747,7 +750,7 @@ done:
 						src_mask == 0 ? "UNK" :
 						spa_debug_type_find_short_name(spa_type_audio_channel, j + _SH));
 
-			mix->matrix_orig[ic][jc++] = matrix[i][j];
+			matrix_orig[ic][jc++] = matrix[i][j];
 			sum += fabsf(matrix[i][j]);
 
 			if (matrix[i][j] == 0.0f)
@@ -756,7 +759,7 @@ done:
 				spa_strbuf_append(&sb1, "%1.3f ", matrix[i][j]);
 		}
 		if (sb2.pos > 0)
-			spa_log_info(mix->log, "     %s", str2);
+			spa_log_info(mix->log, "         %s", str2);
 		if (sb1.pos > 0) {
 			spa_log_info(mix->log, "%03d %-4.4s %s   %f", ic,
 					dst_mask == 0 ? "UNK" :
@@ -780,14 +783,15 @@ done:
 		spa_log_info(mix->log, "normalize %f", maxsum);
 		for (i = 0; i < dst_chan; i++)
 			for (j = 0; j < src_chan; j++)
-		                mix->matrix_orig[i][j] /= maxsum;
+		                matrix_orig[i][j] /= maxsum;
 	}
-	return 0;
 }
 
 static void impl_channelmix_set_volume(struct channelmix *mix, float volume, bool mute,
 		uint32_t n_channel_volumes, float *channel_volumes)
 {
+	CHANNELMIX_DEF_MATRIX(matrix_orig, mix, matrix_orig);
+	CHANNELMIX_DEF_MATRIX(matrix, mix, matrix);
 	float volumes[MAX_CHANNELS];
 	float vol = mute ? 0.0f : volume, t;
 	uint32_t i, j;
@@ -806,19 +810,19 @@ static void impl_channelmix_set_volume(struct channelmix *mix, float volume, boo
 	if (n_channel_volumes == src_chan) {
 		for (i = 0; i < dst_chan; i++) {
 			for (j = 0; j < src_chan; j++) {
-				mix->matrix[i][j] = mix->matrix_orig[i][j] * volumes[j];
+				matrix[i][j] = matrix_orig[i][j] * volumes[j];
 			}
 		}
 	} else if (n_channel_volumes == dst_chan) {
 		for (i = 0; i < dst_chan; i++) {
 			for (j = 0; j < src_chan; j++) {
-				mix->matrix[i][j] = mix->matrix_orig[i][j] * volumes[i];
+				matrix[i][j] = matrix_orig[i][j] * volumes[i];
 			}
 		}
 	} else if (n_channel_volumes == 0) {
 		for (i = 0; i < dst_chan; i++) {
 			for (j = 0; j < src_chan; j++) {
-				mix->matrix[i][j] = mix->matrix_orig[i][j] * vol;
+				matrix[i][j] = matrix_orig[i][j] * vol;
 			}
 		}
 	}
@@ -830,7 +834,7 @@ static void impl_channelmix_set_volume(struct channelmix *mix, float volume, boo
 	t = 0.0;
 	for (i = 0; i < dst_chan; i++) {
 		for (j = 0; j < src_chan; j++) {
-			float v = mix->matrix[i][j];
+			float v = matrix[i][j];
 			if (i == 0 && j == 0)
 				t = v;
 			else if (t != v)
@@ -853,7 +857,7 @@ static void impl_channelmix_set_volume(struct channelmix *mix, float volume, boo
 		for (i = 0; i < dst_chan; i++) {
 			spa_strbuf_init(&sb1, str1, sizeof(str1));
 			for (j = 0; j < src_chan; j++) {
-				float v = mix->matrix[i][j];
+				float v = matrix[i][j];
 				if (i == 0)
 					spa_strbuf_append(&sb2, " %03d  ", j);
 				if (v == 0.0f)
@@ -875,6 +879,8 @@ static void impl_channelmix_set_volume(struct channelmix *mix, float volume, boo
 static void impl_channelmix_free(struct channelmix *mix)
 {
 	mix->process = NULL;
+	free(mix->data);
+	mix->data = NULL;
 }
 
 void channelmix_reset(struct channelmix *mix)
@@ -895,6 +901,8 @@ void channelmix_reset(struct channelmix *mix)
 int channelmix_init(struct channelmix *mix)
 {
 	const struct channelmix_info *info;
+	void *d, *b[2];
+	size_t taps_size, buffer_size, alloc_size, matrix_size, lr4_size;
 
 	if (mix->src_chan > MAX_CHANNELS ||
 	    mix->dst_chan > MAX_CHANNELS)
@@ -908,29 +916,56 @@ int channelmix_init(struct channelmix *mix)
 	mix->free = impl_channelmix_free;
 	mix->process = info->process;
 	mix->set_volume = impl_channelmix_set_volume;
+	mix->reconfigure = impl_channelmix_reconfigure;
 	mix->delay = (uint32_t)(mix->rear_delay * mix->freq / 1000.0f);
 	mix->func_cpu_flags = info->cpu_flags;
 	mix->func_name = info->name;
 
-	spa_zero(mix->taps_mem);
-	mix->taps = SPA_PTR_ALIGN(mix->taps_mem, CHANNELMIX_OPS_MAX_ALIGN, float);
-	mix->buffer[0] = SPA_PTR_ALIGN(&mix->buffer_mem[0], CHANNELMIX_OPS_MAX_ALIGN, float);
-	mix->buffer[1] = SPA_PTR_ALIGN(&mix->buffer_mem[2*BUFFER_SIZE], CHANNELMIX_OPS_MAX_ALIGN, float);
+	if (mix->hilbert_taps > 0)
+		mix->n_taps = SPA_CLAMP(mix->hilbert_taps, 15u, MAX_TAPS) | 1;
+	else
+		mix->n_taps = 1;
+
+	mix->buffer_size = SPA_ROUND_UP_N(mix->delay + mix->n_taps, CHANNELMIX_OPS_MAX_ALIGN/4);
+	if (mix->buffer_size > MAX_BUFFER_SIZE) {
+		mix->buffer_size = MAX_BUFFER_SIZE;
+		mix->delay = MAX_BUFFER_SIZE - mix->n_taps;
+	}
+	taps_size = SPA_ROUND_UP(mix->n_taps * sizeof(float), CHANNELMIX_OPS_MAX_ALIGN);
+	buffer_size = SPA_ROUND_UP(mix->buffer_size*2 * sizeof(float) +
+			CHANNELMIX_OPS_MAX_ALIGN, CHANNELMIX_OPS_MAX_ALIGN);
+	matrix_size = SPA_ROUND_UP(mix->src_chan * mix->dst_chan * sizeof(float), CHANNELMIX_OPS_MAX_ALIGN);
+	lr4_size = SPA_ROUND_UP(mix->dst_chan * sizeof(struct lr4), CHANNELMIX_OPS_MAX_ALIGN);
+
+	alloc_size = taps_size + buffer_size*2 + lr4_size + matrix_size*2 + CHANNELMIX_OPS_MAX_ALIGN;
+	d = calloc(1, alloc_size);
+	if (d == NULL)
+		return -errno;
+
+	mix->data = d;
+	mix->taps = SPA_PTR_ALIGN(d, CHANNELMIX_OPS_MAX_ALIGN, float);
+	mix->buffer[0] = SPA_PTROFF_ALIGN(mix->taps, taps_size, CHANNELMIX_OPS_MAX_ALIGN, float);
+	mix->buffer[1] = SPA_PTROFF_ALIGN(mix->buffer[0], buffer_size, CHANNELMIX_OPS_MAX_ALIGN, float);
+	mix->matrix = SPA_PTROFF_ALIGN(mix->buffer[1], buffer_size, CHANNELMIX_OPS_MAX_ALIGN, float);
+	mix->matrix_orig = SPA_PTROFF_ALIGN(mix->matrix, matrix_size, CHANNELMIX_OPS_MAX_ALIGN, float);
+	mix->lr4 = SPA_PTROFF_ALIGN(mix->matrix_orig, matrix_size, CHANNELMIX_OPS_MAX_ALIGN, struct lr4);
+
+
+	b[0] = SPA_PTROFF_ALIGN(mix->lr4, lr4_size, CHANNELMIX_OPS_MAX_ALIGN, float);
+	b[1] = SPA_PTROFF_ALIGN(b[0], matrix_size, CHANNELMIX_OPS_MAX_ALIGN, float);
 
 	if (mix->hilbert_taps > 0) {
-		mix->n_taps = SPA_CLAMP(mix->hilbert_taps, 15u, MAX_TAPS) | 1;
 		blackman_window(mix->taps, mix->n_taps);
 		hilbert_generate(mix->taps, mix->n_taps);
 		reverse_taps(mix->taps, mix->n_taps);
 	} else {
-		mix->n_taps = 1;
 		mix->taps[0] = 1.0f;
 	}
-	if (mix->delay + mix->n_taps > BUFFER_SIZE)
-		mix->delay = BUFFER_SIZE - mix->n_taps;
 
 	spa_log_debug(mix->log, "selected %s delay:%d options:%08x", info->name, mix->delay,
 			mix->options);
 
-	return make_matrix(mix);
+	channelmix_reconfigure(mix);
+
+	return 0;
 }

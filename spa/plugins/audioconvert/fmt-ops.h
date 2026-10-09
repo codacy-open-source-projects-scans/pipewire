@@ -212,6 +212,8 @@ struct convert {
 #define DITHER_METHOD_TRIANGULAR_HF	3
 #define DITHER_METHOD_WANNAMAKER_3	4
 #define DITHER_METHOD_LIPSHITZ		5
+#define DITHER_METHOD_HIGHPASS3		6
+#define DITHER_METHOD_HIGHPASS2		7
 	uint32_t method;
 
 	uint32_t src_fmt;
@@ -222,7 +224,9 @@ struct convert {
 	uint32_t func_cpu_flags;
 	const char *func_name;
 
-	unsigned int is_passthrough:1;
+#define CONVERT_FLAG_PASSTHROUGH	(1u<<0)
+#define CONVERT_FLAG_CLEAR_ON_EMPTY	(1u<<1)
+	uint32_t flags;
 
 	float scale;
 	uint32_t *random;
@@ -267,6 +271,10 @@ static const struct dither_method_info {
 		"wannamaker3", "Wannamaker 3 dithering", },
 	[DITHER_METHOD_LIPSHITZ] = { DITHER_METHOD_LIPSHITZ,
 		"shaped5", "Lipshitz 5 dithering", },
+	[DITHER_METHOD_HIGHPASS3] = { DITHER_METHOD_HIGHPASS3,
+		"highpass3", "Highpass 3 dithering", },
+	[DITHER_METHOD_HIGHPASS2] = { DITHER_METHOD_HIGHPASS2,
+		"highpass2", "Highpass 2 dithering", },
 };
 
 static inline uint32_t dither_method_from_label(const char *label)
@@ -282,6 +290,9 @@ static inline uint32_t dither_method_from_label(const char *label)
 #define convert_process(conv,...)	(conv)->process(conv, __VA_ARGS__)
 #define convert_clear(conv,...)		(conv)->clear(conv, __VA_ARGS__)
 #define convert_free(conv)		(conv)->free(conv)
+
+#define convert_is_passthrough(conv)	SPA_FLAG_IS_SET((conv)->flags, CONVERT_FLAG_PASSTHROUGH)
+#define convert_is_clear_on_empty(conv)	SPA_FLAG_IS_SET((conv)->flags, CONVERT_FLAG_CLEAR_ON_EMPTY)
 
 #define DEFINE_NOISE_FUNCTION(name,arch)				\
 void conv_noise_##name##_##arch(struct convert *conv, float *noise,	\
@@ -457,6 +468,7 @@ DEFINE_FUNCTION(s16_to_f32d, sse2);
 DEFINE_FUNCTION(s16s_to_f32d, sse2);
 DEFINE_FUNCTION(s16s_to_f32d_2, sse2);
 DEFINE_FUNCTION(s24_to_f32d, sse2);
+DEFINE_FUNCTION(s32_to_f32d_2, sse2);
 DEFINE_FUNCTION(s32_to_f32d, sse2);
 DEFINE_FUNCTION(f32d_to_s32, sse2);
 DEFINE_FUNCTION(f32d_to_s32_noise, sse2);
@@ -468,8 +480,10 @@ DEFINE_FUNCTION(f32d_to_s16s, sse2);
 DEFINE_FUNCTION(f32d_to_s16_noise, sse2);
 DEFINE_FUNCTION(f32d_to_s16d, sse2);
 DEFINE_FUNCTION(f32d_to_s16d_noise, sse2);
+DEFINE_FUNCTION(32_to_32d_2, sse2);
 DEFINE_FUNCTION(32_to_32d, sse2);
 DEFINE_FUNCTION(32s_to_32d, sse2);
+DEFINE_FUNCTION(32d_to_32_2, sse2);
 DEFINE_FUNCTION(32d_to_32, sse2);
 DEFINE_FUNCTION(32d_to_32s, sse2);
 #endif
@@ -485,6 +499,7 @@ DEFINE_FUNCTION(s16_to_f32d, avx2);
 DEFINE_FUNCTION(s16s_to_f32d, avx2);
 DEFINE_FUNCTION(s16s_to_f32d_2, avx2);
 DEFINE_FUNCTION(s24_to_f32d, avx2);
+DEFINE_FUNCTION(s32_to_f32d_2, avx2);
 DEFINE_FUNCTION(s32_to_f32d, avx2);
 DEFINE_FUNCTION(f32d_to_s32, avx2);
 DEFINE_FUNCTION(f32d_to_s16_4, avx2);

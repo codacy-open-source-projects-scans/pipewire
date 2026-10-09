@@ -55,7 +55,7 @@
  * - `node.always-process = <bool>`: true to receive even when not running
  * - `sess.latency.msec = <str>`: target network latency in milliseconds, default 100
  * - `stream.props = {}`: properties to be passed to all the stream
- * - `stream.rules` = <rules>: match rules, use create-stream actions.
+ * - `stream.rules` = \<rules\>: match rules, use create-stream actions.
  *
  * ### stream.rules matches
  *
@@ -353,6 +353,8 @@ static int rule_matched(void *data, const char *location, const char *action,
 	i->matched = true;
 	if (spa_streq(action, "create-stream")) {
 		struct pw_properties *p = pw_properties_copy(i->props);
+		if (p == NULL)
+			return -errno;
 		pw_properties_update_string(p, str, len);
 		create_stream(i->stream, p);
 	}
@@ -373,10 +375,12 @@ do_setup_stream(struct spa_loop *loop,
 	uint16_t port = 0;
 
 	props = pw_properties_copy(impl->stream_props);
+	if (props == NULL)
+		return -errno;
 
 	pw_net_get_ip(&s->sa, addr, sizeof(addr), NULL, &port);
 
-	pw_properties_setf(props, "sess.name", "%s", s->header.stream_name);
+	pw_properties_setf(props, "sess.name", "%.*s", VBAN_STREAM_NAME_SIZE, s->header.stream_name);
 	pw_properties_setf(props, "vban.ip", "%s", addr);
 	pw_properties_setf(props, "vban.port", "%u", port);
 
@@ -521,7 +525,7 @@ invalid_version:
 
 static int listen_start(struct impl *impl)
 {
-	int fd;
+	int fd, res;
 
 	if (impl->source != NULL)
 		return 0;
@@ -530,16 +534,16 @@ static int listen_start(struct impl *impl)
 
 	if ((fd = make_socket((const struct sockaddr *)&impl->src_addr,
 					impl->src_len, impl->ifname)) < 0) {
-		pw_log_error("failed to create socket: %m");
+		pw_log_error("failed to create socket: %s", spa_strerror(fd));
 		return fd;
 	}
 
 	impl->source = pw_loop_add_io(impl->data_loop, fd,
 				SPA_IO_IN, true, on_vban_io, impl);
 	if (impl->source == NULL) {
+		res = -errno;
 		pw_log_error("can't create io source: %m");
-		close(fd);
-		return -errno;
+		return res;
 	}
 	return 0;
 }
@@ -711,8 +715,9 @@ int pipewire__module_init(struct pw_impl_module *module, const char *args)
 	str = pw_properties_get(props, "local.ifname");
 	impl->ifname = str ? strdup(str) : NULL;
 
-	impl->src_port = pw_properties_get_uint32(props, "source.port", DEFAULT_SOURCE_PORT);
-	if (impl->src_port == 0) {
+	if ((str = pw_properties_get(props, "source.port")) == NULL)
+		str = SPA_STRINGIFY(DEFAULT_SOURCE_PORT);
+	if ((impl->src_port = pw_net_parse_port(str, 0)) == 0) {
 		pw_log_error("invalid source.port");
 		goto out;
 	}

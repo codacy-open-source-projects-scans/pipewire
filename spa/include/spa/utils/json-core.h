@@ -665,14 +665,18 @@ SPA_API_JSON int spa_json_parse_string(const char *val, int len, char *result)
 	return spa_json_parse_stringn(val, len, result, len+1);
 }
 
-SPA_API_JSON int spa_json_encode_string(char *str, int size, const char *val)
+SPA_API_JSON size_t spa_json_encode_stringn(char *dst, size_t capacity, const char *src, size_t length)
 {
-	int len = 0;
 	static const char hex[] = { "0123456789abcdef" };
-#define __PUT(c) { if (len < size) *str++ = c; len++; }
+
+	size_t len = 0;
+#define __PUT(c) do { if (len < capacity) *dst++ = c; len++; } while (0)
+
 	__PUT('"');
-	while (*val) {
-		switch (*val) {
+	for (; length > 0; length--, src++) {
+		const char val = *src;
+
+		switch (val) {
 		case '\n':
 			__PUT('\\'); __PUT('n');
 			break;
@@ -690,24 +694,58 @@ SPA_API_JSON int spa_json_encode_string(char *str, int size, const char *val)
 			break;
 		case '\\':
 		case '"':
-			__PUT('\\'); __PUT(*val);
+			__PUT('\\'); __PUT(val);
 			break;
 		default:
-			if (*val > 0 && *val < 0x20) {
+			if ((unsigned char) val < 0x20) {
 				__PUT('\\'); __PUT('u');
 				__PUT('0'); __PUT('0');
-				__PUT(hex[((*val)>>4)&0xf]); __PUT(hex[(*val)&0xf]);
+				__PUT(hex[(val>>4)&0xf]); __PUT(hex[val&0xf]);
+			} else if ((unsigned char) val < 0x80) {
+				__PUT(val);
 			} else {
-				__PUT(*val);
+				/* multi-byte UTF-8: emit valid sequences but replace invalid ones with U+FFFD */
+				size_t cont_needed, cont_valid, i;
+				const unsigned char lead = (unsigned char) val;
+
+				if (lead >= 0xc0 && lead <= 0xdf)
+					cont_needed = 1;
+				else if (lead >= 0xe0 && lead <= 0xef)
+					cont_needed = 2;
+				else if (lead >= 0xf0 && lead <= 0xf7)
+					cont_needed = 3;
+				else
+					cont_needed = 0; /* stray continuation or invalid lead */
+
+				for (cont_valid = 0; cont_valid < cont_needed; cont_valid++) {
+					const size_t next = cont_valid + 1;
+					if (next >= length ||
+					    (unsigned char) src[next] < 0x80 ||
+					    (unsigned char) src[next] > 0xbf)
+						break;
+				}
+				if (cont_needed > 0 && cont_valid == cont_needed) {
+					for (i = 0; i <= cont_needed; i++)
+						__PUT(src[i]);
+					src += cont_needed;
+					length -= cont_needed;
+				} else {
+					/* U+FFFD replacement character */
+					__PUT('\xef'); __PUT('\xbf'); __PUT('\xbd');
+				}
 			}
 			break;
 		}
-		val++;
 	}
 	__PUT('"');
 	__PUT('\0');
 #undef __PUT
 	return len-1;
+}
+
+SPA_API_JSON int spa_json_encode_string(char *dst, int capacity, const char *src)
+{
+	return spa_json_encode_stringn(dst, capacity, src, strlen(src));
 }
 
 /**
