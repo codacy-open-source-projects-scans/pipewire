@@ -849,6 +849,8 @@ struct pw_impl_node {
 	struct spa_fraction target_rate;
 	uint64_t target_quantum;
 
+	enum pw_node_state pending_state;
+
 	uint64_t driver_start;
 	uint64_t elapsed;		/* elapsed time in playing */
 
@@ -1334,9 +1336,10 @@ void pw_impl_port_destroy(struct pw_impl_port *port);
 /** Suepend a port */
 void pw_impl_port_suspend(struct pw_impl_port *port);
 
-/** Iterate the params of the given port. The callback should return
- * 1 to fetch the next item, 0 to stop iteration or <0 on error.
- * The function returns 0 on success or the error returned by the callback. */
+/** Iterate the params of the given port. The return value of the callback
+ * is ignored. Returns -ENOENT when the port does not have the param, 0 when
+ * the params come from the cache, otherwise the result of
+ * spa_node_port_enum_params(). */
 int pw_impl_port_for_each_param(struct pw_impl_port *port,
 			   int seq, uint32_t param_id,
 			   uint32_t index, uint32_t max,
@@ -1363,6 +1366,10 @@ int pw_impl_port_enum_param(struct pw_impl_port *port,
 			   const struct spa_pod *filter,
 			   struct spa_pod **param,
 			   struct spa_pod_builder *builder);
+
+/** Mark the cached values of a param as stale, the next full enumeration
+ * fetches them from the node again */
+void pw_impl_port_invalidate_param(struct pw_impl_port *port, uint32_t param_id);
 
 /** Iterate the links of the port. The callback should return
  * 0 to fetch the next item, any other value stops the iteration and returns

@@ -1335,8 +1335,12 @@ handle_rect_prop (const struct spa_pod_prop *prop, const char *width, const char
             height, G_TYPE_INT, rect[1].height,
             NULL);
       } else {
-        set_pref_int_range (res, width, rect[0].width, rect[1].width, rect[2].width);
-        set_pref_int_range (res, height, rect[0].height, rect[1].height, rect[2].height);
+	struct spa_rectangle max = SPA_RECTANGLE(
+			SPA_MIN(rect[2].width, (uint32_t)INT_MAX),
+			SPA_MIN(rect[2].height, (uint32_t)INT_MAX));
+
+        set_pref_int_range (res, width, rect[0].width, rect[1].width, max.width);
+        set_pref_int_range (res, height, rect[0].height, rect[1].height, max.height);
       }
       break;
     }

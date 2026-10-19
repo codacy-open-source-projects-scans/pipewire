@@ -94,8 +94,9 @@ static int audio_packet_repair(struct rtp_stream *impl, struct rtp_packet *last,
 }
 
 /* read wanted samples from the packet buffer at timestamp. Fill the gaps with
- * 0 bytes */
-static void audio_packet_buffer_read(struct rtp_stream *impl, uint32_t timestamp,
+ * 0 bytes. Returns the number of samples at the end that were not available
+ * in the packet buffer yet. */
+static uint32_t audio_packet_buffer_read(struct rtp_stream *impl, uint32_t timestamp,
 		void *dst, uint32_t wanted, uint32_t stride)
 {
 	struct rtp_packet *p, *prev_p = NULL;
@@ -161,6 +162,7 @@ skip:
 	}
 	if (wanted > 0)
 		memset(dst, 0, wanted * stride);
+	return wanted;
 }
 
 static void rtp_audio_process_playback(void *data)
@@ -169,7 +171,7 @@ static void rtp_audio_process_playback(void *data)
 	struct pw_buffer *buf;
 	struct spa_data *d;
 	struct pw_time pwt;
-	uint32_t wanted, timestamp, target_buffer, stride, maxsize;
+	uint32_t wanted, timestamp, target_buffer, stride, maxsize, missing;
 	uint32_t device_delay;
 	int32_t avail, flags = 0;
 	struct spa_io_position *pos = impl->io_position;
@@ -268,11 +270,22 @@ static void rtp_audio_process_playback(void *data)
 			impl->have_sync = impl->num_queued != 0;
 			error = 0.0;
 
-			pw_log_info("sync:%d %08x %08x target:%u synced:%u", avail,
+			pw_log(impl->have_sync ? SPA_LOG_LEVEL_INFO : SPA_LOG_LEVEL_DEBUG,
+				"sync:%d %08x %08x target:%u synced:%u", avail,
 				impl->tail_timestamp, timestamp, target_buffer, impl->have_sync);
 		} else {
 			avail = (int32_t)(impl->tail_timestamp - timestamp);
 			error = (double)target_buffer - (double)avail - in_flight;
+
+			/* Trigger a resync when we are behind by more than `target_buffer`
+			 * (meaning we currently have twice the configured target latency). The
+			 * DLL cannot handle this anymore (the timestamp might even have had
+			 * a discontinuity, making any attempt to correct it with the DLL futile). */
+			if (error < -(double)impl->target_buffer) {
+				pw_log_warn("receiver read overrun avail:%d target:%u error:%f",
+						avail, target_buffer, error);
+				impl->have_sync = false;
+			}
 			error = SPA_CLAMPD(error, -impl->max_error, impl->max_error);
 		}
 		corr = spa_dll_update(&impl->dll, error);
@@ -285,7 +298,16 @@ static void rtp_audio_process_playback(void *data)
 	}
 	/* read samples from the received packets. Missing packets are filled
 	 * with silence */
-	audio_packet_buffer_read(impl, timestamp, d[0].data, wanted, stride);
+	missing = audio_packet_buffer_read(impl, timestamp, d[0].data, wanted, stride);
+
+	if (!impl->direct_timestamp && impl->have_sync && missing > 0) {
+		/* We ran out of data and need to resync. Also drop the packet queue
+		 * as all packets in there lie in the past and are irrelevant for
+		 * playback as well as repair. */
+		pw_log_info("receiver read underrun %u/%u", missing, wanted);
+		rtp_stream_clear_queued_packets(impl);
+		impl->have_sync = false;
+	}
 
 	impl->expected_timestamp = timestamp + wanted;
 
@@ -464,7 +486,7 @@ static void rtp_audio_process_capture(void *data)
 		if (SPA_FLAG_IS_SET(pos->clock.flags, SPA_IO_CLOCK_FLAG_DISCONT)) {
 			pw_log_info("IO clock reports discontinuity; resynchronizing");
 			impl->have_sync = false;
-		} else if (SPA_ABS((int64_t)expected_timestamp - (int64_t)actual_timestamp) > (int64_t)(pos->clock.duration)) {
+		} else if (SPA_ABS((int64_t)rtp_timestamp_delta(expected_timestamp, actual_timestamp)) > (int64_t)pos->clock.duration) {
 			/* Normally, expected and actual timestamp should be in sync, and deviate
 			 * only minimally at most. If a major deviation occurs, then most likely
 			 * the driver clock has experienced an unexpected jump. Note that the
@@ -481,8 +503,10 @@ static void rtp_audio_process_capture(void *data)
 	 * that resynchronization is needed, then this will be done immediately below. */
 
 	if (!impl->have_sync) {
-		if (!impl->direct_timestamp)
-			impl->ts_align = actual_timestamp - impl->expected_timestamp;
+		/* keep the RTP timestamps continuous when the driver changes */
+		if (!impl->direct_timestamp && !impl->separate_sender && pos &&
+		    impl->clock_id != SPA_ID_INVALID && pos->clock.id != impl->clock_id)
+			impl->ts_align += impl->expected_timestamp - actual_timestamp;
 		pw_log_info("(re)sync to timestamp:%u seq:%u ts_offset:%u ts_align:%u SSRC:%u",
 				actual_timestamp, impl->seq, impl->ts_offset, impl->ts_align, impl->ssrc);
 		rtp_stream_clear_pending_packet(impl);
@@ -495,6 +519,8 @@ static void rtp_audio_process_capture(void *data)
 			impl->refilling = true;
 		}
 	}
+	if (SPA_LIKELY(pos))
+		impl->clock_id = pos->clock.id;
 
 	src = SPA_PTROFF(d[0].data, offs, void);
 	while (wanted > 0) {

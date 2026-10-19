@@ -123,6 +123,7 @@ struct rtp_stream {
 	uint32_t header_size;
 	uint32_t payload_size;
 	uint32_t ts_align;
+	uint32_t clock_id;
 
 	uint32_t n_packets;
 	struct spa_list free;
@@ -637,7 +638,7 @@ static int parse_audio_info(const struct pw_properties *props, struct spa_audio_
 
 static uint32_t msec_to_samples(struct rtp_stream *impl, float msec)
 {
-	return (uint32_t)(msec * impl->rate / 1000);
+	return (uint32_t)lrintf(msec * impl->rate / 1000);
 }
 static float samples_to_msec(struct rtp_stream *impl, uint32_t samples)
 {
@@ -673,6 +674,7 @@ struct rtp_stream *rtp_stream_new(struct pw_core *core,
 		goto out;
 	}
 	impl->first = true;
+	impl->clock_id = SPA_ID_INVALID;
 	set_internal_stream_state(impl, RTP_STREAM_INTERNAL_STATE_STOPPED);
 	spa_hook_list_init(&impl->listener_list);
 	impl->direction = direction;
@@ -826,7 +828,8 @@ struct rtp_stream *rtp_stream_new(struct pw_core *core,
 		if (!spa_atou32(str, &framecount, 0))
 			framecount = 0;
 
-	if (ptime > 0.0f || framecount > 0) {
+	bool have_ptime = ptime > 0.0f || framecount > 0;
+	if (have_ptime) {
 		if (!framecount) {
 			impl->psamples = msec_to_samples(impl, ptime);
 			pw_properties_setf(props, "rtp.framecount", "%u", impl->psamples);
@@ -838,6 +841,8 @@ struct rtp_stream *rtp_stream_new(struct pw_core *core,
 		} else if (fabsf((samples_to_msec(impl, framecount)) - ptime) > 0.1f) {
 			impl->psamples = msec_to_samples(impl, ptime);
 			pw_log_warn("rtp.ptime doesn't match rtp.framecount. Choosing rtp.ptime");
+		} else {
+			impl->psamples = framecount;
 		}
 	} else {
 		impl->psamples = impl->payload_size / impl->stride;
@@ -849,6 +854,15 @@ struct rtp_stream *rtp_stream_new(struct pw_core *core,
 
 			pw_properties_setf(props, "rtp.framecount", "%u", impl->psamples);
 		}
+	}
+
+	if (impl->psamples == 0) {
+		if (have_ptime)
+			pw_log_error("rtp.ptime %f too small", ptime);
+		else
+			pw_log_error("sess.max-ptime %f too small", max_ptime);
+		res = -EINVAL;
+		goto out;
 	}
 
 	ptime = samples_to_msec(impl, impl->psamples);
@@ -897,6 +911,18 @@ struct rtp_stream *rtp_stream_new(struct pw_core *core,
 
 	/* make packets */
 	impl->n_packets = (2*impl->target_buffer*impl->stride + impl->mtu-1) / impl->mtu;
+	if (direction == PW_DIRECTION_OUTPUT &&
+	    impl->info.media_subtype == SPA_MEDIA_SUBTYPE_raw) {
+		/* Received packets can be much smaller than the MTU. Make room for
+		 * 3 times the target latency: the receiver buffers up to 2 times
+		 * before it resyncs, plus one extra for jitter. Use the
+		 * announced packet size, or else the smallest allowed one. */
+		uint32_t samples = have_ptime ? impl->psamples : min_samples;
+		if (samples > 0) {
+			uint32_t n_packets = (3*impl->target_buffer + samples-1) / samples;
+			impl->n_packets = SPA_MAX(impl->n_packets, n_packets);
+		}
+	}
 	impl->n_packets = SPA_MAX(impl->n_packets, min_packets);
 	for (i = 0; i < impl->n_packets; i++) {
 		struct rtp_packet *p;
@@ -1274,7 +1300,7 @@ uint64_t rtp_stream_get_time(struct rtp_stream *s, uint32_t *rate)
 
 	*rate = s->rate;
 	return pos->clock.position * s->rate *
-		pos->clock.rate.num / pos->clock.rate.denom;
+		pos->clock.rate.num / pos->clock.rate.denom + s->ts_align;
 }
 
 uint16_t rtp_stream_get_seq(struct rtp_stream *s)

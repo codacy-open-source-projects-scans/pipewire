@@ -1771,7 +1771,7 @@ static inline void *get_buffer_output(struct port *p, uint32_t frames, uint32_t 
 		SPA_ATOMIC_STORE(io->status, SPA_STATUS_HAVE_DATA);
 		SPA_ATOMIC_STORE(mix->io_busy, 0);
 	} else {
-		while (SPA_ATOMIC_LOAD(io->status) != SPA_STATUS_HAVE_DATA)
+		while (SPA_ATOMIC_LOAD(mix->io_busy) != 0)
 			;
 		if (SPA_UNLIKELY(io->buffer_id >= mix->n_buffers))
 			return NULL;
@@ -2560,6 +2560,9 @@ static int client_node_command(void *data, const struct spa_command *command)
 				do_prepare_client, SPA_ID_INVALID, NULL, 0, c);
 			c->started = true;
 		}
+		break;
+	case SPA_NODE_COMMAND_ParamBegin:
+	case SPA_NODE_COMMAND_ParamEnd:
 		break;
 	default:
 		pw_log_warn("%p: unhandled node command %d", c, SPA_COMMAND_TYPE(command));

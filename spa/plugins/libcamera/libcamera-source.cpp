@@ -68,7 +68,6 @@ struct port {
 
 	std::optional<spa_video_info> current_format;
 
-	struct spa_fraction rate = {};
 	StreamConfiguration streamConfig;
 
 	uint32_t buffers_blocks = 1;
@@ -167,8 +166,6 @@ struct impl {
 	     std::shared_ptr<CameraManager> manager, std::shared_ptr<Camera> camera,
 	     std::unique_ptr<CameraConfiguration> config);
 
-	struct spa_dll dll;
-
 	void stop()
 	{
 		spa_loop_locked(
@@ -200,6 +197,25 @@ struct impl {
 		for (auto& p : out_ports)
 			spa_list_init(&p.queue);
 	}
+
+	int queue_request(Request *request)
+	{
+		request->reuse(libcamera::Request::ReuseFlag::ReuseBuffers);
+		request->controls().merge(ctrls);
+
+		spa_log_trace(log, "%p: queueing request %p[%" PRIu64 "]",
+				this, request, request->cookie());
+
+		int res = camera->queueRequest(request);
+		if (res < 0) {
+			spa_log_warn(log, "%p: cannot queue request %p[%" PRIu64 "]: %s",
+					this, request, request->cookie(), spa_strerror(res));
+			return res == -EACCES ? -EBUSY : res;
+		}
+
+		ctrls.clear();
+		return 0;
+	}
 };
 
 #define CHECK_PORT(impl,direction,port_id)  ((direction) == SPA_DIRECTION_OUTPUT && (port_id) == 0)
@@ -209,10 +225,12 @@ struct impl {
 
 void setup_initial_controls(const ControlInfoMap& ctrl_infos, ControlList& ctrls)
 {
+	ctrls.clear();
+
 	/* Libcamera recommends cameras default to manual focus mode, but we don't
 	 * expose any focus controls.  So, specifically enable autofocus on
 	 * cameras which support it. */
-	auto af_it = ctrl_infos.find(libcamera::controls::AF_MODE);
+	auto af_it = ctrl_infos.find(&libcamera::controls::AfMode);
 	if (af_it != ctrl_infos.end()) {
 		const ControlInfo &ctrl_info = af_it->second;
 		auto is_af_continuous = [](const ControlValue &value) {
@@ -220,15 +238,14 @@ void setup_initial_controls(const ControlInfoMap& ctrl_infos, ControlList& ctrls
 		};
 		if (std::any_of(ctrl_info.values().begin(),
 		    ctrl_info.values().end(), is_af_continuous)) {
-			ctrls.set(libcamera::controls::AF_MODE,
+			ctrls.set(libcamera::controls::AfMode,
 					libcamera::controls::AfModeContinuous);
 		}
 	}
 
-	auto ae_it = ctrl_infos.find(libcamera::controls::AE_ENABLE);
-	if (ae_it != ctrl_infos.end()) {
-		ctrls.set(libcamera::controls::AE_ENABLE, true);
-	}
+	auto ae_it = ctrl_infos.find(&libcamera::controls::AeEnable);
+	if (ae_it != ctrl_infos.end())
+		ctrls.set(libcamera::controls::AeEnable, true);
 }
 
 int spa_libcamera_open(struct impl *impl)
@@ -242,9 +259,6 @@ int spa_libcamera_open(struct impl *impl)
 		return res;
 
 	spa_assert(!impl->allocator.allocated());
-
-	const ControlInfoMap &controls = impl->camera->controls();
-	setup_initial_controls(controls, impl->initial_controls);
 
 	impl->acquired = true;
 	return 0;
@@ -270,29 +284,18 @@ int spa_libcamera_close(struct impl *impl)
 
 int spa_libcamera_buffer_recycle(struct impl *impl, struct port *port, uint32_t buffer_id)
 {
-	struct buffer *b = &port->buffers[buffer_id];
-	int res;
+	spa_assert(buffer_id < impl->requestPool.size());
 
+	struct buffer *b = &port->buffers[buffer_id];
 	if (!SPA_FLAG_IS_SET(b->flags, BUFFER_FLAG_OUTSTANDING))
 		return 0;
 
 	SPA_FLAG_CLEAR(b->flags, BUFFER_FLAG_OUTSTANDING);
 
-	if (buffer_id >= impl->requestPool.size()) {
-		spa_log_warn(impl->log, "invalid buffer_id %u >= %zu",
-				buffer_id, impl->requestPool.size());
-		return -EINVAL;
-	}
 	Request *request = impl->requestPool[buffer_id].get();
-	if (impl->active) {
-		request->controls().merge(impl->ctrls);
-		impl->ctrls.clear();
-		if ((res = impl->camera->queueRequest(request)) < 0) {
-			spa_log_warn(impl->log, "can't queue buffer %u: %s",
-				buffer_id, spa_strerror(res));
-			return res == -EACCES ? -EBUSY : res;
-		}
-	}
+	if (impl->active)
+		return impl->queue_request(request);
+
 	return 0;
 }
 
@@ -720,12 +723,14 @@ int spa_libcamera_set_format(struct impl *impl, struct port *port,
 	if ((res = allocBuffers(impl, port, port->streamConfig.bufferCount)) < 0)
 		goto error;
 
+	setup_initial_controls(impl->camera->controls(), impl->initial_controls);
+
 	port->info.change_mask |= SPA_PORT_CHANGE_MASK_FLAGS | SPA_PORT_CHANGE_MASK_RATE;
 	port->info.flags = SPA_PORT_FLAG_CAN_ALLOC_BUFFERS |
 		SPA_PORT_FLAG_LIVE |
 		SPA_PORT_FLAG_PHYSICAL |
 		SPA_PORT_FLAG_TERMINAL;
-	port->info.rate = SPA_FRACTION(port->rate.num, port->rate.denom);
+	port->info.rate = {};
 
 	return 0;
 error:
@@ -1044,9 +1049,7 @@ void handle_completed_request(struct impl *impl, libcamera::Request *request)
 	if (request->status() == libcamera::Request::Status::RequestCancelled) {
 		spa_log_trace(impl->log, "%p: request %p[%" PRIu64 "] cancelled",
 				impl, request, request_id);
-		request->reuse(libcamera::Request::ReuseFlag::ReuseBuffers);
-		SPA_FLAG_SET(b->flags, BUFFER_FLAG_OUTSTANDING);
-		spa_libcamera_buffer_recycle(impl, port, b->id);
+		impl->queue_request(request);
 		return;
 	}
 
@@ -1060,30 +1063,18 @@ void handle_completed_request(struct impl *impl, libcamera::Request *request)
 	const FrameMetadata &fmd = buffer->metadata();
 
 	if (impl->clock) {
-		double target = (double)port->info.rate.num / port->info.rate.denom;
-		double corr;
-
-		if (impl->dll.bw == 0.0) {
-			spa_dll_set_bw(&impl->dll, SPA_DLL_BW_MAX, port->info.rate.denom, port->info.rate.denom);
-			impl->clock->next_nsec = fmd.timestamp;
-			corr = 1.0;
-		} else {
-			double diff = ((double)impl->clock->next_nsec - (double)fmd.timestamp) / SPA_NSEC_PER_SEC;
-			double error = port->info.rate.denom * (diff - target);
-			corr = spa_dll_update(&impl->dll, SPA_CLAMPD(error, -128., 128.));
-		}
 		/* FIXME, we should follow the driver clock and target_ values.
 		 * for now we ignore and use our own. */
-		impl->clock->target_rate = port->rate;
+		impl->clock->target_rate = {};
 		impl->clock->target_duration = 1;
 
 		impl->clock->nsec = fmd.timestamp;
-		impl->clock->rate = port->rate;
+		impl->clock->rate = {};
 		impl->clock->position = fmd.sequence;
 		impl->clock->duration = 1;
 		impl->clock->delay = 0;
-		impl->clock->rate_diff = corr;
-		impl->clock->next_nsec += (uint64_t) (target * SPA_NSEC_PER_SEC * corr);
+		impl->clock->rate_diff = 1;
+		impl->clock->next_nsec = fmd.timestamp + 1;
 	}
 
 	if (b->h) {
@@ -1104,8 +1095,6 @@ void handle_completed_request(struct impl *impl, libcamera::Request *request)
 		if (fmd.status != libcamera::FrameMetadata::Status::FrameSuccess)
 			d->chunk->flags |= SPA_CHUNK_FLAG_CORRUPTED;
 	}
-
-	request->reuse(libcamera::Request::ReuseFlag::ReuseBuffers);
 
 	spa_list_append(&port->queue, &b->link);
 
@@ -1133,7 +1122,7 @@ void handle_completed_request(struct impl *impl, libcamera::Request *request)
 
 void libcamera_on_fd_events(struct spa_source *source)
 {
-	struct impl *impl = (struct impl*) source->data;
+	auto *impl = static_cast<struct impl *>(source->data);
 	uint32_t index;
 	uint64_t cnt;
 
@@ -1228,10 +1217,11 @@ spa_libcamera_alloc_buffers(struct impl *impl, struct port *port,
 		b->id = i;
 		b->outbuf = buffers[i];
 		b->flags = 0;
-		b->h = (struct spa_meta_header*)spa_buffer_find_meta_data(buffers[i], SPA_META_Header, sizeof(*b->h));
+		b->h = static_cast<spa_meta_header *>(spa_buffer_find_meta_data(
+			buffers[i], SPA_META_Header, sizeof(*b->h)));
 
-		b->videotransform = (struct spa_meta_videotransform*)spa_buffer_find_meta_data(
-			buffers[i], SPA_META_VideoTransform, sizeof(*b->videotransform));
+		b->videotransform = static_cast<spa_meta_videotransform *>(spa_buffer_find_meta_data(
+			buffers[i], SPA_META_VideoTransform, sizeof(*b->videotransform)));
 		if (b->videotransform) {
 			b->videotransform->transform =
 				libcamera_orientation_to_spa_transform_value(impl->config->orientation);
@@ -1346,13 +1336,10 @@ int spa_libcamera_stream_on(struct impl *impl)
 	impl->source.rmask = 0;
 
 	for (auto& req : impl->requestPool) {
-		req->reuse(libcamera::Request::ReuseFlag::ReuseBuffers);
-
-		if ((res = impl->camera->queueRequest(req.get())) < 0)
+		if ((res = impl->queue_request(req.get())) < 0)
 			goto err_stop;
 	}
 
-	impl->dll.bw = 0.0;
 	impl->active = true;
 
 	res = spa_loop_locked(
@@ -1428,7 +1415,7 @@ int port_get_format(struct impl *impl, struct port *port,
 		return -EIO;
 	}
 
-	*param = (struct spa_pod*)spa_pod_builder_pop(builder, &f);
+	*param = spa_pod_builder_pop(builder, &f);
 
 	return 1;
 }
@@ -1437,7 +1424,7 @@ int impl_node_enum_params(void *object, int seq,
 			  uint32_t id, uint32_t start, uint32_t num,
 			  const struct spa_pod *filter)
 {
-	struct impl *impl = (struct impl*)object;
+	auto *impl = static_cast<struct impl *>(object);
 	struct spa_pod *param;
 	struct spa_pod_builder b = { 0 };
 	uint8_t buffer[1024];
@@ -1544,18 +1531,18 @@ int impl_node_set_param(void *object,
 
 int impl_node_set_io(void *object, uint32_t id, void *data, size_t size)
 {
-	struct impl *impl = (struct impl*)object;
+	auto *impl = static_cast<struct impl *>(object);
 
 	spa_return_val_if_fail(impl != nullptr, -EINVAL);
 
 	switch (id) {
 	case SPA_IO_Clock:
-		impl->clock = (struct spa_io_clock*)data;
+		impl->clock = static_cast<spa_io_clock *>(data);
 		if (impl->clock)
 			SPA_FLAG_SET(impl->clock->flags, SPA_IO_CLOCK_FLAG_NO_RATE);
 		break;
 	case SPA_IO_Position:
-		impl->position = (struct spa_io_position*)data;
+		impl->position = static_cast<spa_io_position *>(data);
 		break;
 	default:
 		return -ENOENT;
@@ -1565,7 +1552,7 @@ int impl_node_set_io(void *object, uint32_t id, void *data, size_t size)
 
 int impl_node_send_command(void *object, const struct spa_command *command)
 {
-	struct impl *impl = (struct impl*)object;
+	auto *impl = static_cast<struct impl *>(object);
 	int res;
 
 	spa_return_val_if_fail(impl != nullptr, -EINVAL);
@@ -1635,7 +1622,7 @@ impl_node_add_listener(void *object,
 		const struct spa_node_events *events,
 		void *data)
 {
-	struct impl *impl = (struct impl*)object;
+	auto *impl = static_cast<struct impl *>(object);
 	struct spa_hook_list save;
 
 	spa_return_val_if_fail(impl != nullptr, -EINVAL);
@@ -1654,7 +1641,7 @@ int impl_node_set_callbacks(void *object,
 			    const struct spa_node_callbacks *callbacks,
 			    void *data)
 {
-	struct impl *impl = (struct impl*)object;
+	auto *impl = static_cast<struct impl *>(object);
 
 	spa_return_val_if_fail(impl != nullptr, -EINVAL);
 
@@ -1665,7 +1652,7 @@ int impl_node_set_callbacks(void *object,
 
 int impl_node_sync(void *object, int seq)
 {
-	struct impl *impl = (struct impl*)object;
+	auto *impl = static_cast<struct impl *>(object);
 
 	spa_return_val_if_fail(impl != nullptr, -EINVAL);
 
@@ -1695,7 +1682,7 @@ int impl_node_port_enum_params(void *object, int seq,
 			       const struct spa_pod *filter)
 {
 
-	struct impl *impl = (struct impl*)object;
+	auto *impl = static_cast<struct impl *>(object);
 	struct port *port;
 	struct spa_pod *param;
 	struct spa_pod_builder b = { 0 };
@@ -1740,7 +1727,7 @@ next:
 		 */
 		uint32_t n_buffers = port->streamConfig.bufferCount;
 
-		param = (struct spa_pod*)spa_pod_builder_add_object(&b,
+		param = spa_pod_builder_add_object(&b,
 			SPA_TYPE_OBJECT_ParamBuffers, id,
 			SPA_PARAM_BUFFERS_buffers, SPA_POD_Int(n_buffers),
 			SPA_PARAM_BUFFERS_blocks,  SPA_POD_Int(port->buffers_blocks),
@@ -1751,13 +1738,13 @@ next:
 	case SPA_PARAM_Meta:
 		switch (result.index) {
 		case 0:
-			param = (struct spa_pod*)spa_pod_builder_add_object(&b,
+			param = spa_pod_builder_add_object(&b,
 				SPA_TYPE_OBJECT_ParamMeta, id,
 				SPA_PARAM_META_type, SPA_POD_Id(SPA_META_Header),
 				SPA_PARAM_META_size, SPA_POD_Int(sizeof(struct spa_meta_header)));
 			break;
 		case 1:
-			param = (struct spa_pod*)spa_pod_builder_add_object(&b,
+			param = spa_pod_builder_add_object(&b,
 				SPA_TYPE_OBJECT_ParamMeta, id,
 				SPA_PARAM_META_type, SPA_POD_Id(SPA_META_VideoTransform),
 				SPA_PARAM_META_size, SPA_POD_Int(sizeof(struct spa_meta_videotransform)));
@@ -1769,19 +1756,19 @@ next:
 	case SPA_PARAM_IO:
 		switch (result.index) {
 		case 0:
-			param = (struct spa_pod*)spa_pod_builder_add_object(&b,
+			param = spa_pod_builder_add_object(&b,
 				SPA_TYPE_OBJECT_ParamIO, id,
 				SPA_PARAM_IO_id,   SPA_POD_Id(SPA_IO_Buffers),
 				SPA_PARAM_IO_size, SPA_POD_Int(sizeof(struct spa_io_buffers)));
 			break;
 		case 1:
-			param = (struct spa_pod*)spa_pod_builder_add_object(&b,
+			param = spa_pod_builder_add_object(&b,
 				SPA_TYPE_OBJECT_ParamIO, id,
 				SPA_PARAM_IO_id,   SPA_POD_Id(SPA_IO_Clock),
 				SPA_PARAM_IO_size, SPA_POD_Int(sizeof(struct spa_io_clock)));
 			break;
 		case 2:
-			param = (struct spa_pod*)spa_pod_builder_add_object(&b,
+			param = spa_pod_builder_add_object(&b,
 				SPA_TYPE_OBJECT_ParamIO, id,
 				SPA_PARAM_IO_id,   SPA_POD_Id(SPA_IO_Control),
 				SPA_PARAM_IO_size, SPA_POD_Int(sizeof(struct spa_io_sequence)));
@@ -1898,7 +1885,7 @@ int impl_node_port_set_param(void *object,
 			     uint32_t id, uint32_t flags,
 			     const struct spa_pod *param)
 {
-	struct impl *impl = (struct impl*)object;
+	auto *impl = static_cast<struct impl *>(object);
 	struct port *port;
 	int res;
 
@@ -1924,7 +1911,7 @@ int impl_node_port_use_buffers(void *object,
 			       struct spa_buffer **buffers,
 			       uint32_t n_buffers)
 {
-	struct impl *impl = (struct impl*)object;
+	auto *impl = static_cast<struct impl *>(object);
 	struct port *port;
 	int res;
 
@@ -1959,7 +1946,7 @@ int impl_node_port_set_io(void *object,
 			  uint32_t id,
 			  void *data, size_t size)
 {
-	struct impl *impl = (struct impl*)object;
+	auto *impl = static_cast<struct impl *>(object);
 	struct port *port;
 
 	spa_return_val_if_fail(impl != nullptr, -EINVAL);
@@ -1969,10 +1956,10 @@ int impl_node_port_set_io(void *object,
 
 	switch (id) {
 	case SPA_IO_Buffers:
-		port->io = (struct spa_io_buffers*)data;
+		port->io = static_cast<spa_io_buffers *>(data);
 		break;
 	case SPA_IO_Control:
-		port->control = (struct spa_io_sequence*)data;
+		port->control = static_cast<spa_io_sequence *>(data);
 		port->control_size = size;
 		break;
 	default:
@@ -1985,7 +1972,7 @@ int impl_node_port_reuse_buffer(void *object,
 				uint32_t port_id,
 				uint32_t buffer_id)
 {
-	struct impl *impl = (struct impl*)object;
+	auto *impl = static_cast<struct impl *>(object);
 	struct port *port;
 	int res;
 
@@ -2047,7 +2034,7 @@ int process_control(struct impl *impl, struct spa_pod_sequence *control, uint32_
 
 int impl_node_process(void *object)
 {
-	struct impl *impl = (struct impl*)object;
+	auto *impl = static_cast<struct impl *>(object);
 	int res;
 	struct spa_io_buffers *io;
 	struct port *port;

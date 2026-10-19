@@ -1649,7 +1649,8 @@ static void result_port_params(void *data, int seq, int res, uint32_t type, cons
 	{
 		const struct spa_result_node_params *r = result;
 		if (d->seq == seq) {
-			d->callback(d->data, seq, r->id, r->index, r->next, r->param);
+			if (d->callback)
+				d->callback(d->data, seq, r->id, r->index, r->next, r->param);
 			if (d->cache)
 				pw_param_add(&impl->pending_list, seq, r->id, r->param);
 		}
@@ -1668,8 +1669,25 @@ int pw_impl_port_enum_param(struct pw_impl_port *port,
 			   struct spa_pod_builder *builder)
 {
 	struct impl *impl = SPA_CONTAINER_OF(port, struct impl, this);
+	struct spa_param_info *pi;
 	struct pw_param *p;
 	uint32_t idx = 0;
+	int res;
+
+	pi = pw_param_info_find(port->info.params, port->info.n_params, param_id);
+	if (pi == NULL)
+		return -ENOENT;
+
+	if (pi->user != 1) {
+		/* fill the cache with one full enumeration; node errors such as
+		 * -ENOENT for an unreadable param are returned as before */
+		res = pw_impl_port_for_each_param(port, 0, param_id, 0, 0, NULL,
+				NULL, NULL);
+		if (res < 0)
+			return res;
+		if (pi->user != 1)
+			return -EIO;
+	}
 
 	spa_list_for_each(p, &impl->param_list, link) {
 		if (p->id != param_id)
@@ -1685,6 +1703,15 @@ int pw_impl_port_enum_param(struct pw_impl_port *port,
 		}
 	}
 	return 0;
+}
+
+void pw_impl_port_invalidate_param(struct pw_impl_port *port, uint32_t param_id)
+{
+	struct spa_param_info *pi;
+
+	pi = pw_param_info_find(port->info.params, port->info.n_params, param_id);
+	if (pi != NULL)
+		pi->user = 0;
 }
 
 int pw_impl_port_for_each_param(struct pw_impl_port *port,
